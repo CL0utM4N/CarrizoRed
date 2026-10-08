@@ -81,8 +81,56 @@ so it runs its own Carrizo init, firmware load, tiling and SMU8 paths, instead o
 The Polaris personality is then only needed for the *accelerator* (`AMDRadeonX4000`) and the *display* side
 (`AMD9500Controller`), which have no Carrizo code (no codename strings at all).
 
+### How CAIL selects the ASIC (confirmed in Ghidra, `AMDRadeonX4400HWLibs`, Sequoia 24H32)
+
+**1. Device table lookup: `_get_asic_caps_set_from_table(adapter, info, loose)`.** Called from
+`_ReinitializeCapTblManager(adapter)` as `get_asic_caps_set_from_table(adapter, adapter + 0x178, 0)`, which is
+in turn called from `_CailInitCapTable`. It walks `_CAILAsicCapsInitTable` (data starts at `0x953b28`), made of
+0x38-byte rows and ending with device ID `0xFFFFFFFF`:
+
+| Row offset | Carrizo example | Meaning |
+|---|---|---|
+| +0x00 | `0x9874` | PCI device ID, matched against `info+0x04` |
+| +0x08 | `1` | internal revision (fuse `rev_id`), matched against `info+0x1C` for an exact match |
+| +0x10 | `2` | external revision (Linux `rev_id + 1`), also used as the priority when no exact match |
+| +0x18 | `0xFFFFFFFF` / `0xC4`… | PCI revision (`FFFFFFFF` = any), matched against `info+0x10` |
+| +0x20 | `→ CAIL_DDI_CAPS_CARRIZO_A1` | 64-byte caps bitmap, copied to `info+0x1D8` |
+| +0x28 | `→ CARRIZO_GoldenSettings_A1` | golden settings |
+| +0x30 | `0x87` | family (`AMDGPU_FAMILY_CZ`), written to `info+0x18` |
+
+Matching: same device ID **and** (row revision is `FFFFFFFF`, or `loose`, or equal to the PCI revision). An exact
+internal-revision match wins at once; otherwise the highest `+0x10` wins. No match returns 5. On a match it sets
+`info+0x1D0` (row pointer), `info+0x18` (family), `info+0x20`/`+0x24` (external revision) and copies the caps,
+then runs `_Cail_Detect_Grenada` and `_CheckAsicCapExceptionTbl`.
+
+`0x9870` has an any-revision row (`CARRIZO_A0`). `0x9874` has an any-revision row plus per-revision rows
+(`0xC4`, `0xC5`, `0xC6`, …), all `CARRIZO_A1`.
+
+**2. Function-table dispatch: `_CAILInitFunctionPointer(adapter)`.** Reads family at `adapter+0x190`
+(= `info+0x18`) and external revision at `adapter+0x19C` (= `info+0x24`):
+- family `0x87`, external revision 0x01–0x40: `Cail_Tonga_InitFunctionPointer` then
+  `Cail_Carrizo_InitFunctionPointer`
+- family `0x82`: 0x3C–0x4F Fiji, 0x50–0x59 Ellesmere (Tonga + Ellesmere), 0x5A–0x6D Baffin (Tonga + Ellesmere + Baffin)
+
+These match Linux `vi.c` (`external_rev_id`, `AMDGPU_FAMILY_CZ`/`VI`) exactly.
+
+**3. `_Cail_Carrizo_InitFunctionPointer(adapter)`.** Only acts if `CailCapsEnabled(adapter+0x178, 0x53)`, i.e. the
+Carrizo caps are loaded. It then installs the Carrizo implementations into the adapter's function table:
+`+0xFB8 Carrizo_SetupASIC` (= `Cail_ExecuteAsicSetupTable(adapter, &CarrizoAsicSetupTable /*12 steps*/)`),
+`+0x1010 SetupCgReferenceClock`, `CheckDsmuSupport`, `UpdateSwConstantForHwConfig`, `ZeroFbConfigAndSize`,
+`FillMetaData`, `GetFirmwareInfoTable`, `LoadRlcUcode`, `DetectEDCSupport`, `Cail_Carrizo_ReserveFbMcRange`,
+`RestoreAdapterCfgRegisters`, `FindAsicRevID`, clock-gating updates, `PowerGatingControl`, `GetHungBlocks`,
+`CheckAcpHarvested`, `FormatSmuDramDataBuffer`, and more.
+
+**Conclusion:** CAIL's whole chip identity follows from three inputs in `info` (adapter `+0x178`): device ID
+(`+0x04`), PCI revision (`+0x10`) and internal revision (`+0x1C`). With `0x9874` there, CAIL selects
+`CARRIZO_A1`, family `0x87`, and the Carrizo function table, whatever the rest of the driver believes the device is.
+`_get_asic_caps_set_from_table` is an exported symbol, so CarrizoRed can hook it (Lilu) and force the real device
+ID and revision before it runs, if the input turns out to be the spoofed ID.
+
 What still has to be checked in Ghidra:
-1. How CAIL picks its ASIC table: device ID, family ID, `ASICCaps` from HWServices, or something we can feed it.
+1. Where `info+0x04` / `+0x10` / `+0x1C` are filled (`_CailInitCapTable`, `_CAILInitialize`, and HWServices'
+   `createCailInterface` / `populateDeviceInfo`): real PCI config space or the spoofable `device-id` property?
 2. Whether the Carrizo paths are complete or have been compiled out in places (function bodies present vs stubs).
 3. What the X4000 accelerator assumes about the ASIC that CAIL won't fix: VRAM/aperture, PTE base (#10), pipe
    config passed to user-space (#13).
