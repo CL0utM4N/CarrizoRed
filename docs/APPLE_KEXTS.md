@@ -128,10 +128,38 @@ Carrizo caps are loaded. It then installs the Carrizo implementations into the a
 `_get_asic_caps_set_from_table` is an exported symbol, so CarrizoRed can hook it (Lilu) and force the real device
 ID and revision before it runs, if the input turns out to be the spoofed ID.
 
+**4. Where the inputs come from.** `_CAILInitialize(adapter, initInfo)` checks `*adapter == 0x1690`, then:
+`CailSaveCailInitInfo(adapter, initInfo, adapter+0x178)` → `CailInitCapTable(adapter)` → `CailCheckASICInfo` →
+`CailCheckChipSetInfo` → `CailCheckBIOSDependentASICInfo` → … (it later compares `info+0x04` with `0x7300` for a
+Fiji ROM patch, which confirms `+0x04` is the device ID).
+- `CailSaveCailInitInfo` requires `initInfo+0x04 == 0x1FFFF` (interface version) and copies **`initInfo+0x08` →
+  `info+0x04` (device ID)**. Flags come from `initInfo+0x0C`, plus pointers/handles from `+0x10…+0x84`.
+- The PCI revision (`info+0x10`) and internal revision (`info+0x1C`) are not set there. They're probably filled
+  by the `adapter+0xFC8` callback that `CailInitCapTable` calls just before the table lookup (if it returns
+  non-zero, the lookup is skipped). `0x9874` has an any-revision row, so the lookup doesn't depend on them.
+
+**5. The device ID is read from real PCI config space.** The full chain:
+- `AMDRadeonX4000HWServices`: `AMDRadeonX4000_AMDRadeonHWServicesCAIL::createCailInterface(IOPCIDevice *pci)` just
+  calls `hwLibsPlugin->callPlatformFunction("AmdCailInterfaceKey", false, pci, &iface, 0, 0)` (`this+0xA8` is
+  the HWLibs plugin, vtable `+0x6C0`). The CAIL interface is built inside HWLibs.
+- HWLibs `AmdCailServices::AmdCailServices(IOPCIDevice *pci)` (`__ZN15AmdCailServicesC2EP11IOPCIDevice`,
+  `0x1a08b0`): `this+0x10 = pci->extendedConfigRead16(0x2)` (`MOV ESI,0x2` at `0x1a090a`), i.e. the **hardware
+  device ID**. It also formats `[bus:dev:func]` and sets `this[0x14] = (deviceId != 0xFFFF)`.
+- HWLibs `AmdCailServices::initialize(_CailInitialize *)`: runs `CAILPostVBIOS`, then builds `initInfo` on the
+  stack (`+0x00 = 0x88` size, `+0x04 = 0x1FFFF` version, **`+0x08 = this+0x10`**, `+0x0C` flags, `+0x10…`
+  from `this+0x20400…`) and calls `CAILInitialize` → `CAILQueryASICInfo` → `CAILQuerySystemInfo` →
+  `CAIL_InitParameter`s → `CAILReserveMCAddressRange` (if flag `0x8000`) → `initializeAdapter`.
+
+**Consequence:** an OpenCore `DeviceProperties` `device-id` spoof (e.g. Baffin `0x67EF`) changes only the
+IORegistry property. That's enough for IOKit to match Apple's Polaris kexts, while CAIL still reads `0x9874`
+from the hardware and selects `CARRIZO_A1` / family `0x87` / the Carrizo function table **with no CAIL patch**.
+The remaining work is in the code that is *not* CAIL: `AMDRadeonX4000` (accelerator) and
+`AMD9500Controller`/`AMDSupport` (display), which still assume a Baffin.
+
 What still has to be checked in Ghidra:
-1. Where `info+0x04` / `+0x10` / `+0x1C` are filled (`_CailInitCapTable`, `_CAILInitialize`, and HWServices'
-   `createCailInterface` / `populateDeviceInfo`): real PCI config space or the spoofable `device-id` property?
-2. Whether the Carrizo paths are complete or have been compiled out in places (function bodies present vs stubs).
+1. Whether the Carrizo paths are complete or have been compiled out in places (function bodies present vs stubs).
+   First hardware boot with the spoof will show this quickly (CAIL errors are printed as
+   `AMD Error: … failed (CAILRESULT=%d)`).
 3. What the X4000 accelerator assumes about the ASIC that CAIL won't fix: VRAM/aperture, PTE base (#10), pipe
    config passed to user-space (#13).
 4. Whether the PowerPlay hwmgr `cz_*` code is reachable from `createPowerPlayInterface`.
