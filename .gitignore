@@ -2,3 +2,4 @@
 /Lilu.kext/
 /MacKernelSDK/
 .DS_Store
+__pycache__/
