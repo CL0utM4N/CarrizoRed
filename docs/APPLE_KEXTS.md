@@ -1,0 +1,103 @@
+# Apple's AMD kexts: getting them and what's inside
+
+## Getting the binaries (Windows, no Mac, no Apple login)
+
+Apple's Kernel Debug Kits contain full kext bundles, executables included. Dortania mirrors every KDK publicly.
+
+```sh
+# 1. Download the KDK for the macOS build you test on (Sequoia 15.8.1 = 24H32), and check it
+gh release download 24H32 -R dortania/KdkSupportPkg -p '*.dmg' -p SHA256SUM
+sha256sum -c SHA256SUM
+
+# 2. Extract the AMD kexts (needs Python 3 and 7-Zip; run from Git Bash or PowerShell)
+python scripts/extract_kdk.py Kernel_Debug_Kit_15.8.1_build_24H32.dmg -o ../CarrizoRed-RE/Sequoia-15.8.1-24H32 \
+    -m Extensions/AMD9500Controller.kext -m Extensions/AMDSupport.kext -m Extensions/AMDFramebuffer.kext \
+    -m Extensions/AMDRadeonX4000 -m Extensions/AMDRadeonServiceManager.kext
+```
+
+[`scripts/extract_kdk.py`](../scripts/extract_kdk.py) takes a `.dmg`, `.pkg` or bare `Payload`. 7-Zip unpacks the
+DMG (HFS+) and the pkg (XAR). The script then streams the `pbzx` payload (xz chunks around an odc cpio archive),
+so the 3.7 GB of contents never sit in memory. Use `--list` for a dry run. Symlinks come out as `<name>.symlink`
+text files, because Windows symlinks need admin rights.
+
+> **Git Bash gotcha:** arguments starting with `/` are rewritten to Windows paths (`-m /AMDSupport.kext` becomes
+> `C:/Program Files/Git/AMDSupport.kext`) and match nothing. Write match strings without a leading slash.
+
+**Never commit these binaries.** They're Apple's copyright. Keep them outside the repo (we use
+`Desktop/CarrizoRed-RE/`).
+
+## Sequoia 15.8.1 (24H32) inventory
+
+KDK SHA-256 `658a7905a47f6c788264b7aaac7a8f6f9e1f387cc41ae8ce227244471ef6def1`. AMD driver bundle version
+7.0.25. All binaries are x86_64 Mach-O kext bundles. **No dSYMs** for the AMD kexts, but they aren't stripped
+(thousands of mangled C++ symbols each), so Ghidra shows real class and method names.
+
+| Kext | Size | Role | Matches |
+|---|---:|---|---|
+| `AMD9500Controller` | 1.1 MB | Display controller (DCE 11.2) | `IOPCIDevice` 0x67C0–0x67DF (Ellesmere), 0x67E0–0x67FF (Baffin) |
+| `AMDSupport` | 2.4 MB | Shared display / ATOM BIOS / connector code | any `1002:xxxx` |
+| `AMDFramebuffer` | 0.3 MB | `IOFramebuffer` per display | `AtiFbStub` |
+| `AMDRadeonX4000` | 5.2 MB | GFX8 accelerator (Metal kernel side) | `AMDRadeonX4000_AMDBaffinGraphicsAccelerator`, `…EllesmereGraphicsAccelerator` (same IDs) |
+| `AMDRadeonX4000HWServices` | 0.1 MB | Loads CAIL and PowerPlay for the accelerator | same IDs, class `…HWServicesPolaris` |
+| `…HWServices/PlugIns/AMDRadeonX4{0,1,4,7}00HWLibs` | 13–19 MB | **CAIL** (AMD's ASIC init library) + PowerPlay hwmgr | `IOPropertyMatch LoadPlugIn = Load4x00` |
+| `AMDRadeonServiceManager` | 0.1 MB | Power/hive services | `IOResources` |
+
+### Device IDs
+Sequoia supports only **Polaris 10 (Ellesmere)** and **Polaris 11 (Baffin)**. There's no Lexa/Polaris 12
+(0x699F) and no Tonga/Fiji, so the spoof target stays **Baffin 0x67EF** (or another Baffin ID).
+
+### HWLibs selection
+`AMDRadeonX4000_AMDRadeonHWServicesAbstract` has `readProjectName` (reading an EFI "project name" property),
+`ProjectNameTable`, `MatchTable` and `findPlugIn`. It sets `LoadPlugIn` = `Load4000`/`Load4100`/`Load4400`/`Load4700`,
+and the HWLibs plugin with the matching `IOPropertyMatch` attaches. The four builds differ (X4400 and X4700 are
+the same size but not byte-identical). **To find in Ghidra:** which variant Baffin gets on an unknown Mac model,
+and whether we can force one through that property.
+
+## The key finding: CAIL already contains Carrizo and Stoney
+
+All four HWLibs builds include AMD's CAIL code for **Carrizo and Stoney** (and Kaveri/Kalindi/Godavari), not
+only Polaris. In `AMDRadeonX4400HWLibs` there are 86 Carrizo-specific symbols, including:
+
+| What | Symbols | Linux item it covers ([CARRIZO_VS_POLARIS.md](CARRIZO_VS_POLARIS.md)) |
+|---|---|---|
+| ASIC table / IDs | `_CarrizoAsicSetupTable`, `_CarrizoId1..3`, `_CarrizoGroup1..3`, `_CarrizoFeatureSupport1`, `_CAIL_DDI_CAPS_CARRIZO_A0/A1`, `_Carrizo_FindAsicRevID` | #1, #20 |
+| Setup | `_Carrizo_SetupASIC`, `_Cail_Carrizo_InitFunctionPointer`, `_Carrizo_UpdateSwConstantForHwConfig`, `_Carrizo_HwConstants_8812(_A1)(_ST)` | #12 |
+| Golden registers | `_CARRIZO_GoldenSettings_A0/A1/A1_ST`, `_aCarrizo_GoldenRegisterSettings` | #13 golden |
+| **Tiling** | `_sCarrizoGbTileModeTbl`, `_sCarrizoGbMacroTileModeTbl` (+ `…Records`) | **#13, the biggest risk** |
+| **Firmware** | `_Carrizo_{PFP,ME,CE,MEC1,MEC2,RLC,SDMA0,SDMA1}_UCODE`, `_Carrizo_UcodeInfo`, `_carrizo_init_ucode_buffer`, `_Carrizo_GetFirmwareInfoTable` | #14 (firmware embedded, no injection needed) |
+| **SMU8 loading** | `_Carrizo_FormatSmuDramDataBuffer`, hwmgr `carrizo/cz_smumgr.c`, `cz_hwmgr.c`, `cz_powertune.c`, `cz_clockpowergating.c` | **#4, #5, #14** |
+| RLC | `_Cail_Carrizo_InitCPJumpTable`, `_Carrizo_LoadRlcUcode`, `_carrizo_reset_rlc`, `_carrizo_halt_rlc`, `_carrizo_send_serdes_cmd` | #15 |
+| SMC access | `_Carrizo_get_indirect_register_smc`, `_Carrizo_set_indirect_register_smc` | #3 |
+| Doorbells | `_Carrizo_set_cpg_door_bell`, `_Carrizo_set_mec_door_bell_range` | #17 |
+| Memory | `_Cail_Carrizo_ReserveFbMcRange`, `_Carrizo_ZeroFbConfigAndSize`, `_carrizo_init_nonsurf_aperture`, `_carrizo_init_enable_ats` | #8–#10 |
+| Power / clock gating | `_Carrizo_PowerGatingControl`, `_Carrizo_Update{Coarse,Medium}GrainClockGating`, `_Carrizo_EnableCpPowerGating`, `_carrizo_init_power_gating` | #19 |
+| Hang detection | `_Carrizo_IsGFXHung`, `_Carrizo_GetHungBlocks` | #18 |
+| UVD / VCE | `_carrizo_patch_uvd_dpg_tables`, `_carrizo_vce_pgfsm`, `_Carrizo_check_vce_harvested` | #21 |
+| Display offsets | `_CARRIZO_DCP_OFFSETS`, `_STONEY_CRTC_OFFSETS` | (CAIL-side display tables) |
+
+This changes the Phase 3 plan. NootedRed uses the same trick with Raven code inside `AMDRadeonX5000HWLibs`.
+**The goal becomes getting CAIL to identify the device as Carrizo** (family/ASIC ID, revision, `CarrizoAsicSetupTable`),
+so it runs its own Carrizo init, firmware load, tiling and SMU8 paths, instead of porting those from Linux.
+The Polaris personality is then only needed for the *accelerator* (`AMDRadeonX4000`) and the *display* side
+(`AMD9500Controller`), which have no Carrizo code (no codename strings at all).
+
+What still has to be checked in Ghidra:
+1. How CAIL picks its ASIC table: device ID, family ID, `ASICCaps` from HWServices, or something we can feed it.
+2. Whether the Carrizo paths are complete or have been compiled out in places (function bodies present vs stubs).
+3. What the X4000 accelerator assumes about the ASIC that CAIL won't fix: VRAM/aperture, PTE base (#10), pipe
+   config passed to user-space (#13).
+4. Whether the PowerPlay hwmgr `cz_*` code is reachable from `createPowerPlayInterface`.
+
+## Ghidra starting points
+
+Load each binary as **Mac OS X Mach-O, x86-64**. Run auto-analysis with the "Demangler GNU" analyzer enabled.
+
+- `AMDRadeonX4400HWLibs` (or whichever variant Baffin loads): `_CarrizoAsicSetupTable` and its xrefs, then
+  find the routine that walks the ASIC setup tables (it'll reference `_BaffinAsicStateRegInfo` /
+  `_CarrizoAsicSetupTable` side by side).
+- `AMDRadeonX4000HWServices`: `…HWServicesAbstract::start`, `findPlugIn`, `readProjectName`, `populateDeviceInfo`,
+  `…HWServicesCAIL::createCailInterface`.
+- `AMDRadeonX4000`: `AMDRadeonX4000_AMDBaffinGraphicsAccelerator` vtable, then the shared
+  `AMDRadeonX4000_AMDGraphicsAccelerator::start`.
+- `AMD9500Controller` / `AMDSupport`: VBIOS fetch, `ATOMBIOS` command-table execution (`SetPixelClock`,
+  `DIGxTransmitterControl`). See [DCE11_REGISTER_DIFF.md](DCE11_REGISTER_DIFF.md) "What to do with this".

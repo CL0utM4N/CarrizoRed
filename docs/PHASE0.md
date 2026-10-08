@@ -34,14 +34,9 @@ Boot a recent Linux live USB/install with `amdgpu` working on the iGPU, then sav
 - [ ] OpenCore with [AMD_Vanilla](https://github.com/AMD-OSX/AMD_Vanilla) patches (15h/16h set, core
       count patched for 4 cores), booting to desktop
 - [ ] `ioreg -lw0 > ioreg.txt` and an IORegistryExplorer save
-- [ ] Copy out for reverse engineering (from the exact macOS build you will test on):
-  - `/System/Library/Extensions/AMDRadeonX4000.kext`
-  - `/System/Library/Extensions/AMDRadeonX4000HWServices.kext`
-  - `/System/Library/Extensions/AMD9500Controller.kext`
-  - `/System/Library/Extensions/AMDSupport.kext`
-  - On Big Sur+ these binaries live in the kernel collection; extract with
-    `kmutil` / `ipsw kernel extract` or grab them from the KDK.
-- [ ] Install the matching KDK (Kernel Debug Kit) for symbolised panic logs
+- [x] Kexts for reverse engineering extracted on Windows from the Sequoia 15.8.1 (24H32) KDK. See
+      [APPLE_KEXTS.md](APPLE_KEXTS.md). Re-extract from the KDK for the exact build you install if it differs.
+- [ ] Install the matching KDK on the test machine for symbolised panic logs
 
 ## Reverse engineering — first targets
 

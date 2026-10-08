@@ -14,7 +14,7 @@ patch anything yet and will not give you graphics acceleration.
 | Carrizo / Bristol Ridge | A12-9800, A10-9700, A10-8700P | 1002:9870, 9874–9877 | gfx801 | DCE 11.0 | Primary target |
 | Stoney Ridge | A9-9420, A6-9220 | 1002:98E4 | gfx810 | DCE 11.0 | Later |
 
-macOS: Monterey through Tahoe (26). Excavator CPUs have AVX2, so Ventura+ runs without CPU hacks
+macOS: Monterey through Tahoe (26); the primary development target is **Sequoia (15.x)**. Excavator CPUs have AVX2, so Ventura+ runs without CPU hacks
 (AMD_Vanilla patches still required).
 
 Why this family: macOS removed the GCN 1–3 drivers in Ventura, but kept Polaris (GFX8, DCE 11.2). Carrizo is
@@ -62,8 +62,15 @@ CarrizoRed/
   kern_info.c      kmod_info declaration
   Info.plist.in    Bundle template (filled in by the Makefile)
 docs/
-  ROADMAP.md       Phase plan
-  PHASE0.md        Hardware / environment / reverse-engineering checklist
+  ROADMAP.md               Phase plan
+  PHASE0.md                Hardware / environment / reverse-engineering checklist
+  CARRIZO_VS_POLARIS.md    Where Linux amdgpu treats Carrizo differently from Polaris
+  DCE11_REGISTER_DIFF.md   DCE 11.0 vs 11.2 display register diff (full data in docs/data/)
+  APPLE_KEXTS.md           Getting Apple's AMD kexts from a KDK on Windows, and what's inside them
+scripts/
+  bootstrap.sh             Fetch Lilu + MacKernelSDK (macOS / CI)
+  extract_kdk.py           Extract files from a KDK .dmg/.pkg without a Mac
+  dce_regdiff.py           Diff two Linux DCE register header sets
 ```
 
 ## Licensing notes

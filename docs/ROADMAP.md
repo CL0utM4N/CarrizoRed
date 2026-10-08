@@ -7,7 +7,9 @@ See [PHASE0.md](PHASE0.md).
 - [ ] macOS boots on the A12-9800 with OpenCore + AMD_Vanilla (firmware framebuffer, no acceleration)
 - [x] Build pipeline works (GitHub Actions macOS runner)
 - [ ] Reference data collected: ioreg, VBIOS (VFCT), Linux `umr` register dumps
-- [ ] `AMDRadeonX4000`, `AMDRadeonX4000HWServices`, `AMD9500Controller`, `AMDSupport` loaded in Ghidra
+- [x] Sequoia 15.8.1 AMD kexts extracted from the KDK on Windows: [APPLE_KEXTS.md](APPLE_KEXTS.md)
+- [ ] `AMDRadeonX4000`, `AMDRadeonX4000HWServices` (+ HWLibs), `AMD9500Controller`, `AMDSupport` loaded in Ghidra
+- [ ] Find how CAIL selects its ASIC table, and whether its Carrizo paths are complete
 - [x] Linux Carrizo-vs-Polaris differences catalogued: [CARRIZO_VS_POLARIS.md](CARRIZO_VS_POLARIS.md)
 - [x] DCE 11.0 vs 11.2 register header diff: [DCE11_REGISTER_DIFF.md](DCE11_REGISTER_DIFF.md)
 
