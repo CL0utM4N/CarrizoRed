@@ -1,0 +1,28 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Lilu and MacKernelSDK
+        run: bash ./scripts/bootstrap.sh
+
+      - name: Build Debug
+        run: make DEBUG=1 zip
+
+      - name: Build Release
+        run: make zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CarrizoRed
+          path: |
+            build/*/*.zip
+            Lilu.kext
