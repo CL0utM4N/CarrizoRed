@@ -68,7 +68,9 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   shows the real failure: `+0 D0 halted; +150 USBCMD=HCRST (Apple's reset); +255 HCRST clear, ready; +263 D3, dead`.
   Apple's reset *succeeds*, but takes ~105 ms (ours took 12 ms at probe time). `AppleUSBXHCI::reset()` gives up just
   before that ("reset failed" `0xe00002c9` = `kIOReturnIOError`), and the driver powers the controller off for good.
-  Linux allows the xHCI reset up to 10 s. Next: read `AppleUSBXHCI::reset()` and lengthen its wait (Lilu hook).
+  Linux allows the xHCI reset up to 10 s. `AppleUSBXHCI::reset()` waits `clock_interval_to_deadline(100, 1000000)`.
+- **Attempt 6 (OpenCore patch: that deadline 100 → 1000 ms, `Base = __ZN12AppleUSBXHCI5resetEv`):** **USB works**. A
+  SanDisk USB 3 stick enumerates on XHC0 at 5 Gbps and the installer boots. XHCIProbe dropped from the EFI.
 - The `shared_region … vm_shared_region_start_address() failed` and launchd `error = 37` lines in verbose recovery
   are noise; processes keep running.
 
