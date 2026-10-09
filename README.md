@@ -51,6 +51,7 @@ uploads them (plus a debug `Lilu.kext`) as a workflow artifact.
 | `-crdbg` | Enable debug logging (DEBUG build) |
 | `-crbeta` | Allow loading on macOS versions newer than Tahoe |
 | `-crnommio` | Skip the MMIO register probe |
+| `-crnovbios` | Don't inject the VBIOS from the ACPI VFCT table as `ATY,bin_image` |
 
 ## Layout
 
@@ -59,6 +60,7 @@ CarrizoRed/
   kern_start.cpp   Lilu plugin configuration / entry point
   kern_cr.*        Main driver logic (device detection, kext load hooks)
   kern_asic.hpp    Device IDs and register offsets (from Linux amdgpu headers)
+  kern_vbios.*     VBIOS from the ACPI VFCT table → "ATY,bin_image" (read first by AMDSupport)
   kern_info.c      kmod_info declaration
   Info.plist.in    Bundle template (filled in by the Makefile)
 docs/

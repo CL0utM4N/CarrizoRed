@@ -7,6 +7,7 @@
 //
 
 #include "kern_cr.hpp"
+#include "kern_vbios.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_devinfo.hpp>
@@ -98,6 +99,12 @@ void CRDriver::processPatcher(KernelPatcher &) {
 	logPCIInfo();
 	if (!checkKernelArgument("-crnommio"))
 		probeMMIO();
+
+	// AMDSupport reads the VBIOS from "ATY,bin_image" before trying the (absent) PCI ROM.
+	if (!checkKernelArgument("-crnovbios")) {
+		bool ok = VBIOS::inject(iGPU, WIOKit::VendorID::ATIAMD, deviceId);
+		iGPU->setProperty("CarrizoRed,vbios-injected", ok);
+	}
 }
 
 void CRDriver::processKext(KernelPatcher &, size_t index, mach_vm_address_t slide, size_t size) {
