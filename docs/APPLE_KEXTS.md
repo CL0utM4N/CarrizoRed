@@ -244,6 +244,15 @@ and the PLL index the Baffin assigner hands out (sent raw as `ucPpll`). Carrizo 
   (Linux DC `carrizo_resource_cap` / `stoney_resource_cap`). Planned patch: wrap it to return 3 / 2. Still to find:
   where Apple gets its CRTC count (no `getNum*Crtc*` symbol exists; candidates are the VBIOS display-path table or
   a per-pipe loop bound elsewhere).
+- Per-pipe objects are created per `ATIController` (one per framebuffer):
+  `DEVICE_COMPONENT_FACTORY::create{Timing,Scaler,Gamma}Generator(uint, ATIController *, uchar)` and
+  `BaffinTimingGenerator::initWithController(uchar crtc, ATIController *)`; register blocks come from
+  `BaffinTimingGenerator::calculateCrtcOffset(uint)`. **Hypothesis:** the number of pipes in use follows the number of
+  framebuffers, i.e. the connector count (from `AtiBiosParser{1,2}::getNumberOfConnectors` when no personality
+  matches). The D509BA VBIOS has ~2 connectors (eDP + HDMI), which would keep Apple on pipes 0–1, all Stoney has.
+  To confirm in Ghidra: `BaffinSharedController::initializeResources`, `::initializeProjectDependentResources`,
+  `DEVICE_COMPONENT_FACTORY::createTimingGenerator` and its callers (which index is passed as the CRTC), and any
+  shared-controller loop that touches all 6 pipes regardless (e.g. line-buffer or interrupt setup).
 - `BaffinLineBuffer::initWithController(pipe, ctrl)` sets size `this+0x34 = 0x6013`, `this+0x28 = LBOffset[pipe]`
   (per-pipe register block table), and `this+0x30 = 1` (not shared, so `AtiLineBuffer::getLbSize()` returns the full
   value; it halves it when the flag is clear). `BaffinLineBuffer::calculatePitch(depth, width)` returns entries per
