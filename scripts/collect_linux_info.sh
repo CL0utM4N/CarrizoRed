@@ -96,6 +96,7 @@ for d in /sys/kernel/debug/dri/*; do
   cat "$d/amdgpu_vram_mm" >"$out/gpu/vram-mm.txt" 2>/dev/null
   cat "$d/amdgpu_gtt_mm" >"$out/gpu/gtt-mm.txt" 2>/dev/null
   cat "$d/amdgpu_pm_info" >"$out/gpu/pm-info.txt" 2>/dev/null
+  regs="$d/amdgpu_regs"
   break
 done
 dmesg | grep -iE "amdgpu|\[drm\]|VFCT|radeon" >"$out/gpu/dmesg-amdgpu.txt" 2>&1
@@ -115,8 +116,43 @@ if command -v umr >/dev/null; then
     echo "== $r" >>"$out/gpu/umr-registers.txt"
     umr -O bits -r "*.*.$r" >>"$out/gpu/umr-registers.txt" 2>&1
   done
+elif [ -n "${regs:-}" ] && [ -r "$regs" ]; then
+  # Fallback without umr: amdgpu_regs returns the MMIO register at byte offset (dword index * 4).
+  # Offsets are VI/Carrizo-family (gfx_8_0_d.h, gmc_8_1_d.h, bif_5_0_d.h, dce_11_0_d.h); read-only.
+  rd() {  # rd <name> <dword index>
+    local v
+    v=$(dd if="$regs" bs=4 skip=$(($2)) count=1 2>/dev/null | od -An -tx4 | tr -d ' ')
+    printf '%-34s 0x%04X  %s\n' "$1" $(($2)) "${v:-<read failed>}" >>"$out/gpu/registers.txt"
+  }
+  echo "# name                               index   value (amdgpu_regs, $(date))" >"$out/gpu/registers.txt"
+  rd GRBM_STATUS 0x2004
+  rd GB_ADDR_CONFIG 0x263E
+  rd CC_RB_BACKEND_DISABLE 0x263D
+  rd CC_GC_SHADER_ARRAY_CONFIG 0x226F
+  for i in $(seq 0 31); do rd "GB_TILE_MODE$i" $((0x2644 + i)); done
+  for i in $(seq 0 15); do rd "GB_MACROTILE_MODE$i" $((0x2664 + i)); done
+  rd CONFIG_MEMSIZE 0x150A
+  rd MC_VM_FB_LOCATION 0x809
+  rd MC_VM_FB_OFFSET 0x81A
+  rd MC_VM_SYSTEM_APERTURE_LOW_ADDR 0x80D
+  rd MC_VM_SYSTEM_APERTURE_HIGH_ADDR 0x80E
+  rd MC_ARB_RAMCFG 0x9D8
+  rd DMIF_ADDR_CONFIG 0x2F5
+  rd LB0_LB_MEMORY_CTRL 0x1AC1
+  rd LB1_LB_MEMORY_CTRL 0x1CC1
+  rd LB2_LB_MEMORY_CTRL 0x1EC1
+  rd CRTC0_CRTC_CONTROL 0x1B9C
+  rd CRTC1_CRTC_CONTROL 0x1D9C
+  rd CRTC2_CRTC_CONTROL 0x1F9C
+  rd GRPH0_CONTROL 0x1A01
+  rd GRPH0_PRIMARY_SURFACE_ADDRESS 0x1A04
+  rd PIXCLK0_RESYNC_CNTL 0x13A
+  rd PIXCLK1_RESYNC_CNTL 0x138
+  rd PIXCLK2_RESYNC_CNTL 0x139
+  rd PHYPLL_PIXCLK_CNTL 0x13E
+  for i in $(seq 0 17); do rd "PLL0_REG+$i" $((0x1700 + i)); done
 else
-  echo "umr not installed (dnf/apt install umr), register dump skipped" >"$out/gpu/umr-missing.txt"
+  echo "Neither umr nor amdgpu_regs available, register dump skipped" >"$out/gpu/registers-missing.txt"
 fi
 
 # --- Pack ---------------------------------------------------------------------------------
