@@ -20,6 +20,10 @@ private:
 
 	void processPatcher(KernelPatcher &patcher);
 	void processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
+	void patchPolarisController(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
+
+	static uint32_t wrapGetDisplayLimit(void *that);
+	static uint8_t wrapGetNumLineBuffers(void *that);
 
 	void findByConfigSpace();
 	void logPCIInfo();

@@ -138,15 +138,42 @@ void CRDriver::findByConfigSpace() {
 	iterator->release();
 }
 
-void CRDriver::processKext(KernelPatcher &, size_t index, mach_vm_address_t slide, size_t size) {
-	for (auto &kext : kexts) {
-		if (kext.loadIndex == index) {
-			SYSLOG("cr", "%s loaded: slide 0x%llX size 0x%lX", kext.id, static_cast<uint64_t>(slide),
-				static_cast<unsigned long>(size));
-			return;
-		}
+void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	for (size_t i = 0; i < arrsize(kexts); i++) {
+		if (kexts[i].loadIndex != index)
+			continue;
+		SYSLOG("cr", "%s loaded: slide 0x%llX size 0x%lX", kexts[i].id, static_cast<uint64_t>(slide),
+			static_cast<unsigned long>(size));
+		if (i == KextPolarisController)
+			patchPolarisController(patcher, index, slide, size);
+		return;
 	}
 }
+
+// BaffinSharedController::getDisplayLimit() and ::getNumLineBuffers() return 6. AMD9500Controller::
+// initializeProjectDependentResources() creates a timing generator, cursor, scaler, pipe control and gamma generator
+// for each of getDisplayLimit() pipes and a line buffer for each of getNumLineBuffers(), all on fixed per-pipe register
+// blocks. Carrizo has 3 pipes and Stoney 2, so limit both to the real count (docs/APPLE_KEXTS.md, "Pipes").
+void CRDriver::patchPolarisController(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	if (checkKernelArgument("-crnopipes")) {
+		SYSLOG("cr", "pipe limit patch disabled by -crnopipes");
+		return;
+	}
+	KernelPatcher::RouteRequest requests[] {
+		{"__ZN22BaffinSharedController15getDisplayLimitEv", wrapGetDisplayLimit},
+		{"__ZN22BaffinSharedController17getNumLineBuffersEv", wrapGetNumLineBuffers},
+	};
+	if (patcher.routeMultiple(index, requests, slide, size)) {
+		SYSLOG("cr", "AMD9500Controller limited to %u display pipes", displayPipes(family));
+	} else {
+		SYSLOG("cr", "failed to route AMD9500Controller pipe limits (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+}
+
+uint32_t CRDriver::wrapGetDisplayLimit(void *) { return displayPipes(callback->family); }
+
+uint8_t CRDriver::wrapGetNumLineBuffers(void *) { return displayPipes(callback->family); }
 
 void CRDriver::logPCIInfo() {
 	revision = static_cast<uint8_t>(WIOKit::readPCIConfigValue(iGPU, WIOKit::kIOPCIConfigRevisionID));

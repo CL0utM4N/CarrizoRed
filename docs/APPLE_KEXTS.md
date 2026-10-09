@@ -250,9 +250,15 @@ and the PLL index the Baffin assigner hands out (sent raw as `ucPpll`). Carrizo 
   `BaffinTimingGenerator::calculateCrtcOffset(uint)`. **Hypothesis:** the number of pipes in use follows the number of
   framebuffers, i.e. the connector count (from `AtiBiosParser{1,2}::getNumberOfConnectors` when no personality
   matches). The D509BA VBIOS has ~2 connectors (eDP + HDMI), which would keep Apple on pipes 0–1, all Stoney has.
-  To confirm in Ghidra: `BaffinSharedController::initializeResources`, `::initializeProjectDependentResources`,
-  `DEVICE_COMPONENT_FACTORY::createTimingGenerator` and its callers (which index is passed as the CRTC), and any
-  shared-controller loop that touches all 6 pipes regardless (e.g. line-buffer or interrupt setup).
+  **Answered (hypothesis was wrong):** `AMD9500Controller::initializeProjectDependentResources()` loops over
+  `getDisplayLimit()` (vtable `+0x8f8`) creating the timing generator, hardware cursor, scaler, pipe control and gamma
+  generator per pipe, and over `getNumLineBuffers()` (`+0x918`) for the line buffers. Both are constant getters in
+  `BaffinSharedController`: `getDisplayLimit` = 6, `getNumLineBuffers` = 6. Neighbours: `getFrameBufferLimit` (`+0x900`)
+  returns the byte at `this+0x311f2` (framebuffer count, passed to the connector assigner), `getDigLimit` (`+0x908`) =
+  6, `getNumPixelClocks` (`+0x910`) = 7 (passed to the PLL assigner). **CarrizoRed routes `getDisplayLimit` and
+  `getNumLineBuffers` to 3 (Carrizo) / 2 (Stoney)** (`-crnopipes` disables it). The PLL count is still to check.
+- `BaffinSharedController::initializeResources()` has no per-pipe loop; it maps register sub-ranges of a PCI BAR
+  (`[0, 0xC0000)`, `+0x40000`, `+0x100000`, `[0, 0x300000)`; check which BAR before the spoof test fails there).
 - `BaffinLineBuffer::initWithController(pipe, ctrl)` sets size `this+0x34 = 0x6013`, `this+0x28 = LBOffset[pipe]`
   (per-pipe register block table), and `this+0x30 = 1` (not shared, so `AtiLineBuffer::getLbSize()` returns the full
   value; it halves it when the flag is clear). `BaffinLineBuffer::calculatePitch(depth, width)` returns entries per

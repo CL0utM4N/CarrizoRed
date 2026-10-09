@@ -42,6 +42,19 @@ inline ChipFamily familyForDevice(uint16_t deviceId) {
 	return ChipFamily::Unknown;
 }
 
+// Display pipes (CRTC + line buffer each) per family, from Linux DC carrizo_resource_cap / stoney_resource_cap.
+// Apple's BaffinSharedController assumes 6 (getDisplayLimit, getNumLineBuffers).
+inline uint8_t displayPipes(ChipFamily family) {
+	switch (family) {
+		case ChipFamily::Carrizo:
+			return 3;
+		case ChipFamily::Stoney:
+			return 2;
+		default:
+			return 0;
+	}
+}
+
 inline const char *familyName(ChipFamily family) {
 	switch (family) {
 		case ChipFamily::Carrizo:
