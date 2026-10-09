@@ -90,6 +90,11 @@ void CRDriver::processPatcher(KernelPatcher &) {
 
 	DeviceInfo::deleter(devInfo);
 
+	// DeviceInfo skips devices whose vendor-id *property* isn't a known GPU vendor, and the EFI overrides it to
+	// 0xFFFF to keep AMDSupport off the iGPU until we patch it. Fall back to every IOPCIDevice's config space.
+	if (!iGPU)
+		findByConfigSpace();
+
 	if (!iGPU) {
 		SYSLOG("cr", "no supported Carrizo-family iGPU found, disabling");
 		disableKextCallbacks();
@@ -105,6 +110,31 @@ void CRDriver::processPatcher(KernelPatcher &) {
 		bool ok = VBIOS::inject(iGPU, WIOKit::VendorID::ATIAMD, deviceId);
 		iGPU->setProperty("CarrizoRed,vbios-injected", ok);
 	}
+}
+
+void CRDriver::findByConfigSpace() {
+	// Walk the device tree like DeviceInfo does (it has already waited for the PCI root to publish): this early in
+	// boot the IOPCIDevices exist but may not be registered yet, so IOService matching could miss them.
+	auto *iterator = IORegistryIterator::iterateOver(gIODTPlane, kIORegistryIterateRecursively);
+	if (!iterator)
+		return;
+	while (auto *entry = iterator->getNextObject()) {
+		auto *pci = OSDynamicCast(IOPCIDevice, entry);
+		if (!pci)
+			continue;
+		auto vendor = WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigVendorID);
+		auto device = static_cast<uint16_t>(WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigDeviceID));
+		auto fam = familyForDevice(device);
+		if (vendor != WIOKit::VendorID::ATIAMD || fam == ChipFamily::Unknown)
+			continue;
+		SYSLOG("cr", "found iGPU %s by config space (not listed by DeviceInfo)", safeString(pci->getName()));
+		iGPU = pci;
+		iGPU->retain();
+		family = fam;
+		deviceId = device;
+		break;
+	}
+	iterator->release();
 }
 
 void CRDriver::processKext(KernelPatcher &, size_t index, mach_vm_address_t slide, size_t size) {

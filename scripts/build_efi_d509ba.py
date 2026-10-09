@@ -2,7 +2,7 @@
 """
 Build an OpenCore EFI for the ASUS VivoBook 15 D509BA (A9-9425, Stoney Ridge) test laptop.
 
-    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe]
+    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe] [--carrizored]
 
 <work dir> must contain:
     unpacked/OpenCore-<ver>-RELEASE/        OpenCorePkg release zip, extracted
@@ -55,6 +55,8 @@ KEXTS = [  # (bundle path inside its release folder, executable, comment)
 GUX_KEXT = ("GUX/GenericUSBXHCI.kext", "GenericUSBXHCI", "Experimental: AMD APU XHCI init workaround")
 # Optional (--xhciprobe): tools/XHCIProbe diagnostic kext from CI, unpacked to unpacked/XHCIProbe/.
 XHCIPROBE_KEXT = ("XHCIProbe/XHCIProbe.kext", "XHCIProbe", "Diagnostic: log/attempt xHCI start before AppleUSBXHCIPCI")
+# Optional (--carrizored): the CarrizoRed kext from CI (CarrizoRed-*-Release.zip), unpacked to unpacked/CarrizoRed/.
+CARRIZORED_KEXT = ("CarrizoRed/CarrizoRed.kext", "CarrizoRed", "CarrizoRed (Lilu plugin, iGPU)")
 
 DRIVERS = ["OpenRuntime.efi", "OpenHfsPlus.efi", "ResetNvramEntry.efi"]
 
@@ -119,6 +121,7 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     with_gux = "--gux" in sys.argv[1:]
     with_probe = "--xhciprobe" in sys.argv[1:]
+    with_cr = "--carrizored" in sys.argv[1:]
     if len(args) != 1:
         sys.exit(__doc__)
     work = Path(args[0]).resolve()
@@ -181,7 +184,7 @@ def main():
 
     # --- Kernel -----------------------------------------------------------------------------------
     adds = []
-    extra = ([GUX_KEXT] if with_gux else []) + ([XHCIPROBE_KEXT] if with_probe else [])
+    extra = ([GUX_KEXT] if with_gux else []) + ([XHCIPROBE_KEXT] if with_probe else []) +         ([CARRIZORED_KEXT] if with_cr else [])
     for pattern, exe, comment in KEXTS + extra:
         src = one(unpacked, pattern)
         if "/PlugIns/" not in pattern:
