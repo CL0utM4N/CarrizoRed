@@ -8,7 +8,7 @@ Build an OpenCore EFI for the ASUS VivoBook 15 D509BA (A9-9425, Stoney Ridge) te
     unpacked/OpenCore-<ver>-RELEASE/        OpenCorePkg release zip, extracted
     unpacked/<Kext>-<ver>-RELEASE/          Lilu, VirtualSMC, ECEnabler, VoodooPS2Controller, RestrictEvents, NVMeFix
     downloads/AMD_Vanilla-patches.plist     github.com/AMD-OSX/AMD_Vanilla patches.plist
-    acpi/SSDT-EC-USBX-LAPTOP.aml            compiled from docs/opencore/SSDT-EC-USBX-LAPTOP.dsl
+    acpi/SSDT-*.aml                         compiled from docs/opencore/SSDT-*.dsl (see SSDTS)
 and receives:
     usb/EFI/...                             copy usb/ (EFI + com.apple.recovery.boot) to a FAT32 USB stick
 
@@ -49,6 +49,11 @@ KEXTS = [  # (bundle path inside its release folder, executable, comment)
 ]
 
 DRIVERS = ["OpenRuntime.efi", "OpenHfsPlus.efi", "ResetNvramEntry.efi"]
+
+SSDTS = {  # compiled from docs/opencore/<name>.dsl into <work dir>/acpi/
+    "SSDT-EC-USBX-LAPTOP.aml": "Fake EC + USBX (laptop, real EC0 under SBRG)",
+    "SSDT-XOSI.aml": "XOSI: firmware sees Windows 10 under macOS (enables HPET)",
+}
 
 
 def die(msg):
@@ -96,9 +101,10 @@ def main():
     work = Path(sys.argv[1]).resolve()
     unpacked = work / "unpacked"
     oc = one(unpacked, "OpenCore-*-RELEASE")
-    ssdt = work / "acpi" / "SSDT-EC-USBX-LAPTOP.aml"
-    if not ssdt.exists():
-        die(f"{ssdt} missing: compile docs/opencore/SSDT-EC-USBX-LAPTOP.dsl with iasl first")
+    ssdts = [work / "acpi" / n for n in SSDTS]
+    for ssdt in ssdts:
+        if not ssdt.exists():
+            die(f"{ssdt} missing: compile docs/opencore/{ssdt.stem}.dsl with iasl first")
 
     usb = work / "usb"
     efi = usb / "EFI"
@@ -112,7 +118,8 @@ def main():
     (ocdir / "Tools").mkdir()
     shutil.copy2(oc / "X64" / "EFI" / "OC" / "OpenCore.efi", ocdir)
     shutil.copytree(oc / "X64" / "EFI" / "OC" / "Resources", ocdir / "Resources")
-    shutil.copy2(ssdt, ocdir / "ACPI")
+    for ssdt in ssdts:
+        shutil.copy2(ssdt, ocdir / "ACPI")
     for d in DRIVERS:
         shutil.copy2(oc / "X64" / "EFI" / "OC" / "Drivers" / d, ocdir / "Drivers")
     shutil.copy2(oc / "X64" / "EFI" / "OC" / "Tools" / "OpenShell.efi", ocdir / "Tools")
@@ -120,10 +127,13 @@ def main():
     cfg = plistlib.load(open(oc / "Docs" / "Sample.plist", "rb"))
 
     # --- ACPI -------------------------------------------------------------------------------------
-    cfg["ACPI"]["Add"] = [{"Comment": "Fake EC + USBX (laptop, real EC0 under SBRG)", "Enabled": True,
-                           "Path": ssdt.name}]
+    cfg["ACPI"]["Add"] = [{"Comment": SSDTS[n], "Enabled": True, "Path": n} for n in SSDTS]
     cfg["ACPI"]["Delete"] = []
-    cfg["ACPI"]["Patch"] = []
+    # _OSI -> XOSI in the DSDT only (SSDT-XOSI provides XOSI). See docs/opencore/SSDT-XOSI.dsl for why.
+    cfg["ACPI"]["Patch"] = [{
+        "Base": "", "BaseSkip": 0, "Comment": "_OSI to XOSI (DSDT)", "Count": 0, "Enabled": True,
+        "Find": b"_OSI", "Limit": 0, "Mask": b"", "OemTableId": bytes(8), "Replace": b"XOSI", "ReplaceMask": b"",
+        "Skip": 0, "TableLength": 0, "TableSignature": b"DSDT"}]
     cfg["ACPI"]["Quirks"].update(FadtEnableReset=False, NormalizeHeaders=False, RebaseRegions=False,
                                  ResetHwSig=False, ResetLogoStatus=True, SyncTableIds=False)
 

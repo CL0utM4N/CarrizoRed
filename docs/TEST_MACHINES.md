@@ -51,6 +51,11 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   That kext matches the board-ids of MacPro6,1 / iMacPro1,1 / MacPro7,1 and crashes on AMD CPUs. It's in the system
   KC, so the fix is a different SMBIOS: **iMac19,1**. The panic text was read back from NVRAM (`AAPL,PanicInfo*`) via
   `dmpstore -all -s FS0:\nvram.bin` in OpenShell, then unpacked from Apple's 7-bit format.
+- **Attempt 3 (iMac19,1):** reaches the macOS Recovery UI, but the PS/2 keyboard and all USB ports are dead. The
+  DSDT's `OSFL()` sets `OSVR` from `_OSI("Windows …")`; macOS answers only `Darwin`, so `OSVR = 3` and the HPET's
+  `_STA` reports it disabled (needs `OSVR >= 0x0C`) and clears `HPEN`. Fix: `SSDT-XOSI` + `_OSI → XOSI` rename
+  (DSDT, 24 hits) so the firmware sees Windows 10 under macOS. HPET `_CRS` already holds IRQ 0/8 and RTC drops its IRQ
+  when `HPEN` = 1, so no IRQ patching is needed.
 - The `shared_region … vm_shared_region_start_address() failed` and launchd `error = 37` lines in verbose recovery
   are noise; processes keep running.
 
