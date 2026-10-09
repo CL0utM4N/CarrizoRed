@@ -2,7 +2,7 @@
 """
 Build an OpenCore EFI for the ASUS VivoBook 15 D509BA (A9-9425, Stoney Ridge) test laptop.
 
-    python scripts/build_efi_d509ba.py <work dir> [--gux]
+    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe]
 
 <work dir> must contain:
     unpacked/OpenCore-<ver>-RELEASE/        OpenCorePkg release zip, extracted
@@ -33,8 +33,9 @@ SMBIOS_MODEL = "iMac19,1"           # 2019 27" iMac: Sequoia-supported, shipped 
 # Not MacPro7,1/iMacPro1,1/MacPro6,1: AppleIntelMCEReporter matches those board-ids and panics on AMD CPUs
 # (NULL deref in AppleIntelMCE::Controller, seen twice on this laptop, 2026-10-09). It lives in the system KC,
 # so OpenCore Kernel->Block can't reliably remove it; avoiding the board-id is the robust fix.
-BOOT_ARGS = "-v keepsyms=1 debug=0x100 npci=0x3000"
+BOOT_ARGS = "-v keepsyms=1 debug=0x100 npci=0x3000 msgbuf=1048576"
 # npci=0x3000: needed on AMD systems without an "Above 4G decoding" option (this laptop has none).
+# msgbuf=1048576: 1 MB kernel log buffer, so boot-time driver messages survive until `dmesg` is run.
 
 KEXTS = [  # (bundle path inside its release folder, executable, comment)
     ("Lilu-*/Lilu.kext", "Lilu", "Patch engine"),
@@ -52,6 +53,8 @@ KEXTS = [  # (bundle path inside its release folder, executable, comment)
 # Experiment for the XHCI "reset failed" problem (2026-10-09): on some AMD APUs, letting GUX run its early init and
 # bail out makes AppleUSBXHCIPCI work afterwards.
 GUX_KEXT = ("GUX/GenericUSBXHCI.kext", "GenericUSBXHCI", "Experimental: AMD APU XHCI init workaround")
+# Optional (--xhciprobe): tools/XHCIProbe diagnostic kext from CI, unpacked to unpacked/XHCIProbe/.
+XHCIPROBE_KEXT = ("XHCIProbe/XHCIProbe.kext", "XHCIProbe", "Diagnostic: log/attempt xHCI start before AppleUSBXHCIPCI")
 
 DRIVERS = ["OpenRuntime.efi", "OpenHfsPlus.efi", "ResetNvramEntry.efi"]
 
@@ -103,6 +106,7 @@ def smbios(work, oc):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     with_gux = "--gux" in sys.argv[1:]
+    with_probe = "--xhciprobe" in sys.argv[1:]
     if len(args) != 1:
         sys.exit(__doc__)
     work = Path(args[0]).resolve()
@@ -165,7 +169,8 @@ def main():
 
     # --- Kernel -----------------------------------------------------------------------------------
     adds = []
-    for pattern, exe, comment in KEXTS + ([GUX_KEXT] if with_gux else []):
+    extra = ([GUX_KEXT] if with_gux else []) + ([XHCIPROBE_KEXT] if with_probe else [])
+    for pattern, exe, comment in KEXTS + extra:
         src = one(unpacked, pattern)
         if "/PlugIns/" not in pattern:
             shutil.copytree(src, ocdir / "Kexts" / src.name)

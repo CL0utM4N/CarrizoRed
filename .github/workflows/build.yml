@@ -20,9 +20,13 @@ jobs:
       - name: Build Release
         run: make zip
 
+      - name: Build XHCIProbe (diagnostic tool)
+        run: make -C tools/XHCIProbe
+
       - uses: actions/upload-artifact@v4
         with:
           name: CarrizoRed
           path: |
             build/*/*.zip
+            tools/XHCIProbe/build/*.zip
             Lilu.kext
