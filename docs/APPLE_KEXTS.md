@@ -164,6 +164,25 @@ What still has to be checked in Ghidra:
    config passed to user-space (#13).
 4. Whether the PowerPlay hwmgr `cz_*` code is reachable from `createPowerPlayInterface`.
 
+## Display side (`AMDSupport`)
+
+### VBIOS source
+`AtomBiosProxy::readAtomBios()` (`0x710f0`) fills a 64 KB buffer at `this+0xC`:
+1. `readEfiAtomBiosImage(buf, 0x10000)`: `getProperty("ATY,bin_image")` on the GPU's provider (`this+0x10038`),
+   copies `min(length, 0x10000)` bytes. The result of `validateAtomBiosImage` is **ignored** on this path.
+2. Only if that returned 0: `readPciAtomBiosImage` (PCI expansion ROM), which must also pass `validateAtomBiosImage`.
+
+APUs have no expansion ROM, so CarrizoRed copies the VBIOS from the ACPI VFCT table into `ATY,bin_image`
+([`kern_vbios.cpp`](../CarrizoRed/kern_vbios.cpp)). It can also be injected by hand through OpenCore
+`DeviceProperties` (a Linux `amdgpu_vbios` dump), in which case CarrizoRed leaves it alone.
+
+### Parsers
+`AtiBiosParser1` handles the `atombios.h` format (`_ATOM_I2C_RECORD`, `_ATOM_HPD_INT_RECORD`): GCN 1–4, including
+Polaris **and Carrizo**. `AtiBiosParser2` handles `atomfirmware.h` (Vega+). Command tables come in V1/V2 interface
+variants (`AtiSetPixelClockInterface_V1/V2`, `AtiSetDceClockInterface_V1/V2`, `AtiTransmitterControlInterface_V1/V2`,
+…), and `AtomBiosProxy::setDisplayClock` has both a `(uchar, uint)` and a `(DCEClockParams *)` overload. Still to
+check: which variant Apple picks for DCE 11.0 (see [DCE11_REGISTER_DIFF.md](DCE11_REGISTER_DIFF.md), pixel clock).
+
 ## Ghidra starting points
 
 Load each binary as **Mac OS X Mach-O, x86-64**. Run auto-analysis with the "Demangler GNU" analyzer enabled.
