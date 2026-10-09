@@ -33,7 +33,7 @@ SMBIOS_MODEL = "iMac19,1"           # 2019 27" iMac: Sequoia-supported, shipped 
 # Not MacPro7,1/iMacPro1,1/MacPro6,1: AppleIntelMCEReporter matches those board-ids and panics on AMD CPUs
 # (NULL deref in AppleIntelMCE::Controller, seen twice on this laptop, 2026-10-09). It lives in the system KC,
 # so OpenCore Kernel->Block can't reliably remove it; avoiding the board-id is the robust fix.
-BOOT_ARGS = "-v keepsyms=1 debug=0x100 npci=0x3000 msgbuf=1048576"
+BOOT_ARGS = "-v keepsyms=1 debug=0x100 npci=0x3000 msgbuf=1048576 revpatch=sbvm"
 # npci=0x3000: needed on AMD systems without an "Above 4G decoding" option (this laptop has none).
 # msgbuf=1048576: 1 MB kernel log buffer, so boot-time driver messages survive until `dmesg` is run.
 
