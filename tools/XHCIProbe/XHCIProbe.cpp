@@ -9,11 +9,18 @@
 //  steps from the public xHCI specification, records the state again, and returns nullptr. It never attaches, so
 //  IOKit then probes AppleUSBXHCIPCI as usual.
 //
+//  On AMD controllers it also reads the firmware's power-management state through ACPI ("XHCIProbe-acpi": OSVR,
+//  XHCD, U3TD and _S0W of the D509BA DSDT), and starts a monitor thread that samples the controller every 1 ms for
+//  60 s after probe() returns, i.e. while AppleUSBXHCIPCI starts it. Every change of PMCSR, PCI command, USBCMD or
+//  USBSTS is appended to "XHCIProbe-trace" as "+<ms> D<n> c<pcicmd> u<usbcmd> s<usbsts>" ("dead" when the
+//  registers read all-ones).
+//
 //  Results are printed with IOLog (verbose boot / dmesg) and published on the IOPCIDevice as properties
-//  "XHCIProbe-before", "XHCIProbe-steps" and "XHCIProbe-after", so `ioreg -lw0 -r -n XHC0@10 | grep XHCIProbe`
-//  shows them after boot.
+//  "XHCIProbe-before", "XHCIProbe-steps", "XHCIProbe-after", "XHCIProbe-acpi" and "XHCIProbe-trace", so
+//  `ioreg -lw0 -r -n XHC0@10 | grep XHCIProbe` shows them after boot.
 //
 //  Boot-args: -xhciprobe_noact   only record state, change nothing
+//             -xhciprobe_nomon   no monitor thread
 //             -xhciprobe_off     do nothing at all
 //
 //  Register layout and bit meanings: eXtensible Host Controller Interface for USB, rev 1.2 (Intel), sections 5.3
@@ -22,7 +29,10 @@
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
+#include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/pci/IOPCIDevice.h>
+#include <kern/clock.h>
+#include <kern/thread.h>
 #include <libkern/c++/OSString.h>
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
@@ -44,7 +54,7 @@ namespace {
 	constexpr UInt16 CommandMemory = 1 << 1, CommandBusMaster = 1 << 2;
 
 	// xHCI capability registers (offsets from BAR0)
-	constexpr UInt32 RegCapLength = 0x00, RegHciVersion = 0x02, RegHcsParams1 = 0x04, RegHccParams1 = 0x10;
+	constexpr UInt32 RegCapLength = 0x00, RegHcsParams1 = 0x04, RegHccParams1 = 0x10;
 	// xHCI operational registers (offsets from BAR0 + CAPLENGTH)
 	constexpr UInt32 RegUsbCmd = 0x00, RegUsbSts = 0x04;
 	constexpr UInt32 CmdRun = 1 << 0, CmdReset = 1 << 1;
@@ -131,6 +141,84 @@ namespace {
 		va_start(va, fmt);
 		vsnprintf(buf + len, size - len, fmt, va);
 		va_end(va);
+	}
+
+	// The D509BA firmware's USB power-management state. Names that don't exist on other machines read as "-".
+	void readAcpi(IOPCIDevice *pci, char *buf, size_t size) {
+		buf[0] = '\0';
+		auto *acpi = OSDynamicCast(IOACPIPlatformDevice, pci->getProperty("acpi-device"));
+		if (!acpi) {
+			appendf(buf, size, "no acpi-device");
+			return;
+		}
+		static const char *const names[] = {"\\OSFL", "\\XHCD", "\\EHCD", "\\U3TD", "\\U_PS", "_S0W"};
+		for (auto *name : names) {
+			UInt32 v = 0;
+			if (acpi->evaluateInteger(name, &v) == kIOReturnSuccess)
+				appendf(buf, size, "%s=%x ", name, v);
+			else
+				appendf(buf, size, "%s=- ", name);
+		}
+	}
+
+	// Monitor thread: samples the controller while AppleUSBXHCIPCI starts it, records every change.
+	struct Monitor {
+		Controller c;
+		IOMemoryMap *map;
+		char trace[4000];
+	};
+
+	constexpr int MonitorMs = 60000;
+	constexpr UInt32 StsNoisy = (1 << 3) | (1 << 4);  // EINT, PCD: change on normal port activity
+
+	UInt64 nowMs() {
+		UInt64 ns;
+		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+		return ns / 1000000;
+	}
+
+	void monitorThread(void *arg, wait_result_t) {
+		auto *m = static_cast<Monitor *>(arg);
+		auto &c = m->c;
+		UInt64 start = nowMs(), lastPublish = 0;
+		UInt32 last[4] = {~0u, ~0u, ~0u, ~0u};
+		bool changed = false, full = false;
+		for (UInt64 t = 0; t < MonitorMs; t = nowMs() - start) {
+			UInt32 now[4];
+			now[0] = c.pm ? c.pci->configRead16(c.pm + 4) & 3 : 0xF;
+			now[1] = c.pci->configRead16(kIOPCIConfigCommand);
+			UInt32 cap = c.r32(RegCapLength);
+			bool dead = cap == ~0u;
+			now[2] = dead ? ~0u : c.r32(c.op(RegUsbCmd));
+			now[3] = dead ? ~0u : c.r32(c.op(RegUsbSts)) & ~StsNoisy;
+			if (!full && memcmp(now, last, sizeof(now))) {
+				memcpy(last, now, sizeof(now));
+				char e[64];
+				if (dead)
+					snprintf(e, sizeof(e), "+%llu D%u c%04x dead; ", t, now[0], now[1]);
+				else
+					snprintf(e, sizeof(e), "+%llu D%u c%04x u%x s%x; ", t, now[0], now[1], now[2], now[3]);
+				IOLog("XHCIProbe: trace %s\n", e);
+				if (strlen(m->trace) + strlen(e) + 8 < sizeof(m->trace)) {
+					appendf(m->trace, sizeof(m->trace), "%s", e);
+				} else {
+					appendf(m->trace, sizeof(m->trace), "FULL");
+					full = true;
+				}
+				changed = true;
+			}
+			if (changed && t - lastPublish >= 500) {
+				c.pci->setProperty("XHCIProbe-trace", m->trace);
+				changed = false;
+				lastPublish = t;
+			}
+			IOSleep(1);
+		}
+		appendf(m->trace, sizeof(m->trace), " end");
+		c.pci->setProperty("XHCIProbe-trace", m->trace);
+		m->map->release();
+		c.pci->release();
+		IOFree(m, sizeof(*m));
 	}
 
 	void startController(Controller &c, char *steps, size_t size) {
@@ -246,6 +334,32 @@ IOService *XHCIProbe::probe(IOService *provider, SInt32 *score) {
 		pci->setProperty("XHCIProbe-steps", steps);
 		snapshot(c, "after", buf, sizeof(buf));
 		pci->setProperty("XHCIProbe-after", buf);
+	}
+
+	if (vendor == 0x1022) {
+		char acpi[160];
+		readAcpi(pci, acpi, sizeof(acpi));
+		IOLog("XHCIProbe: acpi: %s\n", acpi);
+		pci->setProperty("XHCIProbe-acpi", acpi);
+	}
+
+	if (vendor == 0x1022 && !PE_parse_boot_argn("-xhciprobe_nomon", arg, sizeof(arg))) {
+		auto *m = static_cast<Monitor *>(IOMalloc(sizeof(Monitor)));
+		if (m) {
+			m->c = c;
+			m->map = map;
+			m->trace[0] = '\0';
+			pci->retain();
+			thread_t thread;
+			if (kernel_thread_start(monitorThread, m, &thread) == KERN_SUCCESS) {
+				thread_deallocate(thread);
+				// The thread runs our code for 60 s; keep an instance alive so the kext is never unloaded under it.
+				retain();
+				return nullptr;
+			}
+			pci->release();
+			IOFree(m, sizeof(*m));
+		}
 	}
 
 	map->release();
