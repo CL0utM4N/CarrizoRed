@@ -45,6 +45,15 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
 | `EnableGraphSurfaces` / `SetCRTC_UsingDTDTiming` | 1.4 / 2.3 | to check |
 | Data: `FirmwareInfo` 2.2, `Object_Header` 1.3, `IntegratedSystemInfo` 1.9, `PowerPlayInfo` 6.1, `ASIC_InternalSS_Info` 3.1 | | |
 
+### macOS install log
+- **2026-10-09, attempts 1–2 (MacPro7,1 SMBIOS):** recovery (24E263) boots to userspace, keyboard works, then
+  panics ~3.5 min in: page fault `CR2 0x8` in `AppleIntelMCEReporter::start → AppleIntelMCE::Controller::controller`.
+  That kext matches the board-ids of MacPro6,1 / iMacPro1,1 / MacPro7,1 and crashes on AMD CPUs. It's in the system
+  KC, so the fix is a different SMBIOS: **iMac19,1**. The panic text was read back from NVRAM (`AAPL,PanicInfo*`) via
+  `dmpstore -all -s FS0:\nvram.bin` in OpenShell, then unpacked from Apple's 7-bit format.
+- The `shared_region … vm_shared_region_start_address() failed` and launchd `error = 37` lines in verbose recovery
+  are noise; processes keep running.
+
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
 - The pixel-clock path Apple uses for DCE 11.0 VBIOSes is the one this VBIOS needs.

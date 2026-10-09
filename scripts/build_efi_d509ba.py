@@ -29,7 +29,10 @@ import os
 from pathlib import Path
 
 CORE_COUNT = 2                      # A9-9425: 2 cores (not threads)
-SMBIOS_MODEL = "MacPro7,1"          # Dortania's AMD recommendation; supported by Sequoia (and Tahoe)
+SMBIOS_MODEL = "iMac19,1"           # 2019 27" iMac: Sequoia-supported, shipped with Polaris (Radeon Pro 570X-580X).
+# Not MacPro7,1/iMacPro1,1/MacPro6,1: AppleIntelMCEReporter matches those board-ids and panics on AMD CPUs
+# (NULL deref in AppleIntelMCE::Controller, seen twice on this laptop, 2026-10-09). It lives in the system KC,
+# so OpenCore Kernel->Block can't reliably remove it; avoiding the board-id is the robust fix.
 BOOT_ARGS = "-v keepsyms=1 debug=0x100 npci=0x3000"
 # npci=0x3000: needed on AMD systems without an "Above 4G decoding" option (this laptop has none).
 
@@ -41,7 +44,7 @@ KEXTS = [  # (bundle path inside its release folder, executable, comment)
     ("VoodooPS2Controller-*/VoodooPS2Controller.kext", "VoodooPS2Controller", "PS/2 controller"),
     ("VoodooPS2Controller-*/VoodooPS2Controller.kext/Contents/PlugIns/VoodooPS2Keyboard.kext", "VoodooPS2Keyboard",
      "PS/2 keyboard"),
-    ("RestrictEvents-*/RestrictEvents.kext", "RestrictEvents", "MacPro7,1 memory/PCI warnings, CPU name"),
+    ("RestrictEvents-*/RestrictEvents.kext", "RestrictEvents", "CPU name, misc. fixes"),
     ("NVMeFix-*/NVMeFix.kext", "NVMeFix", "NVMe power management"),
 ]
 
@@ -134,9 +137,9 @@ def main():
         ForceExitBootServices=False, ProvideMaxSlide=0)
 
     # --- DeviceProperties ---------------------------------------------------------------------------
-    # Keep Apple's AMDSupport off the unsupported Stoney iGPU while installing: AMDSupport matches any display-class
-    # 1002:xxxx device (IOPCIMatch 0x00001002&0x0000FFFF) and panics in start() on a chip it doesn't know (NULL deref,
-    # first install attempt, 2026-10-09). IOPCIMatch compares the vendor-id *property*, so overriding it stops the
+    # Precaution while installing: keep Apple's AMDSupport off the unsupported Stoney iGPU. AMDSupport matches any
+    # display-class 1002:xxxx device (IOPCIMatch 0x00001002&0x0000FFFF). (The first install panics turned out to be
+    # AppleIntelMCEReporter, not AMDSupport; this stays until CarrizoRed handles the iGPU.) IOPCIMatch compares the vendor-id *property*, so overriding it stops the
     # match; the class code is left alone so the boot framebuffer keeps working. Remove once CarrizoRed handles the iGPU.
     cfg["DeviceProperties"]["Add"] = {
         "PciRoot(0x0)/Pci(0x1,0x0)": {"vendor-id": bytes.fromhex("FFFF0000")},
