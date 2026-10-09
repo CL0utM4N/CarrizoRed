@@ -183,6 +183,41 @@ variants (`AtiSetPixelClockInterface_V1/V2`, `AtiSetDceClockInterface_V1/V2`, `A
 …), and `AtomBiosProxy::setDisplayClock` has both a `(uchar, uint)` and a `(DCEClockParams *)` overload. Still to
 check: which variant Apple picks for DCE 11.0 (see [DCE11_REGISTER_DIFF.md](DCE11_REGISTER_DIFF.md), pixel clock).
 
+### Pixel clock path
+`AtomBiosProxy::setPixelClock(ClockParams *, ActiveConnectorInfo *)` (`0x70a50`, called from other kexts through its
+vtable) only forwards to the parser (`this+0x10070`, vtable `+0x1D8`). `AtiBiosParser1::setPixelClock` forwards
+again to its SetPixelClock object (`this+0xB8`, vtable `+0x138`).
+
+`AtiSetPixelClockInterface_V1::createSetPixelClock` picks the class from the **VBIOS's own `SetPixelClock` table
+revision**: 7 → `AtiSetPixelClock_V1_V7` (Polaris, frequency only), **6 → `AtiSetPixelClock_V1_V6`**,
+**5 → `AtiSetPixelClock_V1_V5`**, anything else → no object ("Not a valid table revision"). So the older
+divider-style revisions DCE 11.0 VBIOSes use are still supported, and selected automatically.
+
+`AtiSetPixelClock_V1_V6::setPixelClock` (`0x98890`) builds `PIXEL_CLOCK_PARAMETERS_V6` exactly as in Linux
+`atombios.h`:
+
+| V6 field | Source |
+|---|---|
+| `ulCrtcPclkFreq` (24-bit clock + CRTC id) | `ClockParams+0x08` (DP: `connector+0x20`), CRTC `connector[0x2D]` |
+| `usFbDiv` | `ClockParams+0x14 / 10` |
+| `ucPostDiv` | `ClockParams[0x18]` |
+| `ucRefDiv` | `ClockParams[0x10]` |
+| `ucPpll` | `connector[0x2E]` |
+| `ucTransmitterID` / `ucEncoderMode` | `translateConnectorInfoToEncoderObjectId` / `…EncoderMode` |
+| `ucMiscInfo` | HDMI deep-colour bits, `0x10` (`REF_DIV_SRC`) |
+| `ulFbDivDecFrac` | `ClockParams+0x1C` |
+
+`AtiAdjustDisplayPll_V3::adjustDisplayPll(ClockParams *, …)` (`0x92aa0`) runs the VBIOS `AdjustDisplayPll` v3 table
+(`ADJUST_DISPLAY_PLL_INPUT/OUTPUT_PARAMETERS_V3`; config flags `0x40` dual link, `0x20` coherent, `0x10` SS) and
+writes back `ClockParams+0x04 = ulDispPllFreq`, **`+0x10 = ucRefDiv`, `+0x18 = ucPostDiv`**.
+
+**Open question:** nothing seen so far writes the **feedback divider** (`ClockParams+0x14`, ×10, and the fraction
+at `+0x1C`). The atombios.h comment says the driver derives it from the returned reference/post dividers
+(`fb = pllFreq × ref × post / refclk`). AMDSupport has no PLL-calculator symbol (only PLL assigners, adjust and
+spread spectrum), so look in the controller (`AMD9500Controller` / `ATIController`) for the code that fills
+`ClockParams` before `setPixelClock`. If no such code exists, CarrizoRed hooks `AtiSetPixelClock_V1_V6::setPixelClock`
+and computes it like Linux DC (`dce110_get_pix_clk_dividers`).
+
 ## Ghidra starting points
 
 Load each binary as **Mac OS X Mach-O, x86-64**. Run auto-analysis with the "Demangler GNU" analyzer enabled.
