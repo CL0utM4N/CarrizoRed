@@ -14,6 +14,9 @@
 #  For the debugfs files (VBIOS, firmware info) Secure Boot must be disabled in the firmware
 #  setup, otherwise kernel lockdown hides them.
 #
+#  Optional, for the register dump: Fedora `sudo dnf install -y umr`, Ubuntu `sudo apt install umr`.
+#  Works from Fedora and Ubuntu live sessions (and installed systems).
+#
 
 set -u
 
@@ -23,9 +26,11 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
-# A Rufus/Ubuntu live USB is mounted read-only at /cdrom; try to make it writable for the output.
-if [ ! -w "$here" ] && [ "$here" = "/cdrom" ]; then
-  mount -o remount,rw /cdrom 2>/dev/null
+# Live USBs are mounted read-only (Ubuntu: /cdrom, Fedora: /run/initramfs/live). If the script
+# runs from there, try to make that mount writable so the output lands on the stick.
+if [ ! -w "$here" ]; then
+  mp=$(findmnt -n -o TARGET --target "$here" 2>/dev/null)
+  [ -n "$mp" ] && [ "$mp" != "/" ] && mount -o remount,rw "$mp" 2>/dev/null
 fi
 base="$here"
 [ -w "$base" ] || base="${SUDO_USER:+/home/$SUDO_USER}"
@@ -97,7 +102,7 @@ dmesg | grep -iE "amdgpu|\[drm\]|VFCT|radeon" >"$out/gpu/dmesg-amdgpu.txt" 2>&1
 [ -s "$out/gpu/vbios.rom" ] || echo "No debugfs VBIOS: is Secure Boot disabled? (VFCT is in acpi/ anyway)" \
   >"$out/gpu/vbios-missing.txt"
 
-# umr (read-only register reads). Install with: sudo apt install umr
+# umr (read-only register reads). Install with: sudo dnf install umr / sudo apt install umr
 if command -v umr >/dev/null; then
   run gpu/umr-blocks.txt umr -lb
   for r in mmGB_ADDR_CONFIG mmGB_TILE_MODE0 mmGB_MACROTILE_MODE0 mmPA_SC_RASTER_CONFIG \
@@ -111,7 +116,7 @@ if command -v umr >/dev/null; then
     umr -O bits -r "*.*.$r" >>"$out/gpu/umr-registers.txt" 2>&1
   done
 else
-  echo "umr not installed (sudo apt install umr), register dump skipped" >"$out/gpu/umr-missing.txt"
+  echo "umr not installed (dnf/apt install umr), register dump skipped" >"$out/gpu/umr-missing.txt"
 fi
 
 # --- Pack ---------------------------------------------------------------------------------
