@@ -2,7 +2,7 @@
 """
 Build an OpenCore EFI for the ASUS VivoBook 15 D509BA (A9-9425, Stoney Ridge) test laptop.
 
-    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe] [--carrizored]
+    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe] [--carrizored [--spoof]]
 
 <work dir> must contain:
     unpacked/OpenCore-<ver>-RELEASE/        OpenCorePkg release zip, extracted
@@ -122,6 +122,9 @@ def main():
     with_gux = "--gux" in sys.argv[1:]
     with_probe = "--xhciprobe" in sys.argv[1:]
     with_cr = "--carrizored" in sys.argv[1:]
+    with_spoof = "--spoof" in sys.argv[1:]
+    if with_spoof and not with_cr:
+        die("--spoof needs --carrizored (it injects the VBIOS the Polaris drivers need)")
     if len(args) != 1:
         sys.exit(__doc__)
     work = Path(args[0]).resolve()
@@ -180,6 +183,11 @@ def main():
     cfg["DeviceProperties"]["Add"] = {
         "PciRoot(0x0)/Pci(0x1,0x0)": {"vendor-id": bytes.fromhex("FFFF0000")},
     }
+    if with_spoof:
+        # Phase 1 test (ROADMAP): let Apple's Polaris 11 (Baffin) drivers attach to the iGPU and record where they fail.
+        # 0x67EF is in the IOPCIMatch lists of AMD9500Controller, AMDRadeonX4000 (Baffin) and HWServices; CAIL reads
+        # the real device ID from config space, so it still takes its Stoney path (docs/APPLE_KEXTS.md).
+        cfg["DeviceProperties"]["Add"]["PciRoot(0x0)/Pci(0x1,0x0)"] = {"device-id": bytes.fromhex("EF670000")}
     cfg["DeviceProperties"]["Delete"] = {}
 
     # --- Kernel -----------------------------------------------------------------------------------
