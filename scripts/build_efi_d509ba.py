@@ -133,8 +133,14 @@ def main():
         ProtectUefiServices=False, ResizeAppleGpuBars=-1, AllowRelocationBlock=False, DiscardHibernateMap=False,
         ForceExitBootServices=False, ProvideMaxSlide=0)
 
-    # --- DeviceProperties: nothing yet (no GPU spoof for the first boot) --------------------------
-    cfg["DeviceProperties"]["Add"] = {}
+    # --- DeviceProperties ---------------------------------------------------------------------------
+    # Keep Apple's AMDSupport off the unsupported Stoney iGPU while installing: AMDSupport matches any display-class
+    # 1002:xxxx device (IOPCIMatch 0x00001002&0x0000FFFF) and panics in start() on a chip it doesn't know (NULL deref,
+    # first install attempt, 2026-10-09). IOPCIMatch compares the vendor-id *property*, so overriding it stops the
+    # match; the class code is left alone so the boot framebuffer keeps working. Remove once CarrizoRed handles the iGPU.
+    cfg["DeviceProperties"]["Add"] = {
+        "PciRoot(0x0)/Pci(0x1,0x0)": {"vendor-id": bytes.fromhex("FFFF0000")},
+    }
     cfg["DeviceProperties"]["Delete"] = {}
 
     # --- Kernel -----------------------------------------------------------------------------------
