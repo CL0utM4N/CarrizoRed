@@ -211,12 +211,33 @@ divider-style revisions DCE 11.0 VBIOSes use are still supported, and selected a
 (`ADJUST_DISPLAY_PLL_INPUT/OUTPUT_PARAMETERS_V3`; config flags `0x40` dual link, `0x20` coherent, `0x10` SS) and
 writes back `ClockParams+0x04 = ulDispPllFreq`, **`+0x10 = ucRefDiv`, `+0x18 = ucPostDiv`**.
 
-**Open question:** nothing seen so far writes the **feedback divider** (`ClockParams+0x14`, ×10, and the fraction
-at `+0x1C`). The atombios.h comment says the driver derives it from the returned reference/post dividers
-(`fb = pllFreq × ref × post / refclk`). AMDSupport has no PLL-calculator symbol (only PLL assigners, adjust and
-spread spectrum), so look in the controller (`AMD9500Controller` / `ATIController`) for the code that fills
-`ClockParams` before `setPixelClock`. If no such code exists, CarrizoRed hooks `AtiSetPixelClock_V1_V6::setPixelClock`
-and computes it like Linux DC (`dce110_get_pix_clk_dividers`).
+**The feedback divider is computed in `AMD9500Controller`, so the V5/V6 path is complete.**
+
+`AMD9500Controller::hwProgramPixelClock(crtc, clock)` (the mode-set entry):
+1. builds a 0x34-byte `ClockParams` (`+0x00 = this+0x31208`, `+0x08 = clock`), releases the PLL;
+2. calls vtable `+0xD50` (`getPllParameters`), which runs `adjustPllParameters` and then
+   `hwCalculateBasicClockParameters`;
+3. spread spectrum (`hwProgramPllSpreadSpectrum`), then `hwProgramPpllUsingBios(crtc, pll, params)`, which copies
+   the active connector info (0x98 bytes), sets **CRTC id at `+0x2D`** and **PLL index at `+0x2E`** (rejects PLL > 6), and
+   calls `AtomBiosProxy::setPixelClock`;
+4. `acquirePll`, `hwSetCrtcToPixelClock`, caches the PLL frequency per PLL (`this+0x312C8 + 0x38 + pll*4`).
+
+`AMD9500Controller::hwCalculateBasicClockParameters(crtc, ClockParams &, ATIConnection *)` (`0x53f40`) is a full PLL
+divider search (same idea as Linux `radeon_compute_pll_avivo`):
+- target = `+0x04` (the frequency `adjustDisplayPll` returned) if non-zero, otherwise `+0x08`;
+- skipped if ref, feedback and post dividers are all set; keeps the ref/post dividers `adjustDisplayPll` returned
+  and solves only for feedback when only those are set;
+- post divider range from VCO 600–1200 MHz (max 127), ref divider ≤ 255, feedback ×10 in 6…4095, fraction in
+  millionths, picks the closest match within 0.1 % (0.01 % for some connections, vtable `+0x198`);
+- `ClockParams`: `+0x00` reference clock, `+0x04` adjusted PLL freq, `+0x08` target, `+0x0C` achieved, `+0x10` ref
+  div, `+0x14` fb div ×10, `+0x18` post div, `+0x1C` fb fraction, `+0x24` spread-spectrum flag, `+0x30` SS-related.
+
+**Consequence:** the DCE 11.0 "driver must supply dividers" difference ([DCE11_REGISTER_DIFF.md](DCE11_REGISTER_DIFF.md),
+pixel clock) is already handled by Apple's code for V5/V6 VBIOSes. No pixel-clock patch is expected. Things to
+verify on hardware: the 600–1200 MHz VCO limits match Carrizo's PLLs (Linux takes them from the VBIOS firmware info),
+and the PLL index the Baffin assigner hands out (sent raw as `ucPpll`). Carrizo only has `ATOM_PPLL1` (0),
+`ATOM_PPLL2` (1) and external/DCPLL, while Baffin has 6 combo-PHY PLLs. The PLL count probably comes from
+`BaffinSharedController::getNumPixelClocks`.
 
 ## Ghidra starting points
 
