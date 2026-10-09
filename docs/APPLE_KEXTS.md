@@ -239,6 +239,28 @@ and the PLL index the Baffin assigner hands out (sent raw as `ucPpll`). Carrizo 
 `ATOM_PPLL2` (1) and external/DCPLL, while Baffin has 6 combo-PHY PLLs. The PLL count probably comes from
 `BaffinSharedController::getNumPixelClocks`.
 
+### Pipes and line buffers
+- `BaffinSharedController::getNumLineBuffers()` returns **6** (one line buffer per pipe). Carrizo has 3 pipes, Stoney 2
+  (Linux DC `carrizo_resource_cap` / `stoney_resource_cap`). Planned patch: wrap it to return 3 / 2. Still to find:
+  where Apple gets its CRTC count (no `getNum*Crtc*` symbol exists; candidates are the VBIOS display-path table or
+  a per-pipe loop bound elsewhere).
+- `BaffinLineBuffer::initWithController(pipe, ctrl)` sets size `this+0x34 = 0x6013`, `this+0x28 = LBOffset[pipe]`
+  (per-pipe register block table), and `this+0x30 = 1` (not shared, so `AtiLineBuffer::getLbSize()` returns the full
+  value; it halves it when the flag is clear). `BaffinLineBuffer::calculatePitch(depth, width)` returns entries per
+  line: `(w+7)/8`, `≈4w/3/8`, `≈5w/3/8`, `(w+3)/4` for the four depths.
+- `BaffinSharedController::getNumNotUsedLbLines` / `hwGetDisplayLineBufferPixels` only do arithmetic on `getLbSize()`
+  (used by `canEnablePrefetch` and the scaler).
+- `AMD9500Controller::hwProgramDisplayLineBuffer(crtc)` calls the line buffer's vtable `+0x188` and
+  `+0x1A0(params+0x53C)` (setup, then pixel storage depth).
+- Linux programs `LB_MEMORY_SIZE = 1712 (0x6B0)` for both DCE 11.0 and 11.2 (`dce_transform_construct`), which fits
+  Carrizo's 12-bit field. Apple's `0x6013` is an internal capacity in different units. Low risk for first light
+  (only affects how many lines fit for scaled or very wide modes); revisit if underflow (flicker or tearing) appears.
+
+### Register `0x13E` (Polaris `PHYPLLF_PIXCLK_RESYNC_CNTL` = Carrizo `PHYPLL_PIXCLK_CNTL`)
+A whole-binary scalar search of `AMD9500Controller` for `0x13e` and `0x4f8` finds **no** instruction operands. The
+resync registers may still come from a data table (Polaris's six are at irregular offsets). Watch for it on the first
+boot (pixel-clock changes, `hwSetCrtcToPixelClock`).
+
 ### PLL indexes (planned patch, waiting for hardware data)
 `BaffinSharedController::getNumPixelClocks()` (`0x2f490`) returns **7** (Baffin PHY PLLs 0–5, plus index 6, which
 `hwProgramPixelClock` turns into `0xFE` = no PLL). The V6 handler sends the PLL index **unchanged** as `ucPpll`.
