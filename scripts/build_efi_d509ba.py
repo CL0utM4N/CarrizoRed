@@ -64,6 +64,18 @@ SSDTS = {  # compiled from docs/opencore/<name>.dsl into <work dir>/acpi/
 }
 
 
+# AppleUSBXHCI::reset() waits only 100 ms for USBCMD.HCRST to clear (clock_interval_to_deadline(100, 1000000)).
+# The D509BA's FCH xHCI (1022:7914) needs ~105 ms, so the driver declares it dead and powers it off (XHCIProbe trace,
+# docs/TEST_MACHINES.md). Raise the wait to 1000 ms. The search starts at reset() itself and the first
+# "mov edi, 100; mov esi, 1000000" in it is that deadline (offset 0x23b in 15.8.1). Linux allows up to 10 s.
+XHCI_RESET_PATCH = {
+    "Arch": "x86_64", "Base": "__ZN12AppleUSBXHCI5resetEv", "Comment": "AppleUSBXHCI reset() timeout 100 -> 1000 ms",
+    "Count": 1, "Enabled": True, "Find": bytes.fromhex("bf64000000be40420f00"),
+    "Identifier": "com.apple.driver.usb.AppleUSBXHCI", "Limit": 0x400, "Mask": b"", "MaxKernel": "",
+    "MinKernel": "20.0.0", "Replace": bytes.fromhex("bfe8030000be40420f00"), "ReplaceMask": b"", "Skip": 0,
+}
+
+
 def die(msg):
     sys.exit(f"error: {msg}")
 
@@ -183,7 +195,7 @@ def main():
     cfg["Kernel"]["Add"] = adds
     cfg["Kernel"]["Block"] = []
     cfg["Kernel"]["Force"] = []
-    cfg["Kernel"]["Patch"] = amd_vanilla_patches(work / "downloads" / "AMD_Vanilla-patches.plist")
+    cfg["Kernel"]["Patch"] = amd_vanilla_patches(work / "downloads" / "AMD_Vanilla-patches.plist") + [XHCI_RESET_PATCH]
     cfg["Kernel"]["Emulate"].update(DummyPowerManagement=True, Cpuid1Data=b"", Cpuid1Mask=b"")
     cfg["Kernel"]["Quirks"].update(
         AppleCpuPmCfgLock=False, AppleXcpmCfgLock=False, AppleXcpmExtraMsrs=False, DisableIoMapper=False,
