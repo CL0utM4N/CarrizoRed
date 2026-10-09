@@ -2,7 +2,7 @@
 """
 Build an OpenCore EFI for the ASUS VivoBook 15 D509BA (A9-9425, Stoney Ridge) test laptop.
 
-    python scripts/build_efi_d509ba.py <work dir>
+    python scripts/build_efi_d509ba.py <work dir> [--gux]
 
 <work dir> must contain:
     unpacked/OpenCore-<ver>-RELEASE/        OpenCorePkg release zip, extracted
@@ -47,6 +47,11 @@ KEXTS = [  # (bundle path inside its release folder, executable, comment)
     ("RestrictEvents-*/RestrictEvents.kext", "RestrictEvents", "CPU name, misc. fixes"),
     ("NVMeFix-*/NVMeFix.kext", "NVMeFix", "NVMe power management"),
 ]
+
+# Optional (--gux): GenericUSBXHCI "RyzenXHCIFix" (github.com/RattletraPM/GUX-RyzenXHCIFix, unpacked to unpacked/GUX/).
+# Experiment for the XHCI "reset failed" problem (2026-10-09): on some AMD APUs, letting GUX run its early init and
+# bail out makes AppleUSBXHCIPCI work afterwards.
+GUX_KEXT = ("GUX/GenericUSBXHCI.kext", "GenericUSBXHCI", "Experimental: AMD APU XHCI init workaround")
 
 DRIVERS = ["OpenRuntime.efi", "OpenHfsPlus.efi", "ResetNvramEntry.efi"]
 
@@ -96,9 +101,11 @@ def smbios(work, oc):
 
 
 def main():
-    if len(sys.argv) != 2:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    with_gux = "--gux" in sys.argv[1:]
+    if len(args) != 1:
         sys.exit(__doc__)
-    work = Path(sys.argv[1]).resolve()
+    work = Path(args[0]).resolve()
     unpacked = work / "unpacked"
     oc = one(unpacked, "OpenCore-*-RELEASE")
     ssdts = [work / "acpi" / n for n in SSDTS]
@@ -158,7 +165,7 @@ def main():
 
     # --- Kernel -----------------------------------------------------------------------------------
     adds = []
-    for pattern, exe, comment in KEXTS:
+    for pattern, exe, comment in KEXTS + ([GUX_KEXT] if with_gux else []):
         src = one(unpacked, pattern)
         if "/PlugIns/" not in pattern:
             shutil.copytree(src, ocdir / "Kexts" / src.name)
