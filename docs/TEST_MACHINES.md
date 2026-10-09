@@ -64,6 +64,11 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   its firmware (`U3D0` → `LXFW`) through SMI 0x66. Fix: XOSI now claims only up to "Windows 2009" (`OSVR = 0x0E`):
   the HPET stays on (needs `>= 0x0C`) and the FCH D3cold flags are cleared. The AMD I²C/GPIO/UART devices then report
   absent (they need `>= 0x0F`); revisit this if the I²C trackpad is ever wanted.
+- **Attempt 5 (XOSI = Windows 7, XHCIProbe 0.2.0):** `_S0W = 0`, so D3cold is off, but USB is still dead. The 1 ms trace
+  shows the real failure: `+0 D0 halted; +150 USBCMD=HCRST (Apple's reset); +255 HCRST clear, ready; +263 D3, dead`.
+  Apple's reset *succeeds*, but takes ~105 ms (ours took 12 ms at probe time). `AppleUSBXHCI::reset()` gives up just
+  before that ("reset failed" `0xe00002c9` = `kIOReturnIOError`), and the driver powers the controller off for good.
+  Linux allows the xHCI reset up to 10 s. Next: read `AppleUSBXHCI::reset()` and lengthen its wait (Lilu hook).
 - The `shared_region … vm_shared_region_start_address() failed` and launchd `error = 37` lines in verbose recovery
   are noise; processes keep running.
 
