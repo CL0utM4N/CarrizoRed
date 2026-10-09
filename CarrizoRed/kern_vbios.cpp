@@ -37,7 +37,7 @@ static OSData *copyAcpiTable(const char *signature) {
 static bool isAtomBios(const uint8_t *image, uint32_t size) {
 	if (size < 0x4A || image[0] != 0x55 || image[1] != 0xAA)
 		return false;
-	uint32_t header = image[0x48] | (image[0x49] << 8);
+	uint32_t header = static_cast<uint32_t>(image[0x48]) | (static_cast<uint32_t>(image[0x49]) << 8);
 	if (!header || header + 8 > size)
 		return false;
 	auto *magic = image + header + 4;
