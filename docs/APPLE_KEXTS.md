@@ -239,6 +239,19 @@ and the PLL index the Baffin assigner hands out (sent raw as `ucPpll`). Carrizo 
 `ATOM_PPLL2` (1) and external/DCPLL, while Baffin has 6 combo-PHY PLLs. The PLL count probably comes from
 `BaffinSharedController::getNumPixelClocks`.
 
+### PLL indexes (planned patch, waiting for hardware data)
+`BaffinSharedController::getNumPixelClocks()` (`0x2f490`) returns **7** (Baffin PHY PLLs 0–5, plus index 6, which
+`hwProgramPixelClock` turns into `0xFE` = no PLL). The V6 handler sends the PLL index **unchanged** as `ucPpll`.
+Linux DC's DCE 11.0 mapping (`dc/bios/dce110/command_table_helper_dce110.c`):
+`PLL0 → ATOM_PPLL0 (2)`, `PLL1 → ATOM_PPLL1 (0)`, `PLL2 → ATOM_PPLL2 (1)` (not created for Carrizo),
+external / DP DTO → `ATOM_PPLL_INVALID (0xFF)`. Carrizo's DC resource has `num_pll = 2`.
+
+So on Carrizo, Apple index 0 and 2 are real pixel PLLs, 1 is doubtful, and 3–5 must never be used. Planned fix:
+wrap `getNumPixelClocks` (return 2) and remap the index before `SetPixelClock`/spread spectrum/transmitter
+control (Apple 0 → ATOM 0, Apple 1 → ATOM 2). Before writing it, get from the first boot: the VBIOS
+`SetPixelClock` revision (Apple logs `ATOM: … offset:%#x, V %u.%u` at debug level) and the PLLs the assigner
+hands out (`AtiPllAssigner::printPllInfo`).
+
 ## Ghidra starting points
 
 Load each binary as **Mac OS X Mach-O, x86-64**. Run auto-analysis with the "Demangler GNU" analyzer enabled.
