@@ -56,6 +56,14 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   `_STA` reports it disabled (needs `OSVR >= 0x0C`) and clears `HPEN`. Fix: `SSDT-XOSI` + `_OSI → XOSI` rename
   (DSDT, 24 hits) so the firmware sees Windows 10 under macOS. HPET `_CRS` already holds IRQ 0/8 and RTC drops its IRQ
   when `HPEN` = 1, so no IRQ patching is needed.
+- **Attempt 4 (XOSI claiming Windows 10):** keyboard works, but XHC0 (`1022:7914`) is dead: AppleUSBXHCIPCI fails
+  its first power-on ("reset failed" `0xe00002c9`), the controller stays powered off, and the installer waits for its
+  root device forever. EHCI is fine. XHCIProbe showed the controller healthy when macOS first finds it (D0, no BIOS
+  owner, HCRST done in 12 ms), so the reset itself is not the problem. The DSDT is: with `OSVR >= 0x0F` the firmware
+  keeps `XHCD` set, which arms D3cold. `XHC0._PS3` then power-gates the xHCI through SMI 0x67, and `_PS0` must reload
+  its firmware (`U3D0` → `LXFW`) through SMI 0x66. Fix: XOSI now claims only up to "Windows 2009" (`OSVR = 0x0E`):
+  the HPET stays on (needs `>= 0x0C`) and the FCH D3cold flags are cleared. The AMD I²C/GPIO/UART devices then report
+  absent (they need `>= 0x0F`); revisit this if the I²C trackpad is ever wanted.
 - The `shared_region … vm_shared_region_start_address() failed` and launchd `error = 37` lines in verbose recovery
   are noise; processes keep running.
 
