@@ -146,6 +146,11 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 			static_cast<unsigned long>(size));
 		if (i == KextPolarisController)
 			patchPolarisController(patcher, index, slide, size);
+		else if (i == KextRadeonX4000)
+			blockAcceleration(patcher, index, slide, size, "__ZN37AMDRadeonX4000_AMDGraphicsAccelerator5probeEP9IOServicePi");
+		else if (i == KextRadeonX4000HWServices)
+			blockAcceleration(patcher, index, slide, size,
+				"__ZN42AMDRadeonX4000_AMDRadeonHWServicesAbstract5probeEP9IOServicePi");
 		return;
 	}
 }
@@ -170,6 +175,22 @@ void CRDriver::patchPolarisController(KernelPatcher &patcher, size_t index, mach
 		patcher.clearError();
 	}
 }
+
+// -crnoaccel: keep Apple's acceleration stack (AMDRadeonX4000 accelerator, HWServices/CAIL) off the iGPU so the display
+// controller (AMD9500Controller) can be brought up on its own. Their probe() reports no match.
+void CRDriver::blockAcceleration(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, const char *probe) {
+	if (!checkKernelArgument("-crnoaccel"))
+		return;
+	KernelPatcher::RouteRequest request {probe, wrapProbeNoMatch};
+	if (patcher.routeMultiple(index, &request, 1, slide, size)) {
+		SYSLOG("cr", "-crnoaccel: %s will not match", probe);
+	} else {
+		SYSLOG("cr", "-crnoaccel: failed to route %s (error %d)", probe, patcher.getError());
+		patcher.clearError();
+	}
+}
+
+IOService *CRDriver::wrapProbeNoMatch(IOService *, IOService *, SInt32 *) { return nullptr; }
 
 uint32_t CRDriver::wrapGetDisplayLimit(void *) { return displayPipes(callback->family); }
 

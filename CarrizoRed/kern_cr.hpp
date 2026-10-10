@@ -25,6 +25,9 @@ private:
 	static uint32_t wrapGetDisplayLimit(void *that);
 	static uint8_t wrapGetNumLineBuffers(void *that);
 
+	void blockAcceleration(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, const char *probe);
+	static IOService *wrapProbeNoMatch(IOService *that, IOService *provider, SInt32 *score);
+
 	void findByConfigSpace();
 	void logPCIInfo();
 	void probeMMIO();
