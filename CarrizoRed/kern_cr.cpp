@@ -13,6 +13,7 @@
 #include <Headers/kern_devinfo.hpp>
 #include <Headers/kern_iokit.hpp>
 #include <Headers/kern_util.hpp>
+#include <IOKit/IODeviceMemory.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <kern/thread.h>
 #include <kern/debug.h>
@@ -641,8 +642,31 @@ void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_add
 }
 
 void CRDriver::traceFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
-	if (!checkKernelArgument("-crnotrace"))
-		routeStages(patcher, index, slide, size, InFramebuffer);
+	if (checkKernelArgument("-crnotrace"))
+		return;
+	routeStages(patcher, index, slide, size, InFramebuffer);
+	KernelPatcher::RouteRequest request {"__ZN14AMDFramebuffer16getApertureRangeEi", wrapGetApertureRange,
+		orgGetApertureRange};
+	if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+		SYSLOG("cr", "trace: failed to route getApertureRange (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+}
+
+// The physical range IOFramebuffer and WindowServer map to draw. Spoof boots 5-10 froze the whole machine as the GUI
+// started, outside every traced function and with the IH never enabled; a CPU access to a physical address nothing
+// decodes (e.g. one built from ATY,vram_base = the GPU-side 0xF4_0000_0000 instead of BAR0 at 0xE000_0000) would do
+// that. Print it before handing it out (thread context).
+IODeviceMemory *CRDriver::wrapGetApertureRange(void *that, int aperture) {
+	auto *mem = FunctionCast(wrapGetApertureRange, callback->orgGetApertureRange)(that, aperture);
+	if (mem)
+		IOLog("CarrizoRed: fb.getApertureRange(%d) -> phys 0x%llx length 0x%llx\n", aperture,
+			static_cast<uint64_t>(mem->getPhysicalAddress()), static_cast<uint64_t>(mem->getLength()));
+	else
+		IOLog("CarrizoRed: fb.getApertureRange(%d) -> none\n", aperture);
+	traceEvent("fb.getApertureRange", true, mem ? static_cast<uint32_t>(mem->getPhysicalAddress() >> 20) : 0);
+	IOSleep(30);
+	return mem;
 }
 
 void CRDriver::traceSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {

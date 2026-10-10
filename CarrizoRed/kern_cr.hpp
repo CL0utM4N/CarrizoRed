@@ -7,6 +7,7 @@
 #define kern_cr_hpp
 
 #include <Headers/kern_patcher.hpp>
+#include <IOKit/IODeviceMemory.h>
 #include <IOKit/pci/IOPCIDevice.h>
 
 #include "kern_asic.hpp"
@@ -46,6 +47,8 @@ private:
 	void traceController(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
 	void traceSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
 	void traceFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
+	static IODeviceMemory *wrapGetApertureRange(void *that, int aperture);
+	mach_vm_address_t orgGetApertureRange {0};
 	static IOService *wrapAtiProbe(IOService *that, IOService *provider, SInt32 *score);
 	static bool wrapAtiStart(IOService *that, IOService *provider);
 	mach_vm_address_t orgAtiProbe {0}, orgAtiStart {0};
