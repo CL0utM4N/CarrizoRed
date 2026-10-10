@@ -9,7 +9,7 @@
 
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOPlatformExpert.h>
-#include <IOKit/acpi/IOACPIPlatformExpert.h>
+#include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/IORegistryEntry.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
@@ -21,20 +21,27 @@ static void setStatus(IOPCIDevice *pci, const char *status) {
 	SYSLOG("vbios", "%s", status);
 }
 
-// The firmware's copy of an ACPI table, from the ACPI platform expert (AppleACPIPlatformExpert). It doesn't publish
-// an "ACPI Tables" property this early in boot, so ask it directly.
+// The firmware's copy of an ACPI table. The platform expert has no "ACPI Tables" property this early in boot and its
+// getACPITableData() is protected, but any ACPI device node can return a table: use the iGPU's own node ("acpi-device",
+// set by IOPCIFamily), else \_SB.
 static const OSData *copyAcpiTable(IOPCIDevice *pci, const char *signature) {
-	auto *expert = OSDynamicCast(IOACPIPlatformExpert, IOService::getPlatform());
-	if (!expert) {
-		setStatus(pci, "platform expert is not an IOACPIPlatformExpert");
+	IOACPIPlatformDevice *acpi = OSDynamicCast(IOACPIPlatformDevice, pci->getProperty("acpi-device"));
+	IORegistryEntry *sb = nullptr;
+	if (!acpi) {
+		sb = IORegistryEntry::fromPath("IOACPIPlane:/_SB");
+		acpi = OSDynamicCast(IOACPIPlatformDevice, sb);
+	}
+	if (!acpi) {
+		setStatus(pci, "no ACPI device to read tables through");
+		OSSafeReleaseNULL(sb);
 		return nullptr;
 	}
-	auto *table = expert->getACPITableData(signature, 0);
-	if (!table) {
+	auto *table = acpi->getACPITableData(signature, 0);
+	if (table)
+		table->retain();
+	else
 		setStatus(pci, "getACPITableData(VFCT) returned nothing");
-		return nullptr;
-	}
-	table->retain();
+	OSSafeReleaseNULL(sb);
 	return table;
 }
 
