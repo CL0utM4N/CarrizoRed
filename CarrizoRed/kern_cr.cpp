@@ -18,7 +18,7 @@
 #include <stdarg.h>
 
 // Short summary of the bring-up trace, repeated by the watcher so it survives the console scrolling.
-static char traceSummary[640];
+static char traceSummary[1024];
 
 static void traceNote(const char *fmt, ...) {
 	size_t len = strlen(traceSummary);
@@ -308,31 +308,42 @@ namespace {
 	struct TracedStage {
 		const char *symbol;
 		const char *name;
+		bool inSupport;  // defined in AMDSupport (else AMD9500Controller)
 		mach_vm_address_t org;
 	};
 
+	// Results are IOReturn-style ints or bools; both are logged as the low 32 bits.
 	TracedStage stages[] {
-		{"__ZN17AMD9500Controller21initializeProjectInfoEv", "initializeProjectInfo", 0},
-		{"__ZN17AMD9500Controller19initializeResourcesEv", "initializeResources", 0},
-		{"__ZN17AMD9500Controller35initializeProjectDependentResourcesEv", "initializeProjectDependentResources", 0},
-		{"__ZN17AMD9500Controller18initializeHardwareEv", "initializeHardware", 0},
-		{"__ZN17AMD9500Controller19initializePowerPlayEv", "initializePowerPlay", 0},
-		{"__ZN17AMD9500Controller24initializeConnectionInfoEv", "initializeConnectionInfo", 0},
-		{"__ZN17AMD9500Controller13initializeICMEv", "initializeICM", 0},
+		{"__ZN17AMD9500Controller21initializeProjectInfoEv", "initializeProjectInfo", false, 0},
+		{"__ZN17AMD9500Controller19initializeResourcesEv", "initializeResources", false, 0},
+		{"__ZN17AMD9500Controller35initializeProjectDependentResourcesEv", "initializeProjectDependentResources", false, 0},
+		{"__ZN17AMD9500Controller18initializeHardwareEv", "initializeHardware", false, 0},
+		{"__ZN17AMD9500Controller19initializePowerPlayEv", "initializePowerPlay", false, 0},
+		{"__ZN17AMD9500Controller24initializeConnectionInfoEv", "initializeConnectionInfo", false, 0},
+		{"__ZN17AMD9500Controller13initializeICMEv", "initializeICM", false, 0},
+		// Inside initializeResources: powerUpHardware (vtable +0xcd0) runs ASIC_Init when detectPowerDown (+0x9a8) says
+		// so; createAsicInfo -> AtiAsicInfo::initWithController -> ASIC_INFO__BAFFIN::populate*.
+		{"__ZN17AMD9500Controller15powerUpHardwareEv", "powerUpHardware", false, 0},
+		{"__ZN17AMD9500Controller15detectPowerDownEv", "detectPowerDown", false, 0},
+		{"__ZN17ASIC_INFO__BAFFIN18populateDeviceInfoEv", "populateDeviceInfo", false, 0},
+		{"__ZN17ASIC_INFO__BAFFIN18populateFbLocationEv", "populateFbLocation", false, 0},
+		{"__ZN17ASIC_INFO__BAFFIN20populateMemoryConfigEv", "populateMemoryConfig", false, 0},
+		{"__ZN13AtomBiosProxy14initializeAsicEv", "initializeAsic", true, 0},
+		{"__ZN11AtiAsicInfo18initWithControllerEP13ATIController", "AsicInfo.initWithController", true, 0},
 	};
 
-	// The stages return an IOReturn-style int; pass the whole register back unchanged.
+	// Two pointer-sized arguments cover every traced function (this, plus at most one argument).
 	template <size_t N>
-	uint64_t wrapStage(void *that) {
-		IOLog("CarrizoRed: AMD9500Controller::%s ...\n", stages[N].name);
-		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(that);
-		IOLog("CarrizoRed: AMD9500Controller::%s -> 0x%x\n", stages[N].name, static_cast<uint32_t>(ret));
+	uint64_t wrapStage(void *that, void *arg) {
+		IOLog("CarrizoRed: %s ...\n", stages[N].name);
+		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(that, arg);
+		IOLog("CarrizoRed: %s -> 0x%x\n", stages[N].name, static_cast<uint32_t>(ret));
 		traceNote("%s=%x ", stages[N].name, static_cast<uint32_t>(ret));
 		return ret;
 	}
 
-	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
-		static_assert(arrsize(stages) == 7, "one wrapper per stage");
+	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, bool support) {
+		static_assert(arrsize(stages) == 14, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			reinterpret_cast<mach_vm_address_t>(wrapStage<0>),
 			reinterpret_cast<mach_vm_address_t>(wrapStage<1>),
@@ -341,8 +352,17 @@ namespace {
 			reinterpret_cast<mach_vm_address_t>(wrapStage<4>),
 			reinterpret_cast<mach_vm_address_t>(wrapStage<5>),
 			reinterpret_cast<mach_vm_address_t>(wrapStage<6>),
+			reinterpret_cast<mach_vm_address_t>(wrapStage<7>),
+			reinterpret_cast<mach_vm_address_t>(wrapStage<8>),
+			reinterpret_cast<mach_vm_address_t>(wrapStage<9>),
+			reinterpret_cast<mach_vm_address_t>(wrapStage<10>),
+			reinterpret_cast<mach_vm_address_t>(wrapStage<11>),
+			reinterpret_cast<mach_vm_address_t>(wrapStage<12>),
+			reinterpret_cast<mach_vm_address_t>(wrapStage<13>),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
+			if (stages[i].inSupport != support)
+				continue;
 			KernelPatcher::RouteRequest request {stages[i].symbol, wrappers[i], stages[i].org};
 			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
 				SYSLOG("cr", "trace: failed to route %s (error %d)", stages[i].name, patcher.getError());
@@ -354,12 +374,13 @@ namespace {
 
 void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	if (!checkKernelArgument("-crnotrace"))
-		routeStages(patcher, index, slide, size);
+		routeStages(patcher, index, slide, size, false);
 }
 
 void CRDriver::traceSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	if (checkKernelArgument("-crnotrace"))
 		return;
+	routeStages(patcher, index, slide, size, true);
 	KernelPatcher::RouteRequest requests[] {
 		{"__ZN13ATIController5probeEP9IOServicePi", wrapAtiProbe, orgAtiProbe},
 		{"__ZN13ATIController5startEP9IOService", wrapAtiStart, orgAtiStart},
