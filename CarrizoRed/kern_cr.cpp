@@ -402,11 +402,11 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 // MC_VM_FB_LOCATION (0xF4_0000_0000 on the D509BA); with the flag set, Apple takes the base from
 // AtiAsicInfo::getFbLocationBase() instead. -crnomcloc disables this.
 void CRDriver::patchSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
-	if (!checkKernelArgument("-crnomcloc")) {
+	{
 		KernelPatcher::RouteRequest request {"__ZN13ATIController17getConfigPropertyEPKcPvj", wrapGetConfigProperty,
 			orgGetConfigProperty};
 		if (patcher.routeMultiple(index, &request, 1, slide, size)) {
-			SYSLOG("cr", "CFG_NON_ZERO_MC_LOC forced on");
+			SYSLOG("cr", "aty_config overrides active");
 		} else {
 			SYSLOG("cr", "failed to route ATIController::getConfigProperty (error %d)", patcher.getError());
 			patcher.clearError();
@@ -433,11 +433,29 @@ bool CRDriver::wrapTestVram(void *that, uint32_t region, bool flag) {
 	return true;
 }
 
+// aty_config options CarrizoRed overrides (all booleans), each with a boot-arg that leaves Apple's value alone.
+//  CFG_NON_ZERO_MC_LOC: see patchSupport.
+//  CFG_NO_PP: no PowerPlay. Apple's PowerPlay drives the Polaris SMU7 power controller; Stoney has an SMU8, which
+//  also controls the CPU and memory clocks. Spoof boots 5-7 froze the whole machine instantly as the GUI (and AGPM's
+//  power management) started, outside every traced display function.
+static const struct {
+	const char *name;
+	const char *keepArg;
+} configOverrides[] {
+	{"CFG_NON_ZERO_MC_LOC", "-crnomcloc"},
+	{"CFG_NO_PP", "-crpp"},
+};
+
 uint64_t CRDriver::wrapGetConfigProperty(void *that, const char *name, void *value, uint32_t size) {
 	auto ret = FunctionCast(wrapGetConfigProperty, callback->orgGetConfigProperty)(that, name, value, size);
-	if (name && value && size && !strcmp(name, "CFG_NON_ZERO_MC_LOC")) {
-		memset(value, 0, size);
-		*static_cast<uint8_t *>(value) = 1;
+	if (!name || !value || !size)
+		return ret;
+	for (auto &option : configOverrides) {
+		if (!strcmp(name, option.name) && !checkKernelArgument(option.keepArg)) {
+			memset(value, 0, size);
+			*static_cast<uint8_t *>(value) = 1;
+			traceEvent(option.name, true, 1);
+		}
 	}
 	return ret;
 }
@@ -489,6 +507,9 @@ namespace {
 		{"__ZN14AMDFramebuffer18setPanelPowerStateEj", "fb.setPanelPowerState", InFramebuffer, false, true, 0},
 		{"__ZN14AMDFramebuffer19setOutputPowerStateEj", "fb.setOutputPowerState", InFramebuffer, false, true, 0},
 		{"__ZN14AMDFramebuffer19setSystemPowerStateEj", "fb.setSystemPowerState", InFramebuffer, false, true, 0},
+		// AGPM drives these.
+		{"__ZN14AMDFramebuffer13setPowerLevelEj", "fb.setPowerLevel", InFramebuffer, false, true, 0},
+		{"__ZN14AMDFramebuffer13setPowerLimitEj", "fb.setPowerLimit", InFramebuffer, false, true, 0},
 		{"__ZN14AMDFramebuffer12setAttributeEjm", "fb.setAttribute", InFramebuffer, false, false, 0},
 		{"__ZN14AMDFramebuffer25setAttributeForConnectionEijm", "fb.setAttributeForConnection", InFramebuffer, false, false, 0},
 		{"__ZN14AMDFramebuffer12connectFlagsEiiPj", "fb.connectFlags", InFramebuffer, false, false, 0},
@@ -529,14 +550,14 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 41, "one wrapper per stage");
+		static_assert(arrsize(stages) == 43, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
 			CR_WRAP(16), CR_WRAP(17), CR_WRAP(18), CR_WRAP(19), CR_WRAP(20), CR_WRAP(21), CR_WRAP(22), CR_WRAP(23),
 			CR_WRAP(24), CR_WRAP(25), CR_WRAP(26), CR_WRAP(27), CR_WRAP(28), CR_WRAP(29), CR_WRAP(30), CR_WRAP(31),
 			CR_WRAP(32), CR_WRAP(33), CR_WRAP(34), CR_WRAP(35), CR_WRAP(36), CR_WRAP(37), CR_WRAP(38), CR_WRAP(39),
-			CR_WRAP(40),
+			CR_WRAP(40), CR_WRAP(41), CR_WRAP(42),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
