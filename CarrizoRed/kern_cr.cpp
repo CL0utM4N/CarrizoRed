@@ -71,6 +71,9 @@ static const char *pathPolarisController[] {
 	"/System/Library/Extensions/AMD9500Controller.kext/Contents/MacOS/AMD9500Controller"};
 static const char *pathSupport[] {"/System/Library/Extensions/AMDSupport.kext/Contents/MacOS/AMDSupport"};
 static const char *pathFramebuffer[] {"/System/Library/Extensions/AMDFramebuffer.kext/Contents/MacOS/AMDFramebuffer"};
+static const char *pathAgpm[] {
+	"/System/Library/Extensions/AppleGraphicsPowerManagement.kext/Contents/MacOS/AppleGraphicsPowerManagement"};
+static const char *pathAgdp[] {"/System/Library/Extensions/AppleGraphicsControl.kext/Contents/PlugIns/AppleGraphicsDevicePolicy.kext/Contents/MacOS/AppleGraphicsDevicePolicy"};
 
 enum KextIndex : size_t {
 	KextRadeonX4000,
@@ -78,6 +81,8 @@ enum KextIndex : size_t {
 	KextPolarisController,
 	KextSupport,
 	KextFramebuffer,
+	KextAgpm,
+	KextAgdp,
 	KextCount,
 };
 
@@ -91,6 +96,9 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 	[KextSupport] = {"com.apple.kext.AMDSupport", pathSupport, arrsize(pathSupport), {}, {},
 		KernelPatcher::KextInfo::Unloaded},
 	[KextFramebuffer] = {"com.apple.kext.AMDFramebuffer", pathFramebuffer, arrsize(pathFramebuffer), {}, {},
+		KernelPatcher::KextInfo::Unloaded},
+	[KextAgpm] = {"com.apple.driver.AGPM", pathAgpm, arrsize(pathAgpm), {}, {}, KernelPatcher::KextInfo::Unloaded},
+	[KextAgdp] = {"com.apple.driver.AppleGraphicsDevicePolicy", pathAgdp, arrsize(pathAgdp), {}, {},
 		KernelPatcher::KextInfo::Unloaded},
 };
 
@@ -209,11 +217,22 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 		}
 		else if (i == KextFramebuffer)
 			traceFramebuffer(patcher, index, slide, size);
+		else if (i == KextAgpm) {
+			blockProbe(patcher, index, slide, size, "__ZN14AGPMController5probeEP9IOServicePi", "-crnoagpm");
+			blockProbe(patcher, index, slide, size, "__ZN4AGPM5probeEP9IOServicePi", "-crnoagpm");
+		} else if (i == KextAgdp && checkKernelArgument("-crnoagdp")) {
+			KernelPatcher::RouteRequest request {"__ZN32AppleGraphicsDeviceControlClient5startEP9IOService", wrapStartFail};
+			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+				SYSLOG("cr", "-crnoagdp: failed to route (error %d)", patcher.getError());
+				patcher.clearError();
+			}
+		}
 		else if (i == KextRadeonX4000)
-			blockAcceleration(patcher, index, slide, size, "__ZN37AMDRadeonX4000_AMDGraphicsAccelerator5probeEP9IOServicePi");
+			blockProbe(patcher, index, slide, size, "__ZN37AMDRadeonX4000_AMDGraphicsAccelerator5probeEP9IOServicePi",
+				"-crnoaccel");
 		else if (i == KextRadeonX4000HWServices)
-			blockAcceleration(patcher, index, slide, size,
-				"__ZN42AMDRadeonX4000_AMDRadeonHWServicesAbstract5probeEP9IOServicePi");
+			blockProbe(patcher, index, slide, size,
+				"__ZN42AMDRadeonX4000_AMDRadeonHWServicesAbstract5probeEP9IOServicePi", "-crnoaccel");
 		return;
 	}
 }
@@ -438,12 +457,15 @@ bool CRDriver::wrapTestVram(void *that, uint32_t region, bool flag) {
 //  CFG_NO_PP: no PowerPlay. Apple's PowerPlay drives the Polaris SMU7 power controller; Stoney has an SMU8, which
 //  also controls the CPU and memory clocks. Spoof boots 5-7 froze the whole machine instantly as the GUI (and AGPM's
 //  power management) started, outside every traced display function.
+//  CFG_NO_MSI (opt-in with -crnomsi): legacy interrupts instead of MSI for the display controller.
 static const struct {
 	const char *name;
-	const char *keepArg;
+	const char *arg;
+	bool optIn;  // apply only with arg (else: apply unless arg)
 } configOverrides[] {
-	{"CFG_NON_ZERO_MC_LOC", "-crnomcloc"},
-	{"CFG_NO_PP", "-crpp"},
+	{"CFG_NON_ZERO_MC_LOC", "-crnomcloc", false},
+	{"CFG_NO_PP", "-crpp", false},
+	{"CFG_NO_MSI", "-crnomsi", true},
 };
 
 uint64_t CRDriver::wrapGetConfigProperty(void *that, const char *name, void *value, uint32_t size) {
@@ -451,7 +473,7 @@ uint64_t CRDriver::wrapGetConfigProperty(void *that, const char *name, void *val
 	if (!name || !value || !size)
 		return ret;
 	for (auto &option : configOverrides) {
-		if (!strcmp(name, option.name) && !checkKernelArgument(option.keepArg)) {
+		if (!strcmp(name, option.name) && checkKernelArgument(option.arg) == option.optIn) {
 			memset(value, 0, size);
 			*static_cast<uint8_t *>(value) = 1;
 			traceEvent(option.name, true, 1);
@@ -616,17 +638,25 @@ bool CRDriver::wrapAtiStart(IOService *that, IOService *provider) {
 
 // -crnoaccel: keep Apple's acceleration stack (AMDRadeonX4000 accelerator, HWServices/CAIL) off the iGPU so the display
 // controller (AMD9500Controller) can be brought up on its own. Their probe() reports no match.
-void CRDriver::blockAcceleration(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, const char *probe) {
-	if (!checkKernelArgument("-crnoaccel"))
+// Keep a driver off by making its probe() report no match, when the given boot-arg is present:
+//  -crnoaccel: AMDRadeonX4000 accelerator and HWServices/CAIL, so the display controller comes up on its own.
+//  -crnoagpm: AGPM (AGPMController on the platform device, AGPM per GPU), Apple's GPU power management.
+// Spoof boots 6-8 froze the whole machine instantly as the GUI started, outside every traced display function; AGPM,
+// AGDP (-crnoagdp, see processKext) and MSI (-crnomsi) all become active then, so they can be removed one at a time.
+void CRDriver::blockProbe(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, const char *probe,
+	const char *arg) {
+	if (!checkKernelArgument(arg))
 		return;
 	KernelPatcher::RouteRequest request {probe, wrapProbeNoMatch};
 	if (patcher.routeMultiple(index, &request, 1, slide, size)) {
-		SYSLOG("cr", "-crnoaccel: %s will not match", probe);
+		SYSLOG("cr", "%s: %s will not match", arg, probe);
 	} else {
-		SYSLOG("cr", "-crnoaccel: failed to route %s (error %d)", probe, patcher.getError());
+		SYSLOG("cr", "%s: failed to route %s (error %d)", arg, probe, patcher.getError());
 		patcher.clearError();
 	}
 }
+
+bool CRDriver::wrapStartFail(IOService *, IOService *) { return false; }
 
 IOService *CRDriver::wrapProbeNoMatch(IOService *, IOService *, SInt32 *) { return nullptr; }
 
