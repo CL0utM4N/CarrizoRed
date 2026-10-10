@@ -211,16 +211,55 @@ void CRDriver::startWatcher() {
 		SYSLOG("cr", "failed to start the registry watcher");
 }
 
+static uint32_t numberProperty(IORegistryEntry *entry, const char *key) {
+	auto *obj = entry->getProperty(key);
+	if (auto *num = OSDynamicCast(OSNumber, obj))
+		return num->unsigned32BitValue();
+	if (auto *data = OSDynamicCast(OSData, obj)) {
+		uint32_t value = 0;
+		memcpy(&value, data->getBytesNoCopy(), data->getLength() < sizeof(value) ? data->getLength() : sizeof(value));
+		return value;
+	}
+	return 0;
+}
+
+// One line per framebuffer: connector type, whether a display is attached (an IODisplayConnect child), and the
+// current mode's pixel count and clock. Other children: class (name), two levels deep.
 static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_t size) {
 	auto *iterator = entry->getChildIterator(gIOServicePlane);
 	if (!iterator)
 		return;
+	int fb = 0;
 	while (auto *child = OSDynamicCast(IORegistryEntry, iterator->getNextObject())) {
 		size_t len = strlen(buf);
 		if (len + 1 >= size)
 			break;
-		snprintf(buf + len, size - len, "%*s%s (%s)\n", depth * 2, "", child->getMetaClass()->getClassName(),
-			safeString(child->getName()));
+		const char *cls = child->getMetaClass()->getClassName();
+		if (!strcmp(cls, "AppleMCCSControlModule"))
+			continue;
+		if (!strcmp(cls, "AtiFbStub")) {
+			IORegistryEntry *framebuffer = nullptr;
+			bool display = false;
+			if (auto *it = child->getChildIterator(gIOServicePlane)) {
+				while (auto *grandchild = OSDynamicCast(IORegistryEntry, it->getNextObject())) {
+					if (!framebuffer)
+						framebuffer = grandchild;
+					if (auto *it2 = grandchild->getChildIterator(gIOServicePlane)) {
+						while (auto *leaf = OSDynamicCast(IORegistryEntry, it2->getNextObject()))
+							if (!strcmp(leaf->getMetaClass()->getClassName(), "IODisplayConnect"))
+								display = true;
+						it2->release();
+					}
+				}
+				it->release();
+			}
+			snprintf(buf + len, size - len, "%*sfb%d conn=0x%x display=%s px=%u clk=%u\n", depth * 2, "", fb++,
+				numberProperty(child, "connector-type"), display ? "YES" : "no",
+				framebuffer ? numberProperty(framebuffer, "IOFBCurrentPixelCount") : 0,
+				framebuffer ? numberProperty(framebuffer, "IOFBCurrentPixelClock") : 0);
+			continue;
+		}
+		snprintf(buf + len, size - len, "%*s%s (%s)\n", depth * 2, "", cls, safeString(child->getName()));
 		if (depth < 2)
 			describeChildren(child, depth + 1, buf, size);
 	}
@@ -259,7 +298,17 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			self->iGPU->setProperty("CarrizoRed,tree", now);
 			IOLog("CarrizoRed: t=%ds LoadController=%s, iGPU children:%s\n", t,
 				self->iGPU->getProperty("LoadController") ? "set" : "not set", now[0] ? "" : " none");
-			IOLog("CarrizoRed: trace: %s\n", traceSummary[0] ? traceSummary : "(controller not probed yet)");
+			// Wrap the trace at spaces so a long line can't be overwritten by the next console line.
+			if (!traceSummary[0])
+				IOLog("CarrizoRed: trace: (controller not probed yet)\n");
+			for (size_t pos = 0, len = strlen(traceSummary); pos < len;) {
+				size_t chunk = len - pos > 100 ? 100 : len - pos;
+				if (pos + chunk < len)
+					while (chunk > 1 && traceSummary[pos + chunk - 1] != ' ')
+						chunk--;
+				IOLog("CarrizoRed: trace: %.*s\n", static_cast<int>(chunk), traceSummary + pos);
+				pos += chunk;
+			}
 			for (char *line = now; *line;) {
 				char *end = strchr(line, '\n');
 				if (end)
