@@ -2,7 +2,7 @@
 """
 Build an OpenCore EFI for the ASUS VivoBook 15 D509BA (A9-9425, Stoney Ridge) test laptop.
 
-    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe] [--carrizored [--spoof]] [--oclog]
+    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe] [--carrizored [--spoof [--accel]]] [--oclog]
 
 <work dir> must contain:
     unpacked/OpenCore-<ver>-RELEASE/        OpenCorePkg release zip, extracted
@@ -233,7 +233,8 @@ def main():
 
     # --- NVRAM ------------------------------------------------------------------------------------
     boot = cfg["NVRAM"]["Add"]["7C436110-AB2A-4BBB-A880-FE41995C9F82"]
-    boot["boot-args"] = BOOT_ARGS
+    # Spoof tests bring up the display controller first: -crnoaccel keeps AMDRadeonX4000/HWServices off (--accel to allow).
+    boot["boot-args"] = BOOT_ARGS + (" -crnoaccel" if with_spoof and "--accel" not in sys.argv[1:] else "")
     boot["csr-active-config"] = bytes(4)
     boot["prev-lang:kbd"] = "en-US:0"
     cfg["NVRAM"]["WriteFlash"] = True
