@@ -50,6 +50,24 @@ static const char *stageNames[MaxTraceStages];
 // Interrupt-handler (IH ring) activity, shown by the watcher.
 static uint32_t ihHandlerCalls, ihReadPointerWrites, ihLastReadPointer;
 
+// IH storm breaker. IH registers are dword offsets in BAR5, the same on Tonga (oss_3_0) and CZ (oss_3_0_1).
+namespace IhReg {
+	static constexpr uint32_t RB_CNTL = 0xE30, RB_BASE = 0xE31, RB_RPTR = 0xE32, RB_WPTR = 0xE33, RB_WPTR_ADDR_HI = 0xE34,
+	                          RB_WPTR_ADDR_LO = 0xE35, CNTL = 0xE36, STATUS = 0xE38;
+}
+static volatile uint32_t *ihMmio;
+static void *ihManager;                 // BaffinInterruptManager *
+static mach_vm_address_t ihGetWptrWbAddress, ihIsUsingVram;
+static bool ihStormBroken;
+static uint64_t ihWindowStart;
+static uint32_t ihWindowCalls;
+static struct {
+	uint64_t ms;
+	uint32_t calls, rbCntl, rbBase, rptr, wptr, wptrAddrHi, wptrAddrLo, cntl, status, wbValue, size;
+	uint64_t wbAddress, ringCpu, ringGpu;
+	bool vram;
+} ihSnapshot;
+
 static uint64_t uptimeMs() {
 	uint64_t ns;
 	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
@@ -360,6 +378,16 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				IOLog("CarrizoRed: IH handler calls %u (+%u), rptr writes %u, last rptr 0x%x\n", calls, calls - lastCalls,
 					__atomic_load_n(&ihReadPointerWrites, __ATOMIC_RELAXED), ihLastReadPointer);
 			lastCalls = calls;
+		}
+
+		if (ihStormBroken && tick % 6 == 0) {
+			auto &snap = ihSnapshot;
+			IOLog("CarrizoRed: IH STORM broken at %llu ms after %u handler calls; ring in %s, size 0x%x\n", snap.ms,
+				snap.calls, snap.vram ? "VRAM" : "system memory", snap.size);
+			IOLog("CarrizoRed: IH RB_CNTL=%08x RB_BASE=%08x RPTR=%08x WPTR=%08x WPTR_ADDR=%02x:%08x CNTL=%08x STATUS=%08x\n",
+				snap.rbCntl, snap.rbBase, snap.rptr, snap.wptr, snap.wptrAddrHi, snap.wptrAddrLo, snap.cntl, snap.status);
+			IOLog("CarrizoRed: IH write-back as CPU sees it=%08x at %llx; ring cpu %llx gpu %llx\n", snap.wbValue,
+				snap.wbAddress, snap.ringCpu, snap.ringGpu);
 		}
 
 		// Watchdog: a traced call that never returns (a hard hang with this CPU still alive) becomes a panic that
@@ -688,6 +716,10 @@ void CRDriver::patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_add
 			patcher.clearError();
 		}
 	}
+	stormBreak = !checkKernelArgument("-crnostormbreak");
+	ihGetWptrWbAddress = patcher.solveSymbol(index, "__ZN22BaffinInterruptManager23getWPTRWriteBackAddressEv", slide, size);
+	ihIsUsingVram = patcher.solveSymbol(index, "__ZN22BaffinInterruptManager24isUsingVRAMForRingBufferEv", slide, size);
+	patcher.clearError();
 }
 
 void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
@@ -696,14 +728,56 @@ void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
 	FunctionCast(wrapIhSetHardwareEnabled, callback->orgIhSetHardwareEnabled)(that, enable && !off);
 }
 
+// Storm breaker: more than 500 handler calls within 100 ms means the IH keeps re-raising an interrupt the driver
+// believes it has consumed. Disable the ring and interrupts directly (so the machine survives instead of freezing),
+// record the IH state and the write-pointer write-back the CPU sees, and ignore further calls. -crnostormbreak
+// disables this.
 void CRDriver::wrapIhHandler(void *that, void *owner, void *arg, void *nub, int source) {
-	__atomic_fetch_add(&ihHandlerCalls, 1, __ATOMIC_RELAXED);
+	uint32_t calls = __atomic_add_fetch(&ihHandlerCalls, 1, __ATOMIC_RELAXED);
+	if (ihStormBroken)
+		return;
+	uint64_t ms = uptimeMs();
+	if (ms - ihWindowStart > 100) {
+		ihWindowStart = ms;
+		ihWindowCalls = 0;
+	}
+	if (++ihWindowCalls > 500 && ihMmio && callback->stormBreak) {
+		auto *mmio = ihMmio;
+		ihSnapshot.ms = ms;
+		ihSnapshot.calls = calls;
+		ihSnapshot.rbCntl = mmio[IhReg::RB_CNTL];
+		ihSnapshot.rbBase = mmio[IhReg::RB_BASE];
+		ihSnapshot.rptr = mmio[IhReg::RB_RPTR];
+		ihSnapshot.wptr = mmio[IhReg::RB_WPTR];
+		ihSnapshot.wptrAddrHi = mmio[IhReg::RB_WPTR_ADDR_HI];
+		ihSnapshot.wptrAddrLo = mmio[IhReg::RB_WPTR_ADDR_LO];
+		ihSnapshot.cntl = mmio[IhReg::CNTL];
+		ihSnapshot.status = mmio[IhReg::STATUS];
+		if (auto *manager = static_cast<uint8_t *>(ihManager)) {
+			// BaffinInterruptManager fields (initializeHardware): +0x3c size, +0x40 ring CPU address, +0x48 GPU address.
+			ihSnapshot.size = *reinterpret_cast<uint32_t *>(manager + 0x3C);
+			ihSnapshot.ringCpu = *reinterpret_cast<uint64_t *>(manager + 0x40);
+			ihSnapshot.ringGpu = *reinterpret_cast<uint64_t *>(manager + 0x48);
+			if (ihGetWptrWbAddress) {
+				auto *wb = reinterpret_cast<volatile uint32_t *(*)(void *)>(ihGetWptrWbAddress)(manager);
+				ihSnapshot.wbAddress = reinterpret_cast<uint64_t>(wb);
+				ihSnapshot.wbValue = wb ? *wb : 0xFFFFFFFF;
+			}
+			if (ihIsUsingVram)
+				ihSnapshot.vram = reinterpret_cast<bool (*)(void *)>(ihIsUsingVram)(manager);
+		}
+		mmio[IhReg::CNTL] = ihSnapshot.cntl & ~1u;      // ENABLE_INTR off
+		mmio[IhReg::RB_CNTL] = ihSnapshot.rbCntl & ~1u; // RB_ENABLE off
+		ihStormBroken = true;
+		return;
+	}
 	FunctionCast(wrapIhHandler, callback->orgIhHandler)(that, owner, arg, nub, source);
 }
 
 void CRDriver::wrapIhSetReadPointer(void *that, uint32_t pointer) {
 	__atomic_fetch_add(&ihReadPointerWrites, 1, __ATOMIC_RELAXED);
 	ihLastReadPointer = pointer;
+	ihManager = that;
 	FunctionCast(wrapIhSetReadPointer, callback->orgIhSetReadPointer)(that, pointer);
 }
 
@@ -743,6 +817,8 @@ void CRDriver::probeMMIO() {
 	}
 
 	auto *mmio = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
+	// Keep the mapping: the IH storm breaker writes registers directly (see wrapIhHandler).
+	ihMmio = mmio;
 	auto memSize = mmio[Reg::CONFIG_MEMSIZE];
 	auto fbLocation = mmio[Reg::MC_VM_FB_LOCATION];
 	auto fbOffset = mmio[Reg::MC_VM_FB_OFFSET];
@@ -750,7 +826,6 @@ void CRDriver::probeMMIO() {
 	auto gbAddrConfig = mmio[Reg::GB_ADDR_CONFIG];
 	auto shaderArrayConfig = mmio[Reg::CC_GC_SHADER_ARRAY_CONFIG];
 	auto rbBackendDisable = mmio[Reg::CC_RB_BACKEND_DISABLE];
-	map->release();
 
 	// Same sanity rule as gmc_v8_0_mc_init(): some firmware leaves garbage in the upper half.
 	if ((memSize & 0xFFFF0000) && (memSize & 0xFFFF))

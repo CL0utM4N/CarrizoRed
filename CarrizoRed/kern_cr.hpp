@@ -34,6 +34,7 @@ private:
 	static void wrapIhHandler(void *that, void *owner, void *arg, void *nub, int source);
 	static void wrapIhSetReadPointer(void *that, uint32_t pointer);
 	mach_vm_address_t orgIhSetHardwareEnabled {0}, orgIhHandler {0}, orgIhSetReadPointer {0};
+	bool stormBreak {true};
 	static IOService *wrapProbeNoMatch(IOService *that, IOService *provider, SInt32 *score);
 
 	void patchSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
