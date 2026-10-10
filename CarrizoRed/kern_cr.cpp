@@ -15,6 +15,7 @@
 #include <Headers/kern_util.hpp>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <kern/thread.h>
+#include <kern/debug.h>
 #include <stdarg.h>
 
 // Short summary of the bring-up trace, repeated by the watcher so it survives the console scrolling.
@@ -29,6 +30,39 @@ static void traceNote(const char *fmt, ...) {
 	vsnprintf(traceSummary + len, sizeof(traceSummary) - len, fmt, va);
 	va_end(va);
 }
+
+// Bring-up trace events. The wrappers run in whatever context Apple's code calls them from (possibly with a spinlock
+// held or from an interrupt), where IOLog can deadlock, so they only append to this lock-free ring; the watcher thread
+// prints new events and runs a watchdog over calls that never return.
+struct TraceEvent {
+	uint64_t ms;
+	const char *name;
+	uint32_t value;
+	bool exit;
+};
+
+static constexpr size_t TraceRingSize = 512, MaxTraceStages = 64;
+static TraceEvent traceRing[TraceRingSize];
+static uint32_t traceHead;
+static uint32_t stageOpen[MaxTraceStages];
+static uint64_t stageEnterMs[MaxTraceStages];
+static const char *stageNames[MaxTraceStages];
+
+static uint64_t uptimeMs() {
+	uint64_t ns;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000000;
+}
+
+static void traceEvent(const char *name, bool exit, uint32_t value) {
+	uint32_t index = __atomic_fetch_add(&traceHead, 1, __ATOMIC_RELAXED);
+	auto &event = traceRing[index % TraceRingSize];
+	event.ms = uptimeMs();
+	event.name = name;
+	event.value = value;
+	event.exit = exit;
+}
+
 
 static const char *pathRadeonX4000[] {"/System/Library/Extensions/AMDRadeonX4000.kext/Contents/MacOS/AMDRadeonX4000"};
 static const char *pathRadeonX4000HWServices[] {
@@ -276,9 +310,42 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 	auto *self = static_cast<CRDriver *>(arg);
 	static char last[1536], now[1536];
 	bool print = !checkKernelArgument("-crnowatch");
+	bool watchdog = !checkKernelArgument("-crnowatchdog");
 	bool controllerRequested = checkKernelArgument("-crnoloadctl");
+	uint32_t printed = 0;
 	last[0] = '\0';
-	for (int t = 0; t <= 600; t += 3) {
+	// Tick every 500 ms for 30 minutes.
+	for (uint32_t tick = 0, t = 0; t <= 1800; tick++, t = tick / 2) {
+		// New trace events (written lock-free by the wrappers).
+		uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
+		if (head - printed > TraceRingSize) {
+			IOLog("CarrizoRed: (%u trace events dropped)\n", head - printed - static_cast<uint32_t>(TraceRingSize));
+			printed = head - static_cast<uint32_t>(TraceRingSize);
+		}
+		for (; printed != head; printed++) {
+			auto &event = traceRing[printed % TraceRingSize];
+			if (event.exit)
+				IOLog("CarrizoRed: <- %s = 0x%x\n", event.name, event.value);
+			else
+				IOLog("CarrizoRed: -> %s\n", event.name);
+		}
+
+		// Watchdog: a traced call that never returns (a hard hang with this CPU still alive) becomes a panic that
+		// names it and stays on screen (debug=0x100). -crnowatchdog disables this.
+		if (watchdog) {
+			uint64_t ms = uptimeMs();
+			for (size_t i = 0; i < MaxTraceStages; i++) {
+				if (__atomic_load_n(&stageOpen[i], __ATOMIC_RELAXED) && ms - stageEnterMs[i] > 10000)
+					panic("CarrizoRed watchdog: %s entered %llu ms ago and never returned (trace: %s)", stageNames[i],
+						ms - stageEnterMs[i], traceSummary);
+			}
+		}
+
+		if (tick % 2) {
+			IOSleep(500);
+			continue;
+		}
+
 		now[0] = '\0';
 		describeChildren(self->iGPU, 0, now, sizeof(now));
 
@@ -293,18 +360,18 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				self->iGPU->setProperty("LoadAMDSupport", true);
 				self->iGPU->setProperty("LoadController", true);
 				self->iGPU->registerService();
-				IOLog("CarrizoRed: t=%ds set LoadController on the iGPU and re-registered it\n", t);
-				traceNote("LoadController@%ds ", t);
+				IOLog("CarrizoRed: t=%us set LoadController on the iGPU and re-registered it\n", t);
+				traceNote("LoadController@%us ", t);
 			}
 		}
 
-		// Repeat every 15 s as well: launchd keeps scrolling the console once the GUI starts.
+		// Every 15 s, or when the tree changes: launchd keeps scrolling the console once the GUI starts.
 		if (print && (strcmp(now, last) || t % 15 == 0)) {
 			strlcpy(last, now, sizeof(last));
 			self->iGPU->setProperty("CarrizoRed,tree", now);
-			IOLog("CarrizoRed: t=%ds LoadController=%s, iGPU children:%s\n", t,
+			IOLog("CarrizoRed: t=%us LoadController=%s, iGPU children:%s\n", t,
 				self->iGPU->getProperty("LoadController") ? "set" : "not set", now[0] ? "" : " none");
-			// Wrap the trace at spaces so a long line can't be overwritten by the next console line.
+			// Wrap the summary at spaces so a long line can't be overwritten by the next console line.
 			if (!traceSummary[0])
 				IOLog("CarrizoRed: trace: (controller not probed yet)\n");
 			for (size_t pos = 0, len = strlen(traceSummary); pos < len;) {
@@ -325,7 +392,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				line = end + 1;
 			}
 		}
-		IOSleep(3000);
+		IOSleep(500);
 	}
 }
 
@@ -425,13 +492,18 @@ namespace {
 		{"__ZN17AMD9500Controller19hwProgramPixelClockEhj", "hwProgramPixelClock", InController, false, 0},
 	};
 
-	// Six integer/pointer arguments cover every traced function. On a hard hang, the last "->" without a matching
-	// "<-" is the function that never returned.
+	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
+	// prints them, and panics naming the function if a call hasn't returned after 10 s.
 	template <size_t N>
 	uint64_t wrapStage(void *a, void *b, void *c, void *d, void *e, void *f) {
-		IOLog("CarrizoRed: -> %s\n", stages[N].name);
+		static_assert(N < MaxTraceStages, "too many traced stages");
+		stageNames[N] = stages[N].name;
+		stageEnterMs[N] = uptimeMs();
+		__atomic_fetch_add(&stageOpen[N], 1, __ATOMIC_RELAXED);
+		traceEvent(stages[N].name, false, 0);
 		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(a, b, c, d, e, f);
-		IOLog("CarrizoRed: <- %s = 0x%x\n", stages[N].name, static_cast<uint32_t>(ret));
+		traceEvent(stages[N].name, true, static_cast<uint32_t>(ret));
+		__atomic_fetch_sub(&stageOpen[N], 1, __ATOMIC_RELAXED);
 		if (stages[N].summary)
 			traceNote("%s=%x ", stages[N].name, static_cast<uint32_t>(ret));
 		return ret;
