@@ -8,28 +8,39 @@
 #include "kern_vbios.hpp"
 
 #include <Headers/kern_util.hpp>
+#include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IORegistryEntry.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
 #include <string.h>
 
+// Why the last inject() failed, published as "CarrizoRed,vbios-status" so it shows in ioreg without the kernel log.
+static void setStatus(IOPCIDevice *pci, const char *status) {
+	pci->setProperty("CarrizoRed,vbios-status", status);
+	SYSLOG("vbios", "%s", status);
+}
+
 // The ACPI tables the firmware provided, as published by AppleACPIPlatformExpert ("ACPI Tables" → "VFCT").
-static OSData *copyAcpiTable(const char *signature) {
-	auto *expert = IORegistryEntry::fromPath("IOService:/AppleACPIPlatformExpert");
+// The platform expert is not a child of the registry root (Root → <model> → AppleACPIPlatformExpert), so get it
+// directly instead of by path.
+static OSData *copyAcpiTable(IOPCIDevice *pci, const char *signature) {
+	auto *expert = IOService::getPlatform();
 	if (!expert) {
-		SYSLOG("vbios", "AppleACPIPlatformExpert not found");
+		setStatus(pci, "no platform expert");
 		return nullptr;
 	}
 
-	OSData *table = nullptr;
-	if (auto *tables = OSDynamicCast(OSDictionary, expert->getProperty("ACPI Tables"))) {
-		table = OSDynamicCast(OSData, tables->getObject(signature));
-		if (table)
-			table->retain();
-	} else {
-		SYSLOG("vbios", "AppleACPIPlatformExpert has no \"ACPI Tables\"");
+	auto *tables = OSDynamicCast(OSDictionary, expert->getProperty("ACPI Tables"));
+	if (!tables) {
+		setStatus(pci, "platform expert has no \"ACPI Tables\"");
+		return nullptr;
 	}
-	expert->release();
+	auto *table = OSDynamicCast(OSData, tables->getObject(signature));
+	if (!table) {
+		setStatus(pci, "no VFCT in \"ACPI Tables\"");
+		return nullptr;
+	}
+	table->retain();
 	return table;
 }
 
@@ -50,18 +61,16 @@ bool VBIOS::inject(IOPCIDevice *pci, uint16_t vendorId, uint16_t deviceId) {
 		return true;
 	}
 
-	auto *table = copyAcpiTable("VFCT");
-	if (!table) {
-		SYSLOG("vbios", "no ACPI VFCT table, AMDSupport will not find a VBIOS");
+	auto *table = copyAcpiTable(pci, "VFCT");
+	if (!table)
 		return false;
-	}
 
 	auto *base = static_cast<const uint8_t *>(table->getBytesNoCopy());
 	uint32_t tableSize = table->getLength();
 	bool injected = false;
 
 	if (tableSize < sizeof(Vfct) || reinterpret_cast<const AcpiHeader *>(base)->length > tableSize) {
-		SYSLOG("vbios", "VFCT table too short (%u bytes)", tableSize);
+		setStatus(pci, "VFCT table too short");
 	} else {
 		tableSize = reinterpret_cast<const AcpiHeader *>(base)->length;
 		uint32_t offset = reinterpret_cast<const Vfct *>(base)->vbiosImageOffset;
@@ -71,7 +80,7 @@ bool VBIOS::inject(IOPCIDevice *pci, uint16_t vendorId, uint16_t deviceId) {
 			auto *image = reinterpret_cast<const VfctImageHeader *>(base + offset);
 			uint32_t dataOffset = offset + sizeof(VfctImageHeader);
 			if (image->imageLength == 0 || image->imageLength > tableSize - dataOffset) {
-				SYSLOG("vbios", "VFCT image at 0x%X truncated (length %u)", offset, image->imageLength);
+				setStatus(pci, "VFCT image truncated");
 				break;
 			}
 			offset = dataOffset + image->imageLength;
@@ -90,7 +99,7 @@ bool VBIOS::inject(IOPCIDevice *pci, uint16_t vendorId, uint16_t deviceId) {
 
 			auto *data = base + dataOffset;
 			if (!isAtomBios(data, image->imageLength)) {
-				SYSLOG("vbios", "VFCT image for %04X:%04X is not an ATOM BIOS", vendorId, deviceId);
+				setStatus(pci, "VFCT image is not an ATOM BIOS");
 				break;
 			}
 			if (image->imageLength > MaxAppleImageSize)
@@ -99,11 +108,12 @@ bool VBIOS::inject(IOPCIDevice *pci, uint16_t vendorId, uint16_t deviceId) {
 
 			pci->setProperty(ImageProperty, const_cast<uint8_t *>(data), image->imageLength);
 			SYSLOG("vbios", "injected %s from VFCT (%u bytes)", ImageProperty, image->imageLength);
+			pci->setProperty("CarrizoRed,vbios-status", "injected from VFCT");
 			injected = true;
 			break;
 		}
-		if (!injected)
-			SYSLOG("vbios", "no usable VFCT image for %04X:%04X at %02X:%02X.%X", vendorId, deviceId, bus, dev, func);
+		if (!injected && !pci->getProperty("CarrizoRed,vbios-status"))
+			setStatus(pci, "no VFCT image matches this device/slot");
 	}
 
 	table->release();
