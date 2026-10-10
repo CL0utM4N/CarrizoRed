@@ -14,6 +14,7 @@
 #include <Headers/kern_iokit.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IODeviceTreeSupport.h>
+#include <kern/thread.h>
 
 static const char *pathRadeonX4000[] {"/System/Library/Extensions/AMDRadeonX4000.kext/Contents/MacOS/AMDRadeonX4000"};
 static const char *pathRadeonX4000HWServices[] {
@@ -145,7 +146,10 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 		SYSLOG("cr", "%s loaded: slide 0x%llX size 0x%lX", kexts[i].id, static_cast<uint64_t>(slide),
 			static_cast<unsigned long>(size));
 		if (i == KextPolarisController)
+		{
 			patchPolarisController(patcher, index, slide, size);
+			startWatcher();
+		}
 		else if (i == KextRadeonX4000)
 			blockAcceleration(patcher, index, slide, size, "__ZN37AMDRadeonX4000_AMDGraphicsAccelerator5probeEP9IOServicePi");
 		else if (i == KextRadeonX4000HWServices)
@@ -173,6 +177,60 @@ void CRDriver::patchPolarisController(KernelPatcher &patcher, size_t index, mach
 	} else {
 		SYSLOG("cr", "failed to route AMD9500Controller pipe limits (error %d)", patcher.getError());
 		patcher.clearError();
+	}
+}
+
+// While Apple's display stack starts, print what attached below the iGPU (classes and names, 3 levels) to the verbose
+// console whenever it changes, for 10 minutes. When the panel keeps showing the boot console but the GUI has started
+// elsewhere, this is the only output that can be seen. Also published as "CarrizoRed,tree". -crnowatch disables it.
+void CRDriver::startWatcher() {
+	if (checkKernelArgument("-crnowatch"))
+		return;
+	thread_t thread;
+	if (kernel_thread_start(watcherThread, this, &thread) == KERN_SUCCESS)
+		thread_deallocate(thread);
+	else
+		SYSLOG("cr", "failed to start the registry watcher");
+}
+
+static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_t size) {
+	auto *iterator = entry->getChildIterator(gIOServicePlane);
+	if (!iterator)
+		return;
+	while (auto *child = OSDynamicCast(IORegistryEntry, iterator->getNextObject())) {
+		size_t len = strlen(buf);
+		if (len + 1 >= size)
+			break;
+		snprintf(buf + len, size - len, "%*s%s (%s)\n", depth * 2, "", child->getMetaClass()->getClassName(),
+			safeString(child->getName()));
+		if (depth < 2)
+			describeChildren(child, depth + 1, buf, size);
+	}
+	iterator->release();
+}
+
+void CRDriver::watcherThread(void *arg, wait_result_t) {
+	auto *self = static_cast<CRDriver *>(arg);
+	static char last[1536], now[1536];
+	last[0] = '\0';
+	for (int t = 0; t <= 600; t += 3) {
+		now[0] = '\0';
+		describeChildren(self->iGPU, 0, now, sizeof(now));
+		if (strcmp(now, last)) {
+			strlcpy(last, now, sizeof(last));
+			self->iGPU->setProperty("CarrizoRed,tree", now);
+			IOLog("CarrizoRed: t=%ds iGPU children:%s\n", t, now[0] ? "" : " none");
+			for (char *line = now; *line;) {
+				char *end = strchr(line, '\n');
+				if (end)
+					*end = '\0';
+				IOLog("CarrizoRed:   %s\n", line);
+				if (!end)
+					break;
+				line = end + 1;
+			}
+		}
+		IOSleep(3000);
 	}
 }
 

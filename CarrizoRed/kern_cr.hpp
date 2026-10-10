@@ -28,6 +28,9 @@ private:
 	void blockAcceleration(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, const char *probe);
 	static IOService *wrapProbeNoMatch(IOService *that, IOService *provider, SInt32 *score);
 
+	void startWatcher();
+	static void watcherThread(void *arg, wait_result_t);
+
 	void findByConfigSpace();
 	void logPCIInfo();
 	void probeMMIO();
