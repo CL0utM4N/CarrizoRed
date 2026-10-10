@@ -302,3 +302,19 @@ Load each binary as **Mac OS X Mach-O, x86-64**. Run auto-analysis with the "Dem
   `AMDRadeonX4000_AMDGraphicsAccelerator::start`.
 - `AMD9500Controller` / `AMDSupport`: VBIOS fetch, `ATOMBIOS` command-table execution (`SetPixelClock`,
   `DIGxTransmitterControl`). See [DCE11_REGISTER_DIFF.md](DCE11_REGISTER_DIFF.md) "What to do with this".
+
+## How AMD9500Controller gets loaded (GPU wrangler / AGDC)
+
+First spoof boot on the D509BA (`device-id 0x67EF`, `-crnoaccel`): only `AMD9500ControllerWrangler` and `AMDSupport`
+attached to the iGPU. The `Controller` personality has `IOPropertyMatch {LoadController=True}`, and the only place that
+sets it is `AtiGpuWrangler::vendor_doDeviceAttribute` (AMDSupport), an AGDC vendor method that the graphics policy calls
+on a Mac. Attribute 3 with flags: bit 0 sets `LoadAMDSupport` + `LoadController`, bit 1 sets `LoadAMDSupport` +
+`LoadHWServices` + `LoadAccelerator`; then `registerService()` (vtable `+0x5b0`; `+0x278` is `setProperty(char*, bool)`).
+Nothing requested it for the iGPU, so the controller never matched, and since the wrangler holds the iGPU's
+`IOFramebuffer` match category, the boot framebuffer driver couldn't attach either: the GUI ran with no display and the
+panel kept the boot console. CarrizoRed now sets `LoadAMDSupport` + `LoadController` and re-registers the iGPU once the
+wrangler is attached (`-crnoloadctl` disables it).
+
+`AMD9500Controller` reads its `CFG_*` options with `ATIController::getConfigProperty` from the personality's
+`aty_config` (and per-framebuffer `ATY,<name>` overrides). `CFG_NON_ZERO_MC_LOC` is off for Polaris, so `ATY,vram_base`
+would be 0; CarrizoRed forces it on so the base comes from `AtiAsicInfo::getFbLocationBase()` (`-crnomcloc` disables).
