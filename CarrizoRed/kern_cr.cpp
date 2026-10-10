@@ -216,7 +216,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 	for (int t = 0; t <= 600; t += 3) {
 		now[0] = '\0';
 		describeChildren(self->iGPU, 0, now, sizeof(now));
-		if (strcmp(now, last)) {
+		// Repeat every 15 s as well: launchd keeps scrolling the console once the GUI starts.
+		if (strcmp(now, last) || t % 15 == 0) {
 			strlcpy(last, now, sizeof(last));
 			self->iGPU->setProperty("CarrizoRed,tree", now);
 			IOLog("CarrizoRed: t=%ds iGPU children:%s\n", t, now[0] ? "" : " none");
