@@ -47,6 +47,8 @@ static uint32_t traceHead;
 static uint32_t stageOpen[MaxTraceStages];
 static uint64_t stageEnterMs[MaxTraceStages];
 static const char *stageNames[MaxTraceStages];
+// Interrupt-handler (IH ring) activity, shown by the watcher.
+static uint32_t ihHandlerCalls, ihReadPointerWrites, ihLastReadPointer;
 
 static uint64_t uptimeMs() {
 	uint64_t ns;
@@ -209,6 +211,7 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 		{
 			patchPolarisController(patcher, index, slide, size);
 			traceController(patcher, index, slide, size);
+			patchInterrupts(patcher, index, slide, size);
 			startWatcher();
 		}
 		else if (i == KextSupport) {
@@ -347,6 +350,16 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				IOLog("CarrizoRed: <- %s = 0x%x\n", event.name, event.value);
 			else
 				IOLog("CarrizoRed: -> %s\n", event.name);
+		}
+
+		// Interrupt activity since the last tick: a storm shows as a fast-climbing handler count.
+		{
+			static uint32_t lastCalls;
+			uint32_t calls = __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED);
+			if (calls != lastCalls)
+				IOLog("CarrizoRed: IH handler calls %u (+%u), rptr writes %u, last rptr 0x%x\n", calls, calls - lastCalls,
+					__atomic_load_n(&ihReadPointerWrites, __ATOMIC_RELAXED), ihLastReadPointer);
+			lastCalls = calls;
 		}
 
 		// Watchdog: a traced call that never returns (a hard hang with this CPU still alive) becomes a panic that
@@ -657,6 +670,42 @@ void CRDriver::blockProbe(KernelPatcher &patcher, size_t index, mach_vm_address_
 }
 
 bool CRDriver::wrapStartFail(IOService *, IOService *) { return false; }
+
+// Display interrupts go through the IH ring, managed by BaffinInterruptManager. Polaris (Tonga IH) can acknowledge
+// entries with a doorbell; Carrizo/Stoney (CZ IH) only through IH_RB_RPTR (Linux tonga_ih_set_rptr vs
+// cz_ih_set_rptr). An entry that is never acknowledged keeps the interrupt asserted: spoof boot 9 (legacy INTx) froze
+// as soon as the controller loaded, boots 5-8 (MSI) when the GUI started. Count handler calls and read-pointer
+// updates for the watcher, and with -crnoih keep the IH disabled entirely to confirm it.
+void CRDriver::patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	KernelPatcher::RouteRequest requests[] {
+		{"__ZN22BaffinInterruptManager18setHardwareEnabledEb", wrapIhSetHardwareEnabled, orgIhSetHardwareEnabled},
+		{"__ZN22BaffinInterruptManager7handlerEP8OSObjectPvP9IOServicei", wrapIhHandler, orgIhHandler},
+		{"__ZN22BaffinInterruptManager16setRBReadPointerEj", wrapIhSetReadPointer, orgIhSetReadPointer},
+	};
+	for (auto &request : requests) {
+		if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+			SYSLOG("cr", "interrupts: failed to route %s (error %d)", request.symbol, patcher.getError());
+			patcher.clearError();
+		}
+	}
+}
+
+void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
+	bool off = enable && checkKernelArgument("-crnoih");
+	traceEvent(off ? "IH enable (forced off by -crnoih)" : enable ? "IH enable" : "IH disable", true, enable);
+	FunctionCast(wrapIhSetHardwareEnabled, callback->orgIhSetHardwareEnabled)(that, enable && !off);
+}
+
+void CRDriver::wrapIhHandler(void *that, void *owner, void *arg, void *nub, int source) {
+	__atomic_fetch_add(&ihHandlerCalls, 1, __ATOMIC_RELAXED);
+	FunctionCast(wrapIhHandler, callback->orgIhHandler)(that, owner, arg, nub, source);
+}
+
+void CRDriver::wrapIhSetReadPointer(void *that, uint32_t pointer) {
+	__atomic_fetch_add(&ihReadPointerWrites, 1, __ATOMIC_RELAXED);
+	ihLastReadPointer = pointer;
+	FunctionCast(wrapIhSetReadPointer, callback->orgIhSetReadPointer)(that, pointer);
+}
 
 IOService *CRDriver::wrapProbeNoMatch(IOService *, IOService *, SInt32 *) { return nullptr; }
 

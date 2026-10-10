@@ -28,6 +28,12 @@ private:
 	void blockProbe(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, const char *probe,
 		const char *arg);
 	static bool wrapStartFail(IOService *that, IOService *provider);
+
+	void patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
+	static void wrapIhSetHardwareEnabled(void *that, bool enable);
+	static void wrapIhHandler(void *that, void *owner, void *arg, void *nub, int source);
+	static void wrapIhSetReadPointer(void *that, uint32_t pointer);
+	mach_vm_address_t orgIhSetHardwareEnabled {0}, orgIhHandler {0}, orgIhSetReadPointer {0};
 	static IOService *wrapProbeNoMatch(IOService *that, IOService *provider, SInt32 *score);
 
 	void patchSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);

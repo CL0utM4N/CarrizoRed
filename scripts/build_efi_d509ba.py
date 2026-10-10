@@ -2,7 +2,7 @@
 """
 Build an OpenCore EFI for the ASUS VivoBook 15 D509BA (A9-9425, Stoney Ridge) test laptop.
 
-    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe] [--carrizored [--spoof [--accel] [--minimal]]] [--oclog]
+    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe] [--carrizored [--spoof [--accel] [--minimal]]] [--args="..."] [--oclog]
 
 <work dir> must contain:
     unpacked/OpenCore-<ver>-RELEASE/        OpenCorePkg release zip, extracted
@@ -238,6 +238,10 @@ def main():
     # --minimal: also keep AGPM and AGDP off and use legacy interrupts (spoof boots 6-8 froze as the GUI started).
     if with_spoof and "--minimal" in sys.argv[1:]:
         boot["boot-args"] += " -crnoagpm -crnoagdp -crnomsi"
+    # --args="...": extra boot-args for one-off test variants.
+    for arg in sys.argv[1:]:
+        if arg.startswith("--args="):
+            boot["boot-args"] += " " + arg[len("--args="):]
     boot["csr-active-config"] = bytes(4)
     boot["prev-lang:kbd"] = "en-US:0"
     cfg["NVRAM"]["WriteFlash"] = True
