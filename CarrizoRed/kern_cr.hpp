@@ -32,6 +32,12 @@ private:
 	static uint64_t wrapGetConfigProperty(void *that, const char *name, void *value, uint32_t size);
 	mach_vm_address_t orgGetConfigProperty {0};
 
+	void traceController(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
+	void traceSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
+	static IOService *wrapAtiProbe(IOService *that, IOService *provider, SInt32 *score);
+	static bool wrapAtiStart(IOService *that, IOService *provider);
+	mach_vm_address_t orgAtiProbe {0}, orgAtiStart {0};
+
 	void startWatcher();
 	static void watcherThread(void *arg, wait_result_t);
 

@@ -148,10 +148,13 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 		if (i == KextPolarisController)
 		{
 			patchPolarisController(patcher, index, slide, size);
+			traceController(patcher, index, slide, size);
 			startWatcher();
 		}
-		else if (i == KextSupport)
+		else if (i == KextSupport) {
 			patchSupport(patcher, index, slide, size);
+			traceSupport(patcher, index, slide, size);
+		}
 		else if (i == KextRadeonX4000)
 			blockAcceleration(patcher, index, slide, size, "__ZN37AMDRadeonX4000_AMDGraphicsAccelerator5probeEP9IOServicePi");
 		else if (i == KextRadeonX4000HWServices)
@@ -239,7 +242,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (print && (strcmp(now, last) || t % 15 == 0)) {
 			strlcpy(last, now, sizeof(last));
 			self->iGPU->setProperty("CarrizoRed,tree", now);
-			IOLog("CarrizoRed: t=%ds iGPU children:%s\n", t, now[0] ? "" : " none");
+			IOLog("CarrizoRed: t=%ds LoadController=%s, iGPU children:%s\n", t,
+				self->iGPU->getProperty("LoadController") ? "set" : "not set", now[0] ? "" : " none");
 			for (char *line = now; *line;) {
 				char *end = strchr(line, '\n');
 				if (end)
@@ -278,6 +282,90 @@ uint64_t CRDriver::wrapGetConfigProperty(void *that, const char *name, void *val
 		memset(value, 0, size);
 		*static_cast<uint8_t *>(value) = 1;
 	}
+	return ret;
+}
+
+// Bring-up tracing (-crnotrace disables): log entry and result of ATIController::probe/start and of each
+// AMD9500Controller initialisation stage on the console, so a controller that matches and then fails to start (and
+// disappears again) shows which stage failed.
+namespace {
+	struct TracedStage {
+		const char *symbol;
+		const char *name;
+		mach_vm_address_t org;
+	};
+
+	TracedStage stages[] {
+		{"__ZN17AMD9500Controller21initializeProjectInfoEv", "initializeProjectInfo", 0},
+		{"__ZN17AMD9500Controller19initializeResourcesEv", "initializeResources", 0},
+		{"__ZN17AMD9500Controller35initializeProjectDependentResourcesEv", "initializeProjectDependentResources", 0},
+		{"__ZN17AMD9500Controller18initializeHardwareEv", "initializeHardware", 0},
+		{"__ZN17AMD9500Controller19initializePowerPlayEv", "initializePowerPlay", 0},
+		{"__ZN17AMD9500Controller24initializeConnectionInfoEv", "initializeConnectionInfo", 0},
+		{"__ZN17AMD9500Controller13initializeICMEv", "initializeICM", 0},
+	};
+
+	// The stages return an IOReturn-style int; pass the whole register back unchanged.
+	template <size_t N>
+	uint64_t wrapStage(void *that) {
+		IOLog("CarrizoRed: AMD9500Controller::%s ...\n", stages[N].name);
+		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(that);
+		IOLog("CarrizoRed: AMD9500Controller::%s -> 0x%x\n", stages[N].name, static_cast<uint32_t>(ret));
+		return ret;
+	}
+
+	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+		static_assert(arrsize(stages) == 7, "one wrapper per stage");
+		mach_vm_address_t wrappers[] {
+			reinterpret_cast<mach_vm_address_t>(wrapStage<0>),
+			reinterpret_cast<mach_vm_address_t>(wrapStage<1>),
+			reinterpret_cast<mach_vm_address_t>(wrapStage<2>),
+			reinterpret_cast<mach_vm_address_t>(wrapStage<3>),
+			reinterpret_cast<mach_vm_address_t>(wrapStage<4>),
+			reinterpret_cast<mach_vm_address_t>(wrapStage<5>),
+			reinterpret_cast<mach_vm_address_t>(wrapStage<6>),
+		};
+		for (size_t i = 0; i < arrsize(stages); i++) {
+			KernelPatcher::RouteRequest request {stages[i].symbol, wrappers[i], stages[i].org};
+			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+				SYSLOG("cr", "trace: failed to route %s (error %d)", stages[i].name, patcher.getError());
+				patcher.clearError();
+			}
+		}
+	}
+}
+
+void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	if (!checkKernelArgument("-crnotrace"))
+		routeStages(patcher, index, slide, size);
+}
+
+void CRDriver::traceSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	if (checkKernelArgument("-crnotrace"))
+		return;
+	KernelPatcher::RouteRequest requests[] {
+		{"__ZN13ATIController5probeEP9IOServicePi", wrapAtiProbe, orgAtiProbe},
+		{"__ZN13ATIController5startEP9IOService", wrapAtiStart, orgAtiStart},
+	};
+	for (auto &request : requests) {
+		if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+			SYSLOG("cr", "trace: failed to route %s (error %d)", request.symbol, patcher.getError());
+			patcher.clearError();
+		}
+	}
+}
+
+IOService *CRDriver::wrapAtiProbe(IOService *that, IOService *provider, SInt32 *score) {
+	IOLog("CarrizoRed: %s::probe ...\n", that->getMetaClass()->getClassName());
+	auto *ret = FunctionCast(wrapAtiProbe, callback->orgAtiProbe)(that, provider, score);
+	IOLog("CarrizoRed: %s::probe -> %s\n", that->getMetaClass()->getClassName(), ret ? "match" : "NO MATCH");
+	return ret;
+}
+
+bool CRDriver::wrapAtiStart(IOService *that, IOService *provider) {
+	IOLog("CarrizoRed: %s::start ...\n", that->getMetaClass()->getClassName());
+	bool ret = FunctionCast(wrapAtiStart, callback->orgAtiStart)(that, provider);
+	IOLog("CarrizoRed: %s::start -> %s\n", that->getMetaClass()->getClassName(), ret ? "OK" : "FAILED");
 	return ret;
 }
 
