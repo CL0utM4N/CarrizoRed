@@ -9,6 +9,7 @@
 
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOPlatformExpert.h>
+#include <IOKit/acpi/IOACPIPlatformExpert.h>
 #include <IOKit/IORegistryEntry.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
@@ -20,24 +21,17 @@ static void setStatus(IOPCIDevice *pci, const char *status) {
 	SYSLOG("vbios", "%s", status);
 }
 
-// The ACPI tables the firmware provided, as published by AppleACPIPlatformExpert ("ACPI Tables" → "VFCT").
-// The platform expert is not a child of the registry root (Root → <model> → AppleACPIPlatformExpert), so get it
-// directly instead of by path.
-static OSData *copyAcpiTable(IOPCIDevice *pci, const char *signature) {
-	auto *expert = IOService::getPlatform();
+// The firmware's copy of an ACPI table, from the ACPI platform expert (AppleACPIPlatformExpert). It doesn't publish
+// an "ACPI Tables" property this early in boot, so ask it directly.
+static const OSData *copyAcpiTable(IOPCIDevice *pci, const char *signature) {
+	auto *expert = OSDynamicCast(IOACPIPlatformExpert, IOService::getPlatform());
 	if (!expert) {
-		setStatus(pci, "no platform expert");
+		setStatus(pci, "platform expert is not an IOACPIPlatformExpert");
 		return nullptr;
 	}
-
-	auto *tables = OSDynamicCast(OSDictionary, expert->getProperty("ACPI Tables"));
-	if (!tables) {
-		setStatus(pci, "platform expert has no \"ACPI Tables\"");
-		return nullptr;
-	}
-	auto *table = OSDynamicCast(OSData, tables->getObject(signature));
+	auto *table = expert->getACPITableData(signature, 0);
 	if (!table) {
-		setStatus(pci, "no VFCT in \"ACPI Tables\"");
+		setStatus(pci, "getACPITableData(VFCT) returned nothing");
 		return nullptr;
 	}
 	table->retain();
@@ -65,7 +59,7 @@ bool VBIOS::inject(IOPCIDevice *pci, uint16_t vendorId, uint16_t deviceId) {
 	if (!table)
 		return false;
 
-	auto *base = static_cast<const uint8_t *>(table->getBytesNoCopy());
+	auto *base = static_cast<const uint8_t *>(const_cast<OSData *>(table)->getBytesNoCopy());
 	uint32_t tableSize = table->getLength();
 	bool injected = false;
 
