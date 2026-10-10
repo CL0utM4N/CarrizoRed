@@ -36,12 +36,14 @@ static const char *pathRadeonX4000HWServices[] {
 static const char *pathPolarisController[] {
 	"/System/Library/Extensions/AMD9500Controller.kext/Contents/MacOS/AMD9500Controller"};
 static const char *pathSupport[] {"/System/Library/Extensions/AMDSupport.kext/Contents/MacOS/AMDSupport"};
+static const char *pathFramebuffer[] {"/System/Library/Extensions/AMDFramebuffer.kext/Contents/MacOS/AMDFramebuffer"};
 
 enum KextIndex : size_t {
 	KextRadeonX4000,
 	KextRadeonX4000HWServices,
 	KextPolarisController,
 	KextSupport,
+	KextFramebuffer,
 	KextCount,
 };
 
@@ -53,6 +55,8 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 	[KextPolarisController] = {"com.apple.kext.AMD9500Controller", pathPolarisController,
 		arrsize(pathPolarisController), {}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextSupport] = {"com.apple.kext.AMDSupport", pathSupport, arrsize(pathSupport), {}, {},
+		KernelPatcher::KextInfo::Unloaded},
+	[KextFramebuffer] = {"com.apple.kext.AMDFramebuffer", pathFramebuffer, arrsize(pathFramebuffer), {}, {},
 		KernelPatcher::KextInfo::Unloaded},
 };
 
@@ -169,6 +173,8 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 			patchSupport(patcher, index, slide, size);
 			traceSupport(patcher, index, slide, size);
 		}
+		else if (i == KextFramebuffer)
+			traceFramebuffer(patcher, index, slide, size);
 		else if (i == KextRadeonX4000)
 			blockAcceleration(patcher, index, slide, size, "__ZN37AMDRadeonX4000_AMDGraphicsAccelerator5probeEP9IOServicePi");
 		else if (i == KextRadeonX4000HWServices)
@@ -373,63 +379,75 @@ uint64_t CRDriver::wrapGetConfigProperty(void *that, const char *name, void *val
 // AMD9500Controller initialisation stage on the console, so a controller that matches and then fails to start (and
 // disappears again) shows which stage failed.
 namespace {
+	enum TraceKext { InController, InSupport, InFramebuffer };
+
 	struct TracedStage {
 		const char *symbol;
 		const char *name;
-		bool inSupport;  // defined in AMDSupport (else AMD9500Controller)
+		TraceKext kext;
+		bool summary;  // also note the result in the repeated trace summary (start-up stages only)
 		mach_vm_address_t org;
 	};
 
-	// Results are IOReturn-style ints or bools; both are logged as the low 32 bits.
 	TracedStage stages[] {
-		{"__ZN17AMD9500Controller21initializeProjectInfoEv", "initializeProjectInfo", false, 0},
-		{"__ZN17AMD9500Controller19initializeResourcesEv", "initializeResources", false, 0},
-		{"__ZN17AMD9500Controller35initializeProjectDependentResourcesEv", "initializeProjectDependentResources", false, 0},
-		{"__ZN17AMD9500Controller18initializeHardwareEv", "initializeHardware", false, 0},
-		{"__ZN17AMD9500Controller19initializePowerPlayEv", "initializePowerPlay", false, 0},
-		{"__ZN17AMD9500Controller24initializeConnectionInfoEv", "initializeConnectionInfo", false, 0},
-		{"__ZN17AMD9500Controller13initializeICMEv", "initializeICM", false, 0},
-		// Inside initializeResources: powerUpHardware (vtable +0xcd0) runs ASIC_Init when detectPowerDown (+0x9a8) says
-		// so; createAsicInfo -> AtiAsicInfo::initWithController -> ASIC_INFO__BAFFIN::populate*.
-		{"__ZN17AMD9500Controller15powerUpHardwareEv", "powerUpHardware", false, 0},
-		{"__ZN17AMD9500Controller15detectPowerDownEv", "detectPowerDown", false, 0},
-		{"__ZN17ASIC_INFO__BAFFIN18populateDeviceInfoEv", "populateDeviceInfo", false, 0},
-		{"__ZN17ASIC_INFO__BAFFIN18populateFbLocationEv", "populateFbLocation", false, 0},
-		{"__ZN17ASIC_INFO__BAFFIN20populateMemoryConfigEv", "populateMemoryConfig", false, 0},
-		{"__ZN13AtomBiosProxy14initializeAsicEv", "initializeAsic", true, 0},
-		{"__ZN11AtiAsicInfo18initWithControllerEP13ATIController", "AsicInfo.initWithController", true, 0},
+		// AMD9500Controller start-up (ATIController::start).
+		{"__ZN17AMD9500Controller21initializeProjectInfoEv", "initializeProjectInfo", InController, true, 0},
+		{"__ZN17AMD9500Controller19initializeResourcesEv", "initializeResources", InController, true, 0},
+		{"__ZN17AMD9500Controller35initializeProjectDependentResourcesEv", "initializeProjectDependentResources", InController, true, 0},
+		{"__ZN17AMD9500Controller18initializeHardwareEv", "initializeHardware", InController, true, 0},
+		{"__ZN17AMD9500Controller19initializePowerPlayEv", "initializePowerPlay", InController, true, 0},
+		{"__ZN17AMD9500Controller24initializeConnectionInfoEv", "initializeConnectionInfo", InController, true, 0},
+		{"__ZN17AMD9500Controller13initializeICMEv", "initializeICM", InController, true, 0},
+		{"__ZN17AMD9500Controller15powerUpHardwareEv", "powerUpHardware", InController, true, 0},
+		{"__ZN17AMD9500Controller15detectPowerDownEv", "detectPowerDown", InController, true, 0},
+		{"__ZN17ASIC_INFO__BAFFIN18populateDeviceInfoEv", "populateDeviceInfo", InController, true, 0},
+		{"__ZN17ASIC_INFO__BAFFIN18populateFbLocationEv", "populateFbLocation", InController, true, 0},
+		{"__ZN17ASIC_INFO__BAFFIN20populateMemoryConfigEv", "populateMemoryConfig", InController, true, 0},
+		{"__ZN13AtomBiosProxy14initializeAsicEv", "initializeAsic", InSupport, true, 0},
+		{"__ZN11AtiAsicInfo18initWithControllerEP13ATIController", "AsicInfo.initWithController", InSupport, true, 0},
+		// Display path driven by WindowServer (spoof boot 5 hung hard right after WindowServer started).
+		{"__ZN14AMDFramebuffer4openEv", "fb.open", InFramebuffer, false, 0},
+		{"__ZN14AMDFramebuffer16enableControllerEv", "fb.enableController", InFramebuffer, false, 0},
+		{"__ZN14AMDFramebuffer14setDisplayModeEii", "fb.setDisplayMode", InFramebuffer, false, 0},
+		{"__ZN14AMDFramebuffer12setAttributeEjm", "fb.setAttribute", InFramebuffer, false, 0},
+		{"__ZN14AMDFramebuffer25setAttributeForConnectionEijm", "fb.setAttributeForConnection", InFramebuffer, false, 0},
+		{"__ZN14AMDFramebuffer12connectFlagsEiiPj", "fb.connectFlags", InFramebuffer, false, 0},
+		{"__ZN14AMDFramebuffer21getStartupDisplayModeEPiS0_", "fb.getStartupDisplayMode", InFramebuffer, false, 0},
+		{"__ZN14AMDFramebuffer13setGammaTableEjjjPv", "fb.setGammaTable", InFramebuffer, false, 0},
+		{"__ZN18AtiTimingGenerator20waitForVerticalBlankEb", "tg.waitForVerticalBlank", InSupport, false, 0},
+		{"__ZN18AtiTimingGenerator13waitForActiveEv", "tg.waitForActive", InSupport, false, 0},
+		{"__ZN18AtiTimingGenerator21waitForGraphicsUpdateEv", "tg.waitForGraphicsUpdate", InSupport, false, 0},
+		{"__ZN18AtiTimingGenerator11setupTimingEP28AtiDetailedTimingInformation", "tg.setupTiming", InSupport, false, 0},
+		{"__ZN21BaffinTimingGenerator17waitForCrtcUpdateEv", "tg.waitForCrtcUpdate", InController, false, 0},
+		{"__ZN21BaffinTimingGenerator10enableCrtcEbb", "tg.enableCrtc", InController, false, 0},
+		{"__ZN21BaffinTimingGenerator9blankCrtcEbj", "tg.blankCrtc", InController, false, 0},
+		{"__ZN21BaffinTimingGenerator13programTimingEv", "tg.programTiming", InController, false, 0},
+		{"__ZN17AMD9500Controller19hwProgramPixelClockEhj", "hwProgramPixelClock", InController, false, 0},
 	};
 
-	// Two pointer-sized arguments cover every traced function (this, plus at most one argument).
+	// Six integer/pointer arguments cover every traced function. On a hard hang, the last "->" without a matching
+	// "<-" is the function that never returned.
 	template <size_t N>
-	uint64_t wrapStage(void *that, void *arg) {
-		IOLog("CarrizoRed: %s ...\n", stages[N].name);
-		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(that, arg);
-		IOLog("CarrizoRed: %s -> 0x%x\n", stages[N].name, static_cast<uint32_t>(ret));
-		traceNote("%s=%x ", stages[N].name, static_cast<uint32_t>(ret));
+	uint64_t wrapStage(void *a, void *b, void *c, void *d, void *e, void *f) {
+		IOLog("CarrizoRed: -> %s\n", stages[N].name);
+		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(a, b, c, d, e, f);
+		IOLog("CarrizoRed: <- %s = 0x%x\n", stages[N].name, static_cast<uint32_t>(ret));
+		if (stages[N].summary)
+			traceNote("%s=%x ", stages[N].name, static_cast<uint32_t>(ret));
 		return ret;
 	}
 
-	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, bool support) {
-		static_assert(arrsize(stages) == 14, "one wrapper per stage");
+#define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
+	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
+		static_assert(arrsize(stages) == 31, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
-			reinterpret_cast<mach_vm_address_t>(wrapStage<0>),
-			reinterpret_cast<mach_vm_address_t>(wrapStage<1>),
-			reinterpret_cast<mach_vm_address_t>(wrapStage<2>),
-			reinterpret_cast<mach_vm_address_t>(wrapStage<3>),
-			reinterpret_cast<mach_vm_address_t>(wrapStage<4>),
-			reinterpret_cast<mach_vm_address_t>(wrapStage<5>),
-			reinterpret_cast<mach_vm_address_t>(wrapStage<6>),
-			reinterpret_cast<mach_vm_address_t>(wrapStage<7>),
-			reinterpret_cast<mach_vm_address_t>(wrapStage<8>),
-			reinterpret_cast<mach_vm_address_t>(wrapStage<9>),
-			reinterpret_cast<mach_vm_address_t>(wrapStage<10>),
-			reinterpret_cast<mach_vm_address_t>(wrapStage<11>),
-			reinterpret_cast<mach_vm_address_t>(wrapStage<12>),
-			reinterpret_cast<mach_vm_address_t>(wrapStage<13>),
+			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
+			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
+			CR_WRAP(16), CR_WRAP(17), CR_WRAP(18), CR_WRAP(19), CR_WRAP(20), CR_WRAP(21), CR_WRAP(22), CR_WRAP(23),
+			CR_WRAP(24), CR_WRAP(25), CR_WRAP(26), CR_WRAP(27), CR_WRAP(28), CR_WRAP(29), CR_WRAP(30),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
-			if (stages[i].inSupport != support)
+			if (stages[i].kext != kext)
 				continue;
 			KernelPatcher::RouteRequest request {stages[i].symbol, wrappers[i], stages[i].org};
 			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
@@ -438,17 +456,23 @@ namespace {
 			}
 		}
 	}
+#undef CR_WRAP
 }
 
 void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	if (!checkKernelArgument("-crnotrace"))
-		routeStages(patcher, index, slide, size, false);
+		routeStages(patcher, index, slide, size, InController);
+}
+
+void CRDriver::traceFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	if (!checkKernelArgument("-crnotrace"))
+		routeStages(patcher, index, slide, size, InFramebuffer);
 }
 
 void CRDriver::traceSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	if (checkKernelArgument("-crnotrace"))
 		return;
-	routeStages(patcher, index, slide, size, true);
+	routeStages(patcher, index, slide, size, InSupport);
 	KernelPatcher::RouteRequest requests[] {
 		{"__ZN13ATIController5probeEP9IOServicePi", wrapAtiProbe, orgAtiProbe},
 		{"__ZN13ATIController5startEP9IOService", wrapAtiStart, orgAtiStart},
