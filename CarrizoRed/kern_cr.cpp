@@ -184,10 +184,9 @@ void CRDriver::patchPolarisController(KernelPatcher &patcher, size_t index, mach
 
 // While Apple's display stack starts, print what attached below the iGPU (classes and names, 3 levels) to the verbose
 // console whenever it changes, for 10 minutes. When the panel keeps showing the boot console but the GUI has started
-// elsewhere, this is the only output that can be seen. Also published as "CarrizoRed,tree". -crnowatch disables it.
+// elsewhere, this is the only output that can be seen. Also published as "CarrizoRed,tree". -crnowatch stops the
+// printing (the thread still requests the controller, see below).
 void CRDriver::startWatcher() {
-	if (checkKernelArgument("-crnowatch"))
-		return;
 	thread_t thread;
 	if (kernel_thread_start(watcherThread, this, &thread) == KERN_SUCCESS)
 		thread_deallocate(thread);
@@ -214,12 +213,30 @@ static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_
 void CRDriver::watcherThread(void *arg, wait_result_t) {
 	auto *self = static_cast<CRDriver *>(arg);
 	static char last[1536], now[1536];
+	bool print = !checkKernelArgument("-crnowatch");
+	bool controllerRequested = checkKernelArgument("-crnoloadctl");
 	last[0] = '\0';
 	for (int t = 0; t <= 600; t += 3) {
 		now[0] = '\0';
 		describeChildren(self->iGPU, 0, now, sizeof(now));
+
+		// AMD9500Controller's personality only matches once the iGPU has LoadController=true. On a Mac the graphics
+		// policy asks the wrangler for that (AtiGpuWrangler::vendor_doDeviceAttribute, attribute 3, flag bit 0: set
+		// LoadAMDSupport + LoadController, then registerService()); nothing asks for the iGPU, so the wrangler holds the
+		// framebuffer slot and the GUI has no display. Do the same once the wrangler has attached. Acceleration
+		// (flag bit 1: LoadHWServices + LoadAccelerator) is left for later. -crnoloadctl disables this.
+		if (!controllerRequested && strstr(now, "AMD9500ControllerWrangler")) {
+			controllerRequested = true;
+			if (!self->iGPU->getProperty("LoadController")) {
+				self->iGPU->setProperty("LoadAMDSupport", true);
+				self->iGPU->setProperty("LoadController", true);
+				self->iGPU->registerService();
+				IOLog("CarrizoRed: t=%ds set LoadController on the iGPU and re-registered it\n", t);
+			}
+		}
+
 		// Repeat every 15 s as well: launchd keeps scrolling the console once the GUI starts.
-		if (strcmp(now, last) || t % 15 == 0) {
+		if (print && (strcmp(now, last) || t % 15 == 0)) {
 			strlcpy(last, now, sizeof(last));
 			self->iGPU->setProperty("CarrizoRed,tree", now);
 			IOLog("CarrizoRed: t=%ds iGPU children:%s\n", t, now[0] ? "" : " none");
