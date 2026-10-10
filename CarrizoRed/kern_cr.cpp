@@ -15,6 +15,20 @@
 #include <Headers/kern_util.hpp>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <kern/thread.h>
+#include <stdarg.h>
+
+// Short summary of the bring-up trace, repeated by the watcher so it survives the console scrolling.
+static char traceSummary[640];
+
+static void traceNote(const char *fmt, ...) {
+	size_t len = strlen(traceSummary);
+	if (len + 2 >= sizeof(traceSummary))
+		return;
+	va_list va;
+	va_start(va, fmt);
+	vsnprintf(traceSummary + len, sizeof(traceSummary) - len, fmt, va);
+	va_end(va);
+}
 
 static const char *pathRadeonX4000[] {"/System/Library/Extensions/AMDRadeonX4000.kext/Contents/MacOS/AMDRadeonX4000"};
 static const char *pathRadeonX4000HWServices[] {
@@ -235,6 +249,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				self->iGPU->setProperty("LoadController", true);
 				self->iGPU->registerService();
 				IOLog("CarrizoRed: t=%ds set LoadController on the iGPU and re-registered it\n", t);
+				traceNote("LoadController@%ds ", t);
 			}
 		}
 
@@ -244,6 +259,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			self->iGPU->setProperty("CarrizoRed,tree", now);
 			IOLog("CarrizoRed: t=%ds LoadController=%s, iGPU children:%s\n", t,
 				self->iGPU->getProperty("LoadController") ? "set" : "not set", now[0] ? "" : " none");
+			IOLog("CarrizoRed: trace: %s\n", traceSummary[0] ? traceSummary : "(controller not probed yet)");
 			for (char *line = now; *line;) {
 				char *end = strchr(line, '\n');
 				if (end)
@@ -311,6 +327,7 @@ namespace {
 		IOLog("CarrizoRed: AMD9500Controller::%s ...\n", stages[N].name);
 		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(that);
 		IOLog("CarrizoRed: AMD9500Controller::%s -> 0x%x\n", stages[N].name, static_cast<uint32_t>(ret));
+		traceNote("%s=%x ", stages[N].name, static_cast<uint32_t>(ret));
 		return ret;
 	}
 
@@ -359,6 +376,7 @@ IOService *CRDriver::wrapAtiProbe(IOService *that, IOService *provider, SInt32 *
 	IOLog("CarrizoRed: %s::probe ...\n", that->getMetaClass()->getClassName());
 	auto *ret = FunctionCast(wrapAtiProbe, callback->orgAtiProbe)(that, provider, score);
 	IOLog("CarrizoRed: %s::probe -> %s\n", that->getMetaClass()->getClassName(), ret ? "match" : "NO MATCH");
+	traceNote("%s.probe=%s ", that->getMetaClass()->getClassName(), ret ? "match" : "NO");
 	return ret;
 }
 
@@ -366,6 +384,7 @@ bool CRDriver::wrapAtiStart(IOService *that, IOService *provider) {
 	IOLog("CarrizoRed: %s::start ...\n", that->getMetaClass()->getClassName());
 	bool ret = FunctionCast(wrapAtiStart, callback->orgAtiStart)(that, provider);
 	IOLog("CarrizoRed: %s::start -> %s\n", that->getMetaClass()->getClassName(), ret ? "OK" : "FAILED");
+	traceNote("%s.start=%s ", that->getMetaClass()->getClassName(), ret ? "OK" : "FAILED");
 	return ret;
 }
 
