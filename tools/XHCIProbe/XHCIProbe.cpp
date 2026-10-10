@@ -19,6 +19,10 @@
 //  "XHCIProbe-before", "XHCIProbe-steps", "XHCIProbe-after", "XHCIProbe-acpi" and "XHCIProbe-trace", so
 //  `ioreg -lw0 -r -n XHC0@10 | grep XHCIProbe` shows them after boot.
 //
+//  For 10 minutes it also prints an interrupt summary every 2 s ("XHCIProbe: irq ..." on the verbose screen,
+//  "XHCIProbe-irq" property): MSI/MSI-X enable, how often IMAN.IP and USBSTS.EINT were seen set at 1 ms samples,
+//  and how often the event ring dequeue pointer moved. IP/EINT seen set most of the time = interrupts not serviced.
+//
 //  Boot-args: -xhciprobe_noact   only record state, change nothing
 //             -xhciprobe_nomon   no monitor thread
 //             -xhciprobe_off     do nothing at all
@@ -168,7 +172,13 @@ namespace {
 		char trace[4000];
 	};
 
-	constexpr int MonitorMs = 60000;
+	constexpr int MonitorMs = 600000;  // 10 min: covers the verbose part of an installer boot
+	constexpr int TraceMs = 60000;     // state-change trace only for the first minute
+	constexpr int WindowMs = 2000;     // interrupt summary period
+	// Runtime registers (xHCI 5.5): RTSOFF in the capability registers, interrupter 0 at +0x20.
+	constexpr UInt32 RegRtsOff = 0x18, RegIman = 0x20, RegErdp = 0x38;
+	constexpr UInt32 ImanPending = 1 << 0;
+	constexpr UInt32 StsEventInterrupt = 1 << 3;
 	constexpr UInt32 StsNoisy = (1 << 3) | (1 << 4);  // EINT, PCD: change on normal port activity
 
 	UInt64 nowMs() {
@@ -183,7 +193,41 @@ namespace {
 		UInt64 start = nowMs(), lastPublish = 0;
 		UInt32 last[4] = {~0u, ~0u, ~0u, ~0u};
 		bool changed = false, full = false;
+		// Interrupt statistics per window: if MSI/MSI-X is enabled and interrupts are serviced, IMAN.IP and
+		// USBSTS.EINT are cleared within microseconds and are almost never seen set at a 1 ms sample. If they stay
+		// set, interrupts aren't reaching the driver and it only notices events on its own timeouts.
+		UInt32 samples = 0, ipSet = 0, eintSet = 0, erdpMoves = 0, lastErdp = 0, iman = 0;
+		UInt64 windowStart = 0;
 		for (UInt64 t = 0; t < MonitorMs; t = nowMs() - start) {
+			if (c.r32(RegCapLength) != ~0u) {
+				UInt32 rt = c.r32(RegRtsOff) & ~0x1Fu;
+				iman = c.r32(rt + RegIman);
+				UInt32 erdp = c.r32(rt + RegErdp) & ~0xFu;
+				samples++;
+				if (iman != ~0u && (iman & ImanPending))
+					ipSet++;
+				if (c.r32(c.op(RegUsbSts)) & StsEventInterrupt)
+					eintSet++;
+				if (erdp != lastErdp)
+					erdpMoves++;
+				lastErdp = erdp;
+			}
+			if (t - windowStart >= WindowMs) {
+				bool msi = c.msi && (c.pci->configRead16(c.msi + 2) & 1);
+				bool msix = c.msix && (c.pci->configRead16(c.msix + 2) & 0x8000);
+				char w[160];
+				snprintf(w, sizeof(w), "t=%llus D%u cmd=%04x msi=%d msix=%d iman=%x IP %u/%u EINT %u/%u events %u",
+					t / 1000, c.pm ? c.pci->configRead16(c.pm + 4) & 3 : 0xF, c.pci->configRead16(kIOPCIConfigCommand),
+					msi, msix, iman, ipSet, samples, eintSet, samples, erdpMoves);
+				IOLog("XHCIProbe: irq %s\n", w);
+				c.pci->setProperty("XHCIProbe-irq", w);
+				samples = ipSet = eintSet = erdpMoves = 0;
+				windowStart = t;
+			}
+			if (t >= TraceMs) {
+				IOSleep(1);
+				continue;
+			}
 			UInt32 now[4];
 			now[0] = c.pm ? c.pci->configRead16(c.pm + 4) & 3 : 0xF;
 			now[1] = c.pci->configRead16(kIOPCIConfigCommand);
