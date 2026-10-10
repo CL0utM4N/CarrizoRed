@@ -31,6 +31,8 @@ private:
 	void patchSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
 	static uint64_t wrapGetConfigProperty(void *that, const char *name, void *value, uint32_t size);
 	mach_vm_address_t orgGetConfigProperty {0};
+	static bool wrapTestVram(void *that, uint32_t region, bool flag);
+	mach_vm_address_t orgTestVram {0};
 
 	void traceController(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
 	void traceSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);

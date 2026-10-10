@@ -318,3 +318,13 @@ wrangler is attached (`-crnoloadctl` disables it).
 `AMD9500Controller` reads its `CFG_*` options with `ATIController::getConfigProperty` from the personality's
 `aty_config` (and per-framebuffer `ATY,<name>` overrides). `CFG_NON_ZERO_MC_LOC` is off for Polaris, so `ATY,vram_base`
 would be 0; CarrizoRed forces it on so the base comes from `AtiAsicInfo::getFbLocationBase()` (`-crnomcloc` disables).
+
+### AMD9500Controller start-up on Stoney (spoof boots 3–4)
+`ATIController::start` → `AMD9500Controller::initializeResources` fails with `0xe00002c9`. Inside it,
+`powerUpHardware()` (vtable `+0xcd0`) returns `0xe00002bc`: `detectPowerDown()` (`+0x9a8`) correctly says the GPU is
+already up (so no ASIC_Init), but `ATIController::TestVRAM(PCI_REG_INDEX 7, false)` fails (the check is gated by bit 19
+of `this+0x31332`). Region 7 is the 3 MB sub-range mapped at offset 0 in `BaffinSharedController::initializeResources`;
+the boot console ghosted while it ran, so it writes test patterns into the displayed memory. The other source of the
+same error, `createAsicInfo` (`AtiAsicInfo::initWithController` → `ASIC_INFO__BAFFIN::populate{DeviceInfo,FbLocation,
+MemoryConfig}`), wasn't reached. CarrizoRed now reports TestVRAM as passed (logging the real result; `-crnovramtest`
+disables) to see what fails next.

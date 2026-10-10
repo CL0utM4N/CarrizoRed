@@ -280,16 +280,35 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 // MC_VM_FB_LOCATION (0xF4_0000_0000 on the D509BA); with the flag set, Apple takes the base from
 // AtiAsicInfo::getFbLocationBase() instead. -crnomcloc disables this.
 void CRDriver::patchSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
-	if (checkKernelArgument("-crnomcloc"))
-		return;
-	KernelPatcher::RouteRequest request {"__ZN13ATIController17getConfigPropertyEPKcPvj", wrapGetConfigProperty,
-		orgGetConfigProperty};
-	if (patcher.routeMultiple(index, &request, 1, slide, size)) {
-		SYSLOG("cr", "CFG_NON_ZERO_MC_LOC forced on");
-	} else {
-		SYSLOG("cr", "failed to route ATIController::getConfigProperty (error %d)", patcher.getError());
-		patcher.clearError();
+	if (!checkKernelArgument("-crnomcloc")) {
+		KernelPatcher::RouteRequest request {"__ZN13ATIController17getConfigPropertyEPKcPvj", wrapGetConfigProperty,
+			orgGetConfigProperty};
+		if (patcher.routeMultiple(index, &request, 1, slide, size)) {
+			SYSLOG("cr", "CFG_NON_ZERO_MC_LOC forced on");
+		} else {
+			SYSLOG("cr", "failed to route ATIController::getConfigProperty (error %d)", patcher.getError());
+			patcher.clearError();
+		}
 	}
+
+	// AMD9500Controller::powerUpHardware() runs ATIController::TestVRAM(region 7, false) and fails start-up with
+	// 0xe00002bc when it returns false, which it does on Stoney (spoof boot 4). The APU's "VRAM" is a carve-out of
+	// system RAM that Linux scans out from fine, so let start-up continue, but keep the real result in the trace.
+	// -crnovramtest disables this.
+	if (!checkKernelArgument("-crnovramtest")) {
+		KernelPatcher::RouteRequest request {"__ZN13ATIController8TestVRAME13PCI_REG_INDEXb", wrapTestVram, orgTestVram};
+		if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+			SYSLOG("cr", "failed to route ATIController::TestVRAM (error %d)", patcher.getError());
+			patcher.clearError();
+		}
+	}
+}
+
+bool CRDriver::wrapTestVram(void *that, uint32_t region, bool flag) {
+	bool ret = FunctionCast(wrapTestVram, callback->orgTestVram)(that, region, flag);
+	IOLog("CarrizoRed: TestVRAM(region %u) -> %s, reporting success\n", region, ret ? "passed" : "FAILED");
+	traceNote("TestVRAM(%u)=%s->ok ", region, ret ? "pass" : "FAIL");
+	return true;
 }
 
 uint64_t CRDriver::wrapGetConfigProperty(void *that, const char *name, void *value, uint32_t size) {
