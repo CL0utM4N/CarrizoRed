@@ -2,7 +2,7 @@
 """
 Build an OpenCore EFI for the ASUS VivoBook 15 D509BA (A9-9425, Stoney Ridge) test laptop.
 
-    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe] [--carrizored [--spoof]]
+    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe] [--carrizored [--spoof]] [--oclog]
 
 <work dir> must contain:
     unpacked/OpenCore-<ver>-RELEASE/        OpenCorePkg release zip, extracted
@@ -123,6 +123,7 @@ def main():
     with_probe = "--xhciprobe" in sys.argv[1:]
     with_cr = "--carrizored" in sys.argv[1:]
     with_spoof = "--spoof" in sys.argv[1:]
+    with_oclog = "--oclog" in sys.argv[1:]
     if with_spoof and not with_cr:
         die("--spoof needs --carrizored (it injects the VBIOS the Polaris drivers need)")
     if len(args) != 1:
@@ -218,6 +219,10 @@ def main():
     cfg["Misc"]["Boot"].update(HideAuxiliary=False, PickerMode="Builtin", ShowPicker=True, Timeout=5,
                                PollAppleHotKeys=True)
     cfg["Misc"]["Debug"].update(AppleDebug=True, ApplePanic=True, DisableWatchDog=True, Target=3)
+    if with_oclog:
+        # Target 0x41: logging on + write opencore-<date>.txt to the root of the EFI partition OpenCore booted from.
+        # DisplayLevel 0x80000042: errors, warnings and info (kext injection results are info).
+        cfg["Misc"]["Debug"].update(Target=0x41, DisplayLevel=0x80000042)
     cfg["Misc"]["Security"].update(AllowSetDefault=True, BlacklistAppleUpdate=True, ExposeSensitiveData=6,
                                    ScanPolicy=0, SecureBootModel="Disabled", Vault="Optional")
     cfg["Misc"]["Entries"] = []
