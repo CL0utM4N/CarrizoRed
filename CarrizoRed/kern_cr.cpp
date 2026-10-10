@@ -150,6 +150,8 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 			patchPolarisController(patcher, index, slide, size);
 			startWatcher();
 		}
+		else if (i == KextSupport)
+			patchSupport(patcher, index, slide, size);
 		else if (i == KextRadeonX4000)
 			blockAcceleration(patcher, index, slide, size, "__ZN37AMDRadeonX4000_AMDGraphicsAccelerator5probeEP9IOServicePi");
 		else if (i == KextRadeonX4000HWServices)
@@ -233,6 +235,33 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		}
 		IOSleep(3000);
 	}
+}
+
+// ATIController::getConfigProperty(name, value, size) reads the controller's "aty_config" options. Apple leaves
+// CFG_NON_ZERO_MC_LOC off for Polaris, whose VRAM starts at GPU address 0, so AMD9500Controller sets "ATY,vram_base" to 0
+// and scans out from the wrong place (first spoof boot: purple lines on the panel). On the APU the carve-out sits at
+// MC_VM_FB_LOCATION (0xF4_0000_0000 on the D509BA); with the flag set, Apple takes the base from
+// AtiAsicInfo::getFbLocationBase() instead. -crnomcloc disables this.
+void CRDriver::patchSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	if (checkKernelArgument("-crnomcloc"))
+		return;
+	KernelPatcher::RouteRequest request {"__ZN13ATIController17getConfigPropertyEPKcPvj", wrapGetConfigProperty,
+		orgGetConfigProperty};
+	if (patcher.routeMultiple(index, &request, 1, slide, size)) {
+		SYSLOG("cr", "CFG_NON_ZERO_MC_LOC forced on");
+	} else {
+		SYSLOG("cr", "failed to route ATIController::getConfigProperty (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+}
+
+uint64_t CRDriver::wrapGetConfigProperty(void *that, const char *name, void *value, uint32_t size) {
+	auto ret = FunctionCast(wrapGetConfigProperty, callback->orgGetConfigProperty)(that, name, value, size);
+	if (name && value && size && !strcmp(name, "CFG_NON_ZERO_MC_LOC")) {
+		memset(value, 0, size);
+		*static_cast<uint8_t *>(value) = 1;
+	}
+	return ret;
 }
 
 // -crnoaccel: keep Apple's acceleration stack (AMDRadeonX4000 accelerator, HWServices/CAIL) off the iGPU so the display

@@ -28,6 +28,10 @@ private:
 	void blockAcceleration(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, const char *probe);
 	static IOService *wrapProbeNoMatch(IOService *that, IOService *provider, SInt32 *score);
 
+	void patchSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
+	static uint64_t wrapGetConfigProperty(void *that, const char *name, void *value, uint32_t size);
+	mach_vm_address_t orgGetConfigProperty {0};
+
 	void startWatcher();
 	static void watcherThread(void *arg, wait_result_t);
 
