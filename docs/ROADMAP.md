@@ -17,7 +17,8 @@ See [PHASE0.md](PHASE0.md).
 - [x] Lilu plugin skeleton, iGPU detection by config-space ID
 - [x] Log PCI info, BARs, UMA carve-out size/location, GFX config registers
 - [x] Log when Apple's Polaris kexts load
-- [ ] Confirm the above on hardware
+- [x] Confirm the above on hardware (D509BA / Stoney, 2026-10-10: family, rev 0xDA, 512 MB carve-out,
+      `GB_ADDR_CONFIG` = `0x22010001` = Linux `STONEY_GB_ADDR_CONFIG_GOLDEN`; VBIOS injection fixed after this run)
 - [ ] Spoof `device-id` to `0x67EF` via OpenCore DeviceProperties and record exactly where
       `AMD9500Controller` / `AMDRadeonX4000` fail (panic log, last log lines)
 

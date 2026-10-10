@@ -71,6 +71,10 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   Linux allows the xHCI reset up to 10 s. `AppleUSBXHCI::reset()` waits `clock_interval_to_deadline(100, 1000000)`.
 - **Attempt 6 (OpenCore patch: that deadline 100 → 1000 ms, `Base = __ZN12AppleUSBXHCI5resetEv`):** **USB works**. A
   SanDisk USB 3 stick enumerates on XHC0 at 5 Gbps and the installer boots. XHCIProbe dropped from the EFI.
+- **First CarrizoRed run (installer, 2026-10-10):** loads after dropping a bad `OSBundleCompatibleVersion` (1.0 >
+  version 0.0.1 made XNU reject it silently). Reports Stoney Ridge, rev `0xDA`, 512 MB, carve-out at `0x1FF000000`,
+  `GB_ADDR_CONFIG` `0x22010001` (Linux's Stoney golden value). VBIOS injection said No: the platform expert was looked
+  up by a registry path that doesn't resolve; now uses `IOService::getPlatform()`.
 - The `shared_region … vm_shared_region_start_address() failed` and launchd `error = 37` lines in verbose recovery
   are noise; processes keep running.
 
