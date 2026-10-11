@@ -54,20 +54,34 @@ static uint32_t ihHandlerCalls, ihReadPointerWrites, ihLastReadPointer;
 // Register first-access log. Spoof boots 10-11 froze the whole machine ~20 s after AMD9500Controller::start returned,
 // with no traced function running: most likely a periodic task touching a register that hangs the APU (e.g. one in a
 // power-gated block). Every register offset is marked on first access; once the controller has been up for 2 s, each
-// *new* offset is printed immediately (when interrupts are enabled), so the last line before a freeze names it.
-// -crnoreglog disables this.
+// *new* offset is printed immediately, *before* the access (a read that hangs never returns), so the last line before
+// a freeze names it. Lines from interrupts-off context are queued for the watcher unless -crreglogintsoff (IOLog there
+// can itself deadlock). -crnoreglog disables this.
+// Accesses to display-pipe register blocks the APU doesn't have (pipe >= displayPipes) are always printed (first 100
+// offsets); -crpipeguard also drops those writes and returns 0 for those reads.
 enum RegOp : uint32_t { RegRead, RegWrite, RegPcieRead, RegPcieWrite, RegIndRead, RegIndWrite, RegOpCount };
 static const char *const regOpNames[RegOpCount] {"rd", "WR", "pcie-rd", "PCIE-WR", "ind-rd", "IND-WR"};
 static uint8_t regSeen[RegOpCount][0x10000 / 8];
 static uint64_t regLogFromMs;  // 0 = not yet (controller not started)
 static uint32_t regLogged, regAccesses;
+static bool regLogIntsOff, pipeGuard;
+static uint32_t pipeLimit = 6, pipeAccesses, pipeLogged;
+struct RegEvent {
+	RegOp op;
+	uint32_t offset, extra, value;
+	int pipe;
+};
+static constexpr size_t RegRingSize = 64;
+static RegEvent regRing[RegRingSize];
+static uint32_t regRingHead;
+static void printRegEvent(const RegEvent &event, const char *suffix);
 
 // IH storm breaker. IH registers are dword offsets in BAR5, the same on Tonga (oss_3_0) and CZ (oss_3_0_1).
 namespace IhReg {
 	static constexpr uint32_t RB_CNTL = 0xE30, RB_BASE = 0xE31, RB_RPTR = 0xE32, RB_WPTR = 0xE33, RB_WPTR_ADDR_HI = 0xE34,
 	                          RB_WPTR_ADDR_LO = 0xE35, CNTL = 0xE36, STATUS = 0xE38;
 }
-static volatile uint32_t *ihMmio;
+static volatile uint32_t *gpuMmio;  // BAR5, mapped by probeMMIO
 static void *ihManager;                 // BaffinInterruptManager *
 static mach_vm_address_t ihGetWptrWbAddress, ihIsUsingVram;
 static bool ihStormBroken;
@@ -195,6 +209,10 @@ void CRDriver::processPatcher(KernelPatcher &) {
 		return;
 	}
 
+	pipeLimit = displayPipes(family);
+	pipeGuard = checkKernelArgument("-crpipeguard");
+	regLogIntsOff = checkKernelArgument("-crreglogintsoff");
+
 	logPCIInfo();
 	if (!checkKernelArgument("-crnommio"))
 		probeMMIO();
@@ -246,6 +264,7 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 		}
 		else if (i == KextSupport) {
 			patchSupport(patcher, index, slide, size);
+			patchPlls(patcher, index, slide, size);
 			traceSupport(patcher, index, slide, size);
 		}
 		else if (i == KextFramebuffer)
@@ -274,21 +293,106 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 // initializeProjectDependentResources() creates a timing generator, cursor, scaler, pipe control and gamma generator
 // for each of getDisplayLimit() pipes and a line buffer for each of getNumLineBuffers(), all on fixed per-pipe register
 // blocks. Carrizo has 3 pipes and Stoney 2, so limit both to the real count (docs/APPLE_KEXTS.md, "Pipes").
+// BaffinSharedController::getDigLimit() returns 6; ATIController::doConnectionsProbe() compares it with the DIGs in use
+// when deciding how many displays it can drive. Carrizo and Stoney have 3 (-crnodiglimit disables).
 void CRDriver::patchPolarisController(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	if (checkKernelArgument("-crnopipes")) {
 		SYSLOG("cr", "pipe limit patch disabled by -crnopipes");
-		return;
-	}
-	KernelPatcher::RouteRequest requests[] {
-		{"__ZN22BaffinSharedController15getDisplayLimitEv", wrapGetDisplayLimit},
-		{"__ZN22BaffinSharedController17getNumLineBuffersEv", wrapGetNumLineBuffers},
-	};
-	if (patcher.routeMultiple(index, requests, slide, size)) {
-		SYSLOG("cr", "AMD9500Controller limited to %u display pipes", displayPipes(family));
 	} else {
-		SYSLOG("cr", "failed to route AMD9500Controller pipe limits (error %d)", patcher.getError());
+		KernelPatcher::RouteRequest requests[] {
+			{"__ZN22BaffinSharedController15getDisplayLimitEv", wrapGetDisplayLimit},
+			{"__ZN22BaffinSharedController17getNumLineBuffersEv", wrapGetNumLineBuffers},
+		};
+		if (patcher.routeMultiple(index, requests, slide, size)) {
+			SYSLOG("cr", "AMD9500Controller limited to %u display pipes", displayPipes(family));
+		} else {
+			SYSLOG("cr", "failed to route AMD9500Controller pipe limits (error %d)", patcher.getError());
+			patcher.clearError();
+		}
+	}
+
+	if (!checkKernelArgument("-crnodiglimit")) {
+		KernelPatcher::RouteRequest request {"__ZN22BaffinSharedController11getDigLimitEv", wrapGetDigLimit};
+		if (patcher.routeMultiple(index, &request, 1, slide, size)) {
+			SYSLOG("cr", "AMD9500Controller limited to %u DIGs", DisplayDigs);
+		} else {
+			SYSLOG("cr", "failed to route getDigLimit (error %d)", patcher.getError());
+			patcher.clearError();
+		}
+	}
+
+	// See patchPlls.
+	KernelPatcher::RouteRequest request {"__ZN17AMD9500Controller21hwSetCrtcToPixelClockEhhR11ClockParams",
+		wrapSetCrtcToPixelClock, orgSetCrtcToPixelClock};
+	if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+		SYSLOG("cr", "failed to route hwSetCrtcToPixelClock (error %d)", patcher.getError());
 		patcher.clearError();
 	}
+}
+
+// Pixel PLLs. AMD9500Controller creates its PLL assigner with a hard-coded 7 PLLs
+// (BaffinSharedController::initializeProjectDependentResources → AtiPllAssignerFactory::createPllAssigner(..., 7));
+// it hands out the lowest free index, and hwProgramPpllUsingBios passes the index unchanged to the VBIOS SetPixelClock
+// table as ucPpll (ActiveConnectorInfo +0x2E). Carrizo/Stoney have two pixel PLLs, which Linux DC
+// (command_table_helper_dce110.c) addresses as PLL0 → ATOM_PPLL0 (2) and PLL1 → ATOM_PPLL1 (0); ATOM 1 (PPLL2) isn't
+// used on DCE 11.0. So:
+//  - limit the assigner to 2 PLLs (-crnoplllimit disables);
+//  - remap Apple index 0 → ATOM 0 (unchanged: the first spoof boot lit the panel with it) and 1 → ATOM 2 at
+//    AtomBiosProxy::setPixelClock (-crnopllremap disables). Every call is printed with the crtc, both indexes and the
+//    clock; indexes 2-5 are reported as invalid on the APU and passed through.
+//  - apply the same remap in AMD9500Controller::hwSetCrtcToPixelClock(crtc, pll, params), which writes the index into
+//    CRTCn_PIXEL_RATE_CNTL.PIXEL_RATE_SOURCE (assumed to use the ATOM encoding: 0 PPLL1, 1 PPLL2, 2 PPLL0) and picks
+//    a Polaris PHYPLLx resync register by it (0x100-0x103, nothing on DCE 11.0; index 5 = 0x13E, Carrizo's
+//    PHYPLL_PIXCLK_CNTL, is out of reach with 2 PLLs).
+static uint8_t atomPllFor(uint8_t pll) { return pll == 1 && !checkKernelArgument("-crnopllremap") ? 2 : pll; }
+
+void CRDriver::patchPlls(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	if (!checkKernelArgument("-crnoplllimit")) {
+		KernelPatcher::RouteRequest request {
+			"__ZN21AtiPllAssignerFactory17createPllAssignerEP13ATIControllerPP12ATIConnectorhh",
+			wrapCreatePllAssigner, orgCreatePllAssigner};
+		if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+			SYSLOG("cr", "failed to route createPllAssigner (error %d)", patcher.getError());
+			patcher.clearError();
+		}
+	}
+	KernelPatcher::RouteRequest request {"__ZN13AtomBiosProxy13setPixelClockEP11ClockParamsPK19ActiveConnectorInfo",
+		wrapSetPixelClock, orgSetPixelClock};
+	if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+		SYSLOG("cr", "failed to route AtomBiosProxy::setPixelClock (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+}
+
+void *CRDriver::wrapCreatePllAssigner(void *controller, void *connectors, uint8_t numConnectors, uint8_t numPlls) {
+	uint8_t plls = numPlls > DisplayPlls ? DisplayPlls : numPlls;
+	IOLog("CarrizoRed: PLL assigner: %u connectors, %u PLLs (Apple asked for %u)\n", numConnectors, plls, numPlls);
+	traceNote("plls=%u/%u ", plls, numPlls);
+	return FunctionCast(wrapCreatePllAssigner, callback->orgCreatePllAssigner)(controller, connectors, numConnectors,
+		plls);
+}
+
+uint64_t CRDriver::wrapSetPixelClock(void *that, void *clockParams, const void *connectorInfo) {
+	static constexpr size_t InfoSize = 0x98, CrtcOffset = 0x2D, PllOffset = 0x2E;
+	if (!clockParams || !connectorInfo)
+		return FunctionCast(wrapSetPixelClock, callback->orgSetPixelClock)(that, clockParams, connectorInfo);
+	uint8_t info[InfoSize];
+	memcpy(info, connectorInfo, InfoSize);
+	uint8_t crtc = info[CrtcOffset], pll = info[PllOffset], atomPll = atomPllFor(pll);
+	info[PllOffset] = atomPll;
+	uint32_t clock = 0;
+	memcpy(&clock, static_cast<uint8_t *>(clockParams) + 0x08, sizeof(clock));
+	const char *note = pll >= DisplayPlls && pll <= 5 ? " (INVALID on the APU)" : "";
+	if (ml_get_interrupts_enabled())
+		IOLog("CarrizoRed: setPixelClock crtc %u PLL %u -> ATOM %u, clock %u%s\n", crtc, pll, atomPll, clock, note);
+	traceEvent("setPixelClock crtc<<16|pll<<8|atom", true, (crtc << 16) | (pll << 8) | atomPll);
+	return FunctionCast(wrapSetPixelClock, callback->orgSetPixelClock)(that, clockParams, info);
+}
+
+void CRDriver::wrapSetCrtcToPixelClock(void *that, uint8_t crtc, uint8_t pll, void *clockParams) {
+	uint8_t atomPll = atomPllFor(pll);
+	traceEvent("setCrtcToPixelClock crtc<<16|pll<<8|atom", true, (crtc << 16) | (pll << 8) | atomPll);
+	FunctionCast(wrapSetCrtcToPixelClock, callback->orgSetCrtcToPixelClock)(that, crtc, atomPll, clockParams);
 }
 
 // While Apple's display stack starts, print what attached below the iGPU (classes and names, 3 levels) to the verbose
@@ -402,10 +506,28 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				snap.wbAddress, snap.ringCpu, snap.ringGpu);
 		}
 
+		// Register-log lines queued from interrupts-off context.
+		{
+			static uint32_t regPrinted;
+			uint32_t regHead = __atomic_load_n(&regRingHead, __ATOMIC_RELAXED);
+			if (regHead - regPrinted > RegRingSize) {
+				IOLog("CarrizoRed: (%u queued register lines dropped)\n",
+					regHead - regPrinted - static_cast<uint32_t>(RegRingSize));
+				regPrinted = regHead - static_cast<uint32_t>(RegRingSize);
+			}
+			for (; regPrinted != regHead; regPrinted++)
+				printRegEvent(regRing[regPrinted % RegRingSize], " (ints off, queued)");
+		}
+
+		// Display/MC register changes since the last tick.
+		if (gpuMmio)
+			self->checkDisplayRegs(t);
+
 		// Heartbeat once the register log is armed: shows whether register traffic continues up to a freeze.
 		if (regLogFromMs && tick % 4 == 0)
-			IOLog("CarrizoRed: hb t=%us regs %u ih %u\n", t, __atomic_load_n(&regAccesses, __ATOMIC_RELAXED),
-				__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED));
+			IOLog("CarrizoRed: hb t=%us regs %u ih %u missing-pipe %u\n", t,
+				__atomic_load_n(&regAccesses, __ATOMIC_RELAXED), __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED),
+				__atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED));
 
 		// Watchdog: a traced call that never returns (a hard hang with this CPU still alive) becomes a panic that
 		// names it and stays on screen (debug=0x100). -crnowatchdog disables this.
@@ -515,17 +637,31 @@ bool CRDriver::wrapTestVram(void *that, uint32_t region, bool flag) {
 //  CFG_NO_PP: no PowerPlay. Apple's PowerPlay drives the Polaris SMU7 power controller; Stoney has an SMU8, which
 //  also controls the CPU and memory clocks. Spoof boots 5-7 froze the whole machine instantly as the GUI (and AGPM's
 //  power management) started, outside every traced display function.
+//  CFG_USE_STUTTER, CFG_USE_FEDS, CFG_USE_FBWRKLP: off. Apple tunes display stutter (memory self-refresh), FEDS and
+//  the framebuffer work loop for a Polaris with its own GDDR5; on the APU the display shares DDR4 and the NB P-state
+//  logic with the CPU, and Apple's watermark inputs come from a dGPU VRAM table the APU VBIOS doesn't have. Spoof
+//  boots 10-12 froze ~20 s after start-up with no CPU register access, as a hardware-triggered hang would.
+//  -crstutter, -crfeds, -crfbwrklp each restore Apple's value, to bisect.
 //  CFG_NO_MSI (opt-in with -crnomsi): legacy interrupts instead of MSI for the display controller.
+//  CFG_NO_AUDIO (opt-in with -crnoaudio): no HDMI/DP audio setup.
+//  CFG_USE_TCON (opt-in with -crnotcon): forced off.
 static const struct {
 	const char *name;
+	uint8_t value;
 	const char *arg;
 	bool optIn;  // apply only with arg (else: apply unless arg)
 } configOverrides[] {
-	{"CFG_NON_ZERO_MC_LOC", "-crnomcloc", false},
-	{"CFG_NO_PP", "-crpp", false},
-	{"CFG_NO_MSI", "-crnomsi", true},
+	{"CFG_NON_ZERO_MC_LOC", 1, "-crnomcloc", false},
+	{"CFG_NO_PP", 1, "-crpp", false},
+	{"CFG_USE_STUTTER", 0, "-crstutter", false},
+	{"CFG_USE_FEDS", 0, "-crfeds", false},
+	{"CFG_USE_FBWRKLP", 0, "-crfbwrklp", false},
+	{"CFG_NO_MSI", 1, "-crnomsi", true},
+	{"CFG_NO_AUDIO", 1, "-crnoaudio", true},
+	{"CFG_USE_TCON", 0, "-crnotcon", true},
 };
 
+// Returns non-zero when the option was found; an overridden option counts as found.
 uint64_t CRDriver::wrapGetConfigProperty(void *that, const char *name, void *value, uint32_t size) {
 	auto ret = FunctionCast(wrapGetConfigProperty, callback->orgGetConfigProperty)(that, name, value, size);
 	if (!name || !value || !size)
@@ -533,8 +669,10 @@ uint64_t CRDriver::wrapGetConfigProperty(void *that, const char *name, void *val
 	for (auto &option : configOverrides) {
 		if (!strcmp(name, option.name) && checkKernelArgument(option.arg) == option.optIn) {
 			memset(value, 0, size);
-			*static_cast<uint8_t *>(value) = 1;
-			traceEvent(option.name, true, 1);
+			*static_cast<uint8_t *>(value) = option.value;
+			traceEvent(option.name, true, option.value);
+			if (!ret)
+				ret = 1;
 		}
 	}
 	return ret;
@@ -797,58 +935,88 @@ void CRDriver::patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_add
 	patcher.clearError();
 }
 
-static void regAccess(RegOp op, uint32_t offset, uint32_t extra, uint32_t value) {
+static void printRegEvent(const RegEvent &event, const char *suffix) {
+	bool write = event.op == RegWrite || event.op == RegPcieWrite || event.op == RegIndWrite;
+	char value[16] = "";
+	if (write)
+		snprintf(value, sizeof(value), " = 0x%x", event.value);
+	char pipe[48] = "";
+	if (event.pipe >= 0)
+		snprintf(pipe, sizeof(pipe), " [PIPE %d, APU has %u%s]", event.pipe, pipeLimit, pipeGuard ? ", blocked" : "");
+	IOLog("CarrizoRed: new reg %s 0x%x/0x%x%s%s%s\n", regOpNames[event.op], event.offset, event.extra, value, pipe,
+		suffix);
+}
+
+// Called before every access. Returns true when -crpipeguard blocks it.
+static bool regAccess(RegOp op, uint32_t offset, uint32_t extra, uint32_t value) {
 	__atomic_fetch_add(&regAccesses, 1, __ATOMIC_RELAXED);
-	uint32_t key = (op == RegRead || op == RegWrite ? offset >> 2 : offset ^ (extra << 4)) & 0xFFFF;
+	bool direct = op == RegRead || op == RegWrite;
+	int pipe = direct ? pipeOfRegister(offset >> 2) : -1;
+	bool outside = pipe >= static_cast<int>(pipeLimit);
+	if (outside)
+		__atomic_fetch_add(&pipeAccesses, 1, __ATOMIC_RELAXED);
+	bool block = outside && pipeGuard;
+	uint32_t key = (direct ? offset >> 2 : offset ^ (extra << 4)) & 0xFFFF;
 	uint8_t bit = static_cast<uint8_t>(1u << (key & 7));
 	uint8_t old = __atomic_fetch_or(&regSeen[op][key >> 3], bit, __ATOMIC_RELAXED);
 	if (old & bit)
-		return;
-	uint64_t from = regLogFromMs;
-	if (!from || uptimeMs() < from || regLogged > 400)
-		return;
-	regLogged++;
-	// Printed even with interrupts disabled (spoof boot 12 showed nothing with them enabled).
-	bool ints = ml_get_interrupts_enabled();
-	IOLog("CarrizoRed: new reg %s 0x%x/0x%x = 0x%x%s\n", regOpNames[op], offset, extra, value, ints ? "" : " (ints off)");
-	IODelay(3000);
+		return block;
+	if (outside) {
+		if (__atomic_fetch_add(&pipeLogged, 1, __ATOMIC_RELAXED) >= 100)
+			return block;
+	} else {
+		uint64_t from = regLogFromMs;
+		if (!from || uptimeMs() < from || regLogged > 400)
+			return block;
+		regLogged++;
+	}
+	RegEvent event {op, offset, extra, value, outside ? pipe : -1};
+	if (ml_get_interrupts_enabled() || regLogIntsOff) {
+		printRegEvent(event, ml_get_interrupts_enabled() ? "" : " (ints off)");
+		IODelay(3000);
+	} else {
+		regRing[__atomic_fetch_add(&regRingHead, 1, __ATOMIC_RELAXED) % RegRingSize] = event;
+	}
+	return block;
 }
 
 uint32_t CRDriver::wrapHwRead32(void *that, uint32_t offset) {
-	auto value = FunctionCast(wrapHwRead32, callback->orgHwRead32)(that, offset);
-	regAccess(RegRead, offset, 0, value);
-	return value;
+	if (regAccess(RegRead, offset, 0, 0))
+		return 0;
+	return FunctionCast(wrapHwRead32, callback->orgHwRead32)(that, offset);
 }
 
 uint32_t CRDriver::wrapRead16(void *that, uint32_t offset) {
-	regAccess(RegRead, offset & ~3u, 16, 0);
+	if (regAccess(RegRead, offset & ~3u, 16, 0))
+		return 0;
 	return FunctionCast(wrapRead16, callback->orgRead16)(that, offset);
 }
 
 uint32_t CRDriver::wrapRead8(void *that, uint32_t offset) {
-	regAccess(RegRead, offset & ~3u, 8, 0);
+	if (regAccess(RegRead, offset & ~3u, 8, 0))
+		return 0;
 	return FunctionCast(wrapRead8, callback->orgRead8)(that, offset);
 }
 
 void CRDriver::wrapWrite16(void *that, uint32_t offset, uint32_t value) {
-	regAccess(RegWrite, offset & ~3u, 16, value);
-	FunctionCast(wrapWrite16, callback->orgWrite16)(that, offset, value);
+	if (!regAccess(RegWrite, offset & ~3u, 16, value))
+		FunctionCast(wrapWrite16, callback->orgWrite16)(that, offset, value);
 }
 
 void CRDriver::wrapWrite8(void *that, uint32_t offset, uint32_t value) {
-	regAccess(RegWrite, offset & ~3u, 8, value);
-	FunctionCast(wrapWrite8, callback->orgWrite8)(that, offset, value);
+	if (!regAccess(RegWrite, offset & ~3u, 8, value))
+		FunctionCast(wrapWrite8, callback->orgWrite8)(that, offset, value);
 }
 
 uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {
-	auto value = FunctionCast(wrapRegRead32, callback->orgRegRead32)(that, offset);
-	regAccess(RegRead, offset, 0, value);
-	return value;
+	if (regAccess(RegRead, offset, 0, 0))
+		return 0;
+	return FunctionCast(wrapRegRead32, callback->orgRegRead32)(that, offset);
 }
 
 void CRDriver::wrapRegWrite32(void *that, uint32_t offset, uint32_t value) {
-	regAccess(RegWrite, offset, 0, value);
-	FunctionCast(wrapRegWrite32, callback->orgRegWrite32)(that, offset, value);
+	if (!regAccess(RegWrite, offset, 0, value))
+		FunctionCast(wrapRegWrite32, callback->orgRegWrite32)(that, offset, value);
 }
 
 uint32_t CRDriver::wrapPcieRead32(void *that, uint32_t offset) {
@@ -890,8 +1058,8 @@ void CRDriver::wrapIhHandler(void *that, void *owner, void *arg, void *nub, int 
 		ihWindowStart = ms;
 		ihWindowCalls = 0;
 	}
-	if (++ihWindowCalls > 500 && ihMmio && callback->stormBreak) {
-		auto *mmio = ihMmio;
+	if (++ihWindowCalls > 500 && gpuMmio && callback->stormBreak) {
+		auto *mmio = gpuMmio;
 		ihSnapshot.ms = ms;
 		ihSnapshot.calls = calls;
 		ihSnapshot.rbCntl = mmio[IhReg::RB_CNTL];
@@ -936,6 +1104,8 @@ uint32_t CRDriver::wrapGetDisplayLimit(void *) { return displayPipes(callback->f
 
 uint8_t CRDriver::wrapGetNumLineBuffers(void *) { return displayPipes(callback->family); }
 
+uint32_t CRDriver::wrapGetDigLimit(void *) { return DisplayDigs; }
+
 void CRDriver::logPCIInfo() {
 	revision = static_cast<uint8_t>(WIOKit::readPCIConfigValue(iGPU, WIOKit::kIOPCIConfigRevisionID));
 	auto subVendor = WIOKit::readPCIConfigValue(iGPU, WIOKit::kIOPCIConfigSubSystemVendorID, 0, 16);
@@ -966,8 +1136,9 @@ void CRDriver::probeMMIO() {
 	}
 
 	auto *mmio = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
-	// Keep the mapping: the IH storm breaker writes registers directly (see wrapIhHandler).
-	ihMmio = mmio;
+	// Keep the mapping: the IH storm breaker writes registers directly (see wrapIhHandler), and the watcher reads the
+	// display registers (checkDisplayRegs).
+	gpuMmio = mmio;
 	auto memSize = mmio[Reg::CONFIG_MEMSIZE];
 	auto fbLocation = mmio[Reg::MC_VM_FB_LOCATION];
 	auto fbOffset = mmio[Reg::MC_VM_FB_OFFSET];
@@ -992,6 +1163,135 @@ void CRDriver::probeMMIO() {
 	iGPU->setProperty("CarrizoRed,vram-mb", memSize, 32);
 	iGPU->setProperty("CarrizoRed,carveout-phys", carveoutPhys, 64);
 	iGPU->setProperty("CarrizoRed,gb-addr-config", gbAddrConfig, 32);
+
+	initDisplayRegs();
+}
+
+// Display and memory-controller registers watched from boot (firmware/GOP values) through Apple's bring-up: FB
+// location, HDP aperture, DMIF, and per pipe the scanout surface, watermarks, stutter and NB P-state control. The
+// watcher prints every change (first 8 per register), so the values Apple leaves behind before a freeze are on screen
+// and can be compared with the GOP's and Linux's. Per-pipe registers are only read while that pipe is powered
+// (PIPEn_PG_STATUS), and only for the APU's real pipes.
+namespace {
+	struct WatchedRegDef {
+		const char *name;
+		uint32_t offset;
+	};
+
+	const WatchedRegDef globalRegDefs[] {
+		{"MC_VM_FB_LOCATION", Reg::MC_VM_FB_LOCATION},
+		{"MC_VM_FB_OFFSET", Reg::MC_VM_FB_OFFSET},
+		{"MC_VM_SYSTEM_APERTURE_LOW", Reg::MC_VM_SYSTEM_APERTURE_LOW_ADDR},
+		{"MC_VM_SYSTEM_APERTURE_HIGH", Reg::MC_VM_SYSTEM_APERTURE_HIGH_ADDR},
+		{"HDP_NONSURFACE_BASE", Reg::HDP_NONSURFACE_BASE},
+		{"HDP_NONSURFACE_INFO", Reg::HDP_NONSURFACE_INFO},
+		{"HDP_NONSURFACE_SIZE", Reg::HDP_NONSURFACE_SIZE},
+		{"DMIF_ADDR_CONFIG", Reg::DMIF_ADDR_CONFIG},
+		{"DMIF_CONTROL", Reg::DMIF_CONTROL},
+		{"DMIF_STATUS", Reg::DMIF_STATUS},
+		{"DMIF_ARBITRATION_CONTROL", Reg::DMIF_ARBITRATION_CONTROL},
+		{"DMIF_ADDR_CALC", Reg::DMIF_ADDR_CALC},
+		{"MCIF_CONTROL", Reg::MCIF_CONTROL},
+		{"DCI_MEM_PWR_STATUS", Reg::DCI_MEM_PWR_STATUS},
+		{"DCI_CLK_CNTL", Reg::DCI_CLK_CNTL},
+		{"PIXCLK0_RESYNC_CNTL", Reg::PIXCLK0_RESYNC_CNTL},
+		{"PIXCLK1_RESYNC_CNTL", Reg::PIXCLK1_RESYNC_CNTL},
+		{"PHYPLL_PIXCLK_CNTL", Reg::PHYPLL_PIXCLK_CNTL},
+		{"CRTC0_PIXEL_RATE_CNTL", Reg::CRTC0_PIXEL_RATE_CNTL},
+		{"CRTC1_PIXEL_RATE_CNTL", Reg::CRTC0_PIXEL_RATE_CNTL + 4},
+	};
+
+	const WatchedRegDef pipeRegDefs[] {
+		{"GRPH_ENABLE", Reg::GRPH_ENABLE},
+		{"GRPH_CONTROL", Reg::GRPH_CONTROL},
+		{"GRPH_PRIMARY_SURFACE_ADDRESS", Reg::GRPH_PRIMARY_SURFACE_ADDRESS},
+		{"GRPH_PRIMARY_SURFACE_ADDRESS_HIGH", Reg::GRPH_PRIMARY_SURFACE_ADDRESS_HIGH},
+		{"DPG_PIPE_ARBITRATION_CONTROL1", Reg::DPG_PIPE_ARBITRATION_CONTROL1},
+		{"DPG_PIPE_ARBITRATION_CONTROL2", Reg::DPG_PIPE_ARBITRATION_CONTROL2},
+		{"DPG_WATERMARK_MASK_CONTROL", Reg::DPG_WATERMARK_MASK_CONTROL},
+		{"DPG_PIPE_URGENCY_CONTROL", Reg::DPG_PIPE_URGENCY_CONTROL},
+		{"DPG_PIPE_DPM_CONTROL", Reg::DPG_PIPE_DPM_CONTROL},
+		{"DPG_PIPE_STUTTER_CONTROL", Reg::DPG_PIPE_STUTTER_CONTROL},
+		{"DPG_PIPE_NB_PSTATE_CHANGE_CONTROL", Reg::DPG_PIPE_NB_PSTATE_CHANGE_CONTROL},
+		{"DPG_PIPE_STUTTER_CONTROL_NONLPTCH", Reg::DPG_PIPE_STUTTER_CONTROL_NONLPTCH},
+		{"CRTC_CONTROL", Reg::CRTC_CONTROL},
+	};
+
+	constexpr size_t MaxWatchedPipes = 3;
+	constexpr size_t MaxWatchedRegs = sizeof(globalRegDefs) / sizeof(globalRegDefs[0]) +
+	                                  MaxWatchedPipes * (sizeof(pipeRegDefs) / sizeof(pipeRegDefs[0]));
+	constexpr uint32_t MaxPrintedChanges = 8;
+
+	struct WatchedReg {
+		const char *name;
+		int pipe;  // -1 = display-wide
+		uint32_t offset, value, changes;
+		bool valid;  // value read (pipe powered)
+	};
+	WatchedReg watchedRegs[MaxWatchedRegs];
+	size_t watchedRegCount;
+
+	bool pipePowered(uint32_t pipe) { return (gpuMmio[Reg::PIPE0_PG_STATUS + 3 * pipe] >> 30) == 0; }
+}
+
+void CRDriver::initDisplayRegs() {
+	for (auto &def : globalRegDefs)
+		watchedRegs[watchedRegCount++] = {def.name, -1, def.offset, 0, 0, false};
+	uint32_t pipes = displayPipes(family);
+	for (uint32_t pipe = 0; pipe < pipes && pipe < MaxWatchedPipes; pipe++)
+		for (auto &def : pipeRegDefs)
+			watchedRegs[watchedRegCount++] = {def.name, static_cast<int>(pipe), def.offset + pipeRegisterBase(pipe), 0, 0,
+				false};
+
+	for (size_t i = 0; i < watchedRegCount; i++) {
+		auto &reg = watchedRegs[i];
+		if (reg.pipe >= 0 && !pipePowered(reg.pipe))
+			continue;
+		reg.value = gpuMmio[reg.offset];
+		reg.valid = true;
+	}
+	for (uint32_t pipe = 0; pipe < pipes && pipe < MaxWatchedPipes; pipe++)
+		SYSLOG("cr", "boot: PIPE%u_PG_STATUS 0x%08X", pipe, gpuMmio[Reg::PIPE0_PG_STATUS + 3 * pipe]);
+	for (size_t i = 0; i < watchedRegCount; i++) {
+		auto &reg = watchedRegs[i];
+		if (!reg.valid)
+			SYSLOG("cr", "boot: p%d %s 0x%X: pipe powered off", reg.pipe, reg.name, reg.offset);
+		else if (reg.pipe < 0)
+			SYSLOG("cr", "boot: %s 0x%X = 0x%08X", reg.name, reg.offset, reg.value);
+		else
+			SYSLOG("cr", "boot: p%d %s 0x%X = 0x%08X", reg.pipe, reg.name, reg.offset, reg.value);
+	}
+}
+
+void CRDriver::checkDisplayRegs(uint32_t t) {
+	bool powered[MaxWatchedPipes];
+	for (uint32_t pipe = 0; pipe < MaxWatchedPipes && pipe < displayPipes(family); pipe++)
+		powered[pipe] = pipePowered(pipe);
+	for (size_t i = 0; i < watchedRegCount; i++) {
+		auto &reg = watchedRegs[i];
+		if (reg.pipe >= 0 && !powered[reg.pipe]) {
+			if (reg.valid && reg.changes++ < MaxPrintedChanges)
+				IOLog("CarrizoRed: t=%us p%d %s: pipe powered off\n", t, reg.pipe, reg.name);
+			reg.valid = false;
+			continue;
+		}
+		uint32_t value = gpuMmio[reg.offset];
+		if (reg.valid && value == reg.value)
+			continue;
+		uint32_t changes = reg.changes++;
+		if (changes < MaxPrintedChanges) {
+			char was[24] = " (was off)";
+			if (reg.valid)
+				snprintf(was, sizeof(was), " (was 0x%08X)", reg.value);
+			char pipe[8] = "";
+			if (reg.pipe >= 0)
+				snprintf(pipe, sizeof(pipe), "p%d ", reg.pipe);
+			IOLog("CarrizoRed: t=%us %s%s 0x%X = 0x%08X%s%s\n", t, pipe, reg.name, reg.offset, value, was,
+				changes + 1 == MaxPrintedChanges ? ", further changes not shown" : "");
+		}
+		reg.value = value;
+		reg.valid = true;
+	}
 }
 
 void CRDriver::disableKextCallbacks() {

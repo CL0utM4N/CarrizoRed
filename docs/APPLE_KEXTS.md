@@ -276,7 +276,18 @@ A whole-binary scalar search of `AMD9500Controller` for `0x13e` and `0x4f8` find
 resync registers may still come from a data table (Polaris's six are at irregular offsets). Watch for it on the first
 boot (pixel-clock changes, `hwSetCrtcToPixelClock`).
 
-### PLL indexes (planned patch, waiting for hardware data)
+### PLL indexes (patched: limit + remap)
+**Implemented.** `getNumPixelClocks()` turned out not to size the assigner:
+`BaffinSharedController::initializeProjectDependentResources` calls
+`AtiPllAssignerFactory::createPllAssigner(ctrl, connectors, n, 7)` with a constant 7, and the dynamic assigner hands
+out the lowest free index (`0xFE` = none). The index reaches the hardware twice: as `ucPpll` through
+`hwProgramPpllUsingBios` → `AtomBiosProxy::setPixelClock` (`ActiveConnectorInfo +0x2E`, CRTC at `+0x2D`), and in
+`AMD9500Controller::hwSetCrtcToPixelClock(crtc, pll, params)`, which writes it into
+`CRTCn_PIXEL_RATE_CNTL[1:0]` (byte `0x500 + 0x10·crtc`) and sets bit 0 of a per-PLL Polaris resync register
+(bytes `0x400/0x404/0x408/0x40C/0x430/0x4F8` = dword `0x100–0x103`, `0x10C`, `0x13E`). CarrizoRed passes 2 to
+`createPllAssigner` (so `0x13E` is unreachable) and remaps Apple 1 → ATOM 2 in both places (`-crnoplllimit`,
+`-crnopllremap`). `getDigLimit()` (6, used by `doConnectionsProbe`) is routed to 3. Earlier notes:
+
 `BaffinSharedController::getNumPixelClocks()` (`0x2f490`) returns **7** (Baffin PHY PLLs 0–5, plus index 6, which
 `hwProgramPixelClock` turns into `0xFE` = no PLL). The V6 handler sends the PLL index **unchanged** as `ucPpll`.
 Linux DC's DCE 11.0 mapping (`dc/bios/dce110/command_table_helper_dce110.c`):

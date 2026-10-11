@@ -52,6 +52,12 @@ uploads them (plus a debug `Lilu.kext`) as a workflow artifact.
 | `-crbeta` | Allow loading on macOS versions newer than Tahoe |
 | `-crnommio` | Skip the MMIO register probe |
 | `-crnovbios` | Don't inject the VBIOS from the ACPI VFCT table as `ATY,bin_image` |
+| `-crstutter`, `-crfeds`, `-crfbwrklp` | Keep Apple's `CFG_USE_STUTTER` / `CFG_USE_FEDS` / `CFG_USE_FBWRKLP` (forced off by default) |
+| `-crnoaudio`, `-crnotcon` | Force `CFG_NO_AUDIO` on / `CFG_USE_TCON` off |
+| `-crnodiglimit` | Don't limit `AMD9500Controller` to 3 DIGs |
+| `-crnoplllimit`, `-crnopllremap` | Don't limit the PLL assigner to 2 PLLs / don't remap Apple PLL 1 to `ATOM_PPLL0` |
+| `-crpipeguard` | Drop writes to, and read 0 from, display-pipe register blocks the APU doesn't have |
+| `-crreglogintsoff` | Print register-log lines from interrupts-off context directly instead of queueing them |
 
 ## Layout
 

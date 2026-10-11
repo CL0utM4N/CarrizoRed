@@ -25,6 +25,13 @@ private:
 
 	static uint32_t wrapGetDisplayLimit(void *that);
 	static uint8_t wrapGetNumLineBuffers(void *that);
+	static uint32_t wrapGetDigLimit(void *that);
+
+	void patchPlls(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
+	static void *wrapCreatePllAssigner(void *controller, void *connectors, uint8_t numConnectors, uint8_t numPlls);
+	static uint64_t wrapSetPixelClock(void *that, void *clockParams, const void *connectorInfo);
+	static void wrapSetCrtcToPixelClock(void *that, uint8_t crtc, uint8_t pll, void *clockParams);
+	mach_vm_address_t orgCreatePllAssigner {0}, orgSetPixelClock {0}, orgSetCrtcToPixelClock {0};
 
 	void blockProbe(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, const char *probe,
 		const char *arg);
@@ -73,6 +80,8 @@ private:
 	void findByConfigSpace();
 	void logPCIInfo();
 	void probeMMIO();
+	void initDisplayRegs();
+	void checkDisplayRegs(uint32_t t);
 	void disableKextCallbacks();
 
 	IOPCIDevice *iGPU {nullptr};
