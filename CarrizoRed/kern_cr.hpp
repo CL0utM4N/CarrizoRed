@@ -98,6 +98,8 @@ private:
 	static IOReturn wrapWranglerAttribute(void *that, uint32_t attribute, uint64_t *value, uint64_t size,
 		uint64_t *arg4, uint64_t *arg5, void *arguments);
 	mach_vm_address_t orgDeviceControlAttribute {0}, orgWranglerAttribute {0};
+	static IOReturn wrapInstallInterrupts(void *that);
+	mach_vm_address_t orgInstallInterrupts {0};
 	static void wrapWritePCIReg8(void *that, uint32_t offset, uint8_t value);
 	static void wrapWritePCIReg16(void *that, uint32_t offset, uint16_t value);
 	static void wrapWritePCIReg32(void *that, uint32_t offset, uint32_t value);

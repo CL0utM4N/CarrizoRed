@@ -645,7 +645,14 @@ void CRDriver::patchSupport(KernelPatcher &patcher, size_t index, mach_vm_addres
 	}
 }
 
+// -crnovramwrite: don't run the test at all (it writes patterns into the start of the carve-out through BAR0), to rule
+// its writes out as the cause of the freeze ~20 s after start-up.
 bool CRDriver::wrapTestVram(void *that, uint32_t region, bool flag) {
+	if (checkKernelArgument("-crnovramwrite")) {
+		IOLog("CarrizoRed: TestVRAM(region %u) skipped (-crnovramwrite), reporting success\n", region);
+		traceNote("TestVRAM(%u)=skipped ", region);
+		return true;
+	}
 	bool ret = FunctionCast(wrapTestVram, callback->orgTestVram)(that, region, flag);
 	IOLog("CarrizoRed: TestVRAM(region %u) -> %s, reporting success\n", region, ret ? "passed" : "FAILED");
 	traceNote("TestVRAM(%u)=%s->ok ", region, ret ? "pass" : "FAIL");
@@ -1324,8 +1331,11 @@ static void configWriteNote(IOPCIDevice *device, uint64_t offset, uint32_t value
 	uint32_t n = __atomic_fetch_add(&pciConfigWrites, 1, __ATOMIC_RELAXED);
 	if (n >= 200)
 		return;
+	// The old value (read before the write goes out) shows what actually changes, e.g. whether bus mastering is new.
+	uint32_t old = offset < 0x100 ? device->configRead32(static_cast<uint8_t>(offset & ~3ull)) : 0xFFFFFFFF;
 	pmLog(false, "pci.configWrite off<<16|fn", static_cast<uint32_t>(offset << 16) | device->getFunctionNumber(),
-		"PCI fn%u config write%u 0x%llx = 0x%x", device->getFunctionNumber(), bits, offset, value);
+		"PCI fn%u config write%u 0x%llx = 0x%x (dword was 0x%08x)", device->getFunctionNumber(), bits, offset, value,
+		old);
 }
 
 void CRDriver::wrapConfigWrite8(IOPCIDevice *that, uint8_t offset, uint8_t value) {
@@ -1366,6 +1376,14 @@ void CRDriver::wrapExtConfigWrite32(IOPCIDevice *that, uint64_t offset, uint32_t
 
 // AGDP/AGDC → AMDSupport requests (thread context: user clients and the policy's work loop).
 void CRDriver::patchPolicy(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	{
+		KernelPatcher::RouteRequest request {"__ZN21AtiFbInterruptManager28installInterruptsOnPciDeviceEv",
+			wrapInstallInterrupts, orgInstallInterrupts};
+		if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+			SYSLOG("cr", "failed to route installInterruptsOnPciDevice (error %d)", patcher.getError());
+			patcher.clearError();
+		}
+	}
 	if (checkKernelArgument("-crnotrace"))
 		return;
 	KernelPatcher::RouteRequest requests[] {
@@ -1380,6 +1398,60 @@ void CRDriver::patchPolicy(KernelPatcher &patcher, size_t index, mach_vm_address
 			patcher.clearError();
 		}
 	}
+}
+
+// AtiFbInterruptManager::installInterruptsOnPciDevice() (AMDSupport) is the controller's whole OS-side interrupt
+// set-up: pick the MSI index (getInterruptType = kIOInterruptTypePCIMessaged) unless CFG_NO_MSI, registerInterrupt(index,
+// manager, BaffinInterruptManager::handler) and enableInterrupt(index). Spoof boot 9 with legacy interrupts froze as
+// soon as the controller loaded, MSI boots ~20 s later, although the GPU never delivered an interrupt to the handler.
+// -crnoints skips it (no interrupt registered or enabled); otherwise the PCI command register and MSI capability are
+// printed afterwards (enable, address, data: where the GPU would write its interrupt messages).
+static void printMsiState(IOPCIDevice *device, const char *when) {
+	uint16_t command = device->configRead16(0x04);
+	uint8_t cap = device->configRead8(0x34) & 0xFC;
+	for (int guard = 0; cap && guard < 48; guard++) {
+		uint8_t id = device->configRead8(cap);
+		if (id == 0x05) {  // MSI
+			uint16_t control = device->configRead16(cap + 2);
+			uint32_t addressLo = device->configRead32(cap + 4), addressHi = 0;
+			uint16_t data;
+			if (control & 0x80) {  // 64-bit address
+				addressHi = device->configRead32(cap + 8);
+				data = device->configRead16(cap + 12);
+			} else {
+				data = device->configRead16(cap + 8);
+			}
+			IOLog("CarrizoRed: %s: PCI command 0x%04x, MSI cap 0x%x control 0x%04x (%s) address 0x%08x%08x data 0x%04x\n",
+				when, command, cap, control, (control & 1) ? "ENABLED" : "off", addressHi, addressLo, data);
+			return;
+		}
+		cap = device->configRead8(cap + 1) & 0xFC;
+	}
+	IOLog("CarrizoRed: %s: PCI command 0x%04x, no MSI capability\n", when, command);
+}
+
+IOReturn CRDriver::wrapInstallInterrupts(void *that) {
+	auto *gpu = callback->iGPU;
+	if (checkKernelArgument("-crnoints")) {
+		IOLog("CarrizoRed: installInterruptsOnPciDevice skipped (-crnoints): no interrupt registered or enabled\n");
+		traceNote("ints=skipped ");
+		if (gpu)
+			printMsiState(gpu, "-crnoints");
+		IOSleep(30);
+		return kIOReturnSuccess;
+	}
+	if (gpu)
+		printMsiState(gpu, "before interrupt install");
+	auto ret = FunctionCast(wrapInstallInterrupts, callback->orgInstallInterrupts)(that);
+	// AtiFbInterruptManager: +0x31 installed, +0x34 interrupt index (see installInterruptsOnPciDevice).
+	auto *manager = static_cast<uint8_t *>(that);
+	IOLog("CarrizoRed: installInterruptsOnPciDevice = 0x%x, index %u%s\n", ret, *reinterpret_cast<uint32_t *>(manager + 0x34),
+		manager[0x31] ? "" : " (not installed)");
+	traceNote("ints=%x/%u ", ret, *reinterpret_cast<uint32_t *>(manager + 0x34));
+	if (gpu)
+		printMsiState(gpu, "after interrupt install");
+	IOSleep(30);
+	return ret;
 }
 
 static uint64_t peekValue(const uint64_t *value) { return value ? *value : 0; }

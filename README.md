@@ -62,6 +62,8 @@ uploads them (plus a debug `Lilu.kext`) as a workflow artifact.
 | `-crnopcitrace` | Don't trace the iGPU's PCI power states and config-space writes |
 | `-crreglogall` | Print every register access (with read values) from the controller's probe, not only first touches after start + 2 s |
 | `-crnoctl` | Keep `AMD9500Controller` from matching (spoof, wrangler, AMDSupport and AGDP still load) |
+| `-crnovramwrite` | Skip `ATIController::TestVRAM` entirely (no test patterns written into the carve-out) |
+| `-crnoints` | Skip `AtiFbInterruptManager::installInterruptsOnPciDevice` (no interrupt registered or enabled) |
 | `-crmacgpu` | Neutralise AGDP's board-id config lookup; set `built-in`, `AAPL,slot-name` and `model` on the iGPU |
 
 ## Layout
