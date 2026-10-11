@@ -75,6 +75,8 @@ static constexpr size_t RegRingSize = 64;
 static RegEvent regRing[RegRingSize];
 static uint32_t regRingHead;
 static void printRegEvent(const RegEvent &event, const char *suffix);
+// Power-management / config-space events on the iGPU (see patchPci).
+static uint32_t pmEvents, pciConfigWrites;
 
 // IH storm breaker. IH registers are dword offsets in BAR5, the same on Tonga (oss_3_0) and CZ (oss_3_0_1).
 namespace IhReg {
@@ -120,6 +122,7 @@ static const char *pathFramebuffer[] {"/System/Library/Extensions/AMDFramebuffer
 static const char *pathAgpm[] {
 	"/System/Library/Extensions/AppleGraphicsPowerManagement.kext/Contents/MacOS/AppleGraphicsPowerManagement"};
 static const char *pathAgdp[] {"/System/Library/Extensions/AppleGraphicsControl.kext/Contents/PlugIns/AppleGraphicsDevicePolicy.kext/Contents/MacOS/AppleGraphicsDevicePolicy"};
+static const char *pathPci[] {"/System/Library/Extensions/IOPCIFamily.kext/Contents/MacOS/IOPCIFamily"};
 
 enum KextIndex : size_t {
 	KextRadeonX4000,
@@ -129,6 +132,7 @@ enum KextIndex : size_t {
 	KextFramebuffer,
 	KextAgpm,
 	KextAgdp,
+	KextPci,
 	KextCount,
 };
 
@@ -146,6 +150,8 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 	[KextAgpm] = {"com.apple.driver.AGPM", pathAgpm, arrsize(pathAgpm), {}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextAgdp] = {"com.apple.driver.AppleGraphicsDevicePolicy", pathAgdp, arrsize(pathAgdp), {}, {},
 		KernelPatcher::KextInfo::Unloaded},
+	// Already loaded (boot KC) by the time Lilu runs.
+	[KextPci] = {"com.apple.iokit.IOPCIFamily", pathPci, arrsize(pathPci), {true}, {}, KernelPatcher::KextInfo::Unloaded},
 };
 
 CRDriver *CRDriver::callback = nullptr;
@@ -209,6 +215,8 @@ void CRDriver::processPatcher(KernelPatcher &) {
 		return;
 	}
 
+	gpuBus = iGPU->getBusNumber();
+	gpuDevice = iGPU->getDeviceNumber();
 	pipeLimit = displayPipes(family);
 	pipeGuard = checkKernelArgument("-crpipeguard");
 	regLogIntsOff = checkKernelArgument("-crreglogintsoff");
@@ -262,9 +270,12 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 			patchInterrupts(patcher, index, slide, size);
 			startWatcher();
 		}
+		else if (i == KextPci)
+			patchPci(patcher, index, slide, size);
 		else if (i == KextSupport) {
 			patchSupport(patcher, index, slide, size);
 			patchPlls(patcher, index, slide, size);
+			patchPolicy(patcher, index, slide, size);
 			traceSupport(patcher, index, slide, size);
 		}
 		else if (i == KextFramebuffer)
@@ -525,9 +536,10 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 
 		// Heartbeat once the register log is armed: shows whether register traffic continues up to a freeze.
 		if (regLogFromMs && tick % 4 == 0)
-			IOLog("CarrizoRed: hb t=%us regs %u ih %u missing-pipe %u\n", t,
+			IOLog("CarrizoRed: hb t=%us regs %u ih %u missing-pipe %u pm %u cfgwr %u\n", t,
 				__atomic_load_n(&regAccesses, __ATOMIC_RELAXED), __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED),
-				__atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED));
+				__atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED), __atomic_load_n(&pmEvents, __ATOMIC_RELAXED),
+				__atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));
 
 		// Watchdog: a traced call that never returns (a hard hang with this CPU still alive) becomes a panic that
 		// names it and stays on screen (debug=0x100). -crnowatchdog disables this.
@@ -742,6 +754,10 @@ namespace {
 		{"__ZN21BaffinTimingGenerator9blankCrtcEbj", "tg.blankCrtc", InController, false, false, 0},
 		{"__ZN21BaffinTimingGenerator13programTimingEv", "tg.programTiming", InController, false, false, 0},
 		{"__ZN17AMD9500Controller19hwProgramPixelClockEhj", "hwProgramPixelClock", InController, false, false, 0},
+		// ACPI display state and the Mac display MUX: on this laptop these would run the ASUS firmware's ACPI methods.
+		{"__ZN13ATIController15setDisplayStateEP20IOACPIPlatformDevicej", "setDisplayState(acpi)", InSupport, true, true, 0},
+		{"__ZN13ATIController20initializeMUXControlEv", "initializeMUXControl", InSupport, true, true, 0},
+		{"__ZN13ATIController14setAppleRGBMUXEb", "setAppleRGBMUX", InSupport, true, true, 0},
 	};
 
 	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
@@ -768,14 +784,14 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 43, "one wrapper per stage");
+		static_assert(arrsize(stages) == 46, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
 			CR_WRAP(16), CR_WRAP(17), CR_WRAP(18), CR_WRAP(19), CR_WRAP(20), CR_WRAP(21), CR_WRAP(22), CR_WRAP(23),
 			CR_WRAP(24), CR_WRAP(25), CR_WRAP(26), CR_WRAP(27), CR_WRAP(28), CR_WRAP(29), CR_WRAP(30), CR_WRAP(31),
 			CR_WRAP(32), CR_WRAP(33), CR_WRAP(34), CR_WRAP(35), CR_WRAP(36), CR_WRAP(37), CR_WRAP(38), CR_WRAP(39),
-			CR_WRAP(40), CR_WRAP(41), CR_WRAP(42),
+			CR_WRAP(40), CR_WRAP(41), CR_WRAP(42), CR_WRAP(43), CR_WRAP(44), CR_WRAP(45),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -926,6 +942,19 @@ void CRDriver::patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_add
 		for (auto &request : regRequests) {
 			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
 				SYSLOG("cr", "reglog: failed to route %s (error %d)", request.symbol, patcher.getError());
+				patcher.clearError();
+			}
+		}
+	}
+	if (!checkKernelArgument("-crnopcitrace")) {
+		KernelPatcher::RouteRequest pciRequests[] {
+			{"__ZN21BaffinRegisterService12writePCIReg8Ejh", wrapWritePCIReg8, orgWritePCIReg8},
+			{"__ZN21BaffinRegisterService13writePCIReg16Ejt", wrapWritePCIReg16, orgWritePCIReg16},
+			{"__ZN21BaffinRegisterService13writePCIReg32Ejj", wrapWritePCIReg32, orgWritePCIReg32},
+		};
+		for (auto &request : pciRequests) {
+			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+				SYSLOG("cr", "pci: failed to route %s (error %d)", request.symbol, patcher.getError());
 				patcher.clearError();
 			}
 		}
@@ -1096,6 +1125,229 @@ void CRDriver::wrapIhSetReadPointer(void *that, uint32_t pointer) {
 	ihLastReadPointer = pointer;
 	ihManager = that;
 	FunctionCast(wrapIhSetReadPointer, callback->orgIhSetReadPointer)(that, pointer);
+}
+
+// Power, graphics-policy and PCI config-space tracing. Spoof boot 13 froze ~20 s after AMD9500Controller::start (2-3 s
+// after the GUI session started) with Apple's display code idle: 40 register accesses in total, none after start-up,
+// no interrupts, no mode set, no framebuffer opened. So the freeze comes from something that reaches the GPU without
+// display-register traffic. Candidates traced here, each printed synchronously (with a pause) so the last line before
+// a freeze names it:
+//  - PCI power management of the iGPU (00:01.0) and its HDMI audio function (00:01.1): IOPCIDevice::setPowerState,
+//    IOPCIBridge::setDevicePowerState, IOPCIDevice::setPCIPowerState (which writes PMCSR through
+//    extendedConfigWrite32), and every config-space write to them (IOPCIDevice::configWrite*/extendedConfigWrite*);
+//  - Apple's GPU policy (AGDP/AGDC) asking AMDSupport for something: AtiDeviceControl::vendor_doDeviceAttribute and
+//    AtiGpuWrangler::vendor_doDeviceAttribute (attribute, value, result);
+//  - config writes Apple's controller makes itself (BaffinRegisterService::writePCIReg*);
+//  - ACPI display state / MUX calls (traced stages setDisplayState, initializeMUXControl, setAppleRGBMUX).
+// -crkeepgpuon: refuse to take the iGPU below the PCI "on" state (IOPCIBridge::setDevicePowerState /
+// IOPCIDevice::setPCIPowerState with a state below kIOPCIDeviceOnState report success without doing anything).
+static constexpr unsigned long PciOnState = 2;  // kIOPCIDeviceOnState (0 off, 1 doze, 2 on, 3 paused)
+static bool keepGpuOn;
+
+// Thread context and interrupts enabled: print and pause (sleep allowed only when the caller says so). Otherwise only
+// the trace ring (name + value) is safe.
+static void pmLog(bool canSleep, const char *tag, uint32_t value, const char *fmt, ...) {
+	__atomic_fetch_add(&pmEvents, 1, __ATOMIC_RELAXED);
+	if (!ml_get_interrupts_enabled() || ml_at_interrupt_context()) {
+		traceEvent(tag, true, value);
+		return;
+	}
+	char line[192];
+	va_list va;
+	va_start(va, fmt);
+	vsnprintf(line, sizeof(line), fmt, va);
+	va_end(va);
+	IOLog("CarrizoRed: %s\n", line);
+	if (canSleep)
+		IOSleep(30);
+	else
+		IODelay(2000);
+}
+
+bool CRDriver::isGpuFunction(IOPCIDevice *device) {
+	auto *self = callback;
+	if (!self || !device || !self->iGPU)
+		return false;
+	return device == self->iGPU ||
+	       (device->getBusNumber() == self->gpuBus && device->getDeviceNumber() == self->gpuDevice);
+}
+
+void CRDriver::patchPci(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	keepGpuOn = checkKernelArgument("-crkeepgpuon");
+	if (checkKernelArgument("-crnopcitrace") && !keepGpuOn)
+		return;
+	KernelPatcher::RouteRequest requests[] {
+		{"__ZN11IOPCIDevice13setPowerStateEmP9IOService", wrapPciSetPowerState, orgPciSetPowerState},
+		{"__ZN11IOPCIDevice16setPCIPowerStateEhj", wrapPciSetPCIPowerState, orgPciSetPCIPowerState},
+		{"__ZN11IOPCIBridge19setDevicePowerStateEP11IOPCIDevicejmm", wrapBridgeSetDevicePowerState,
+			orgBridgeSetDevicePowerState},
+		{"__ZN11IOPCIDevice12configWrite8Ehh", wrapConfigWrite8, orgConfigWrite8},
+		{"__ZN11IOPCIDevice13configWrite16Eht", wrapConfigWrite16, orgConfigWrite16},
+		{"__ZN11IOPCIDevice13configWrite32Ehj", wrapConfigWrite32, orgConfigWrite32},
+		{"__ZN11IOPCIDevice20extendedConfigWrite8Eyh", wrapExtConfigWrite8, orgExtConfigWrite8},
+		{"__ZN11IOPCIDevice21extendedConfigWrite16Eyt", wrapExtConfigWrite16, orgExtConfigWrite16},
+		{"__ZN11IOPCIDevice21extendedConfigWrite32Eyj", wrapExtConfigWrite32, orgExtConfigWrite32},
+	};
+	size_t routed = 0;
+	for (auto &request : requests) {
+		if (patcher.routeMultiple(index, &request, 1, slide, size)) {
+			routed++;
+		} else {
+			SYSLOG("cr", "pci: failed to route %s (error %d)", request.symbol, patcher.getError());
+			patcher.clearError();
+		}
+	}
+	SYSLOG("cr", "pci: %lu/%lu IOPCIFamily routes%s", routed, arrsize(requests), keepGpuOn ? ", -crkeepgpuon" : "");
+}
+
+IOReturn CRDriver::wrapPciSetPowerState(IOPCIDevice *that, unsigned long state, IOService *whatDevice) {
+	auto org = FunctionCast(wrapPciSetPowerState, callback->orgPciSetPowerState);
+	if (!isGpuFunction(that))
+		return org(that, state, whatDevice);
+	uint8_t fn = that->getFunctionNumber();
+	pmLog(true, "pci.setPowerState", static_cast<uint32_t>(state), "=> PCI fn%u setPowerState(%lu) from %s", fn,
+		state, whatDevice ? whatDevice->getMetaClass()->getClassName() : "?");
+	auto ret = org(that, state, whatDevice);
+	pmLog(true, "pci.setPowerState ret", ret, "<= PCI fn%u setPowerState(%lu) = 0x%x", fn, state, ret);
+	return ret;
+}
+
+IOReturn CRDriver::wrapPciSetPCIPowerState(IOPCIDevice *that, uint8_t state, uint32_t options) {
+	auto org = FunctionCast(wrapPciSetPCIPowerState, callback->orgPciSetPCIPowerState);
+	if (!isGpuFunction(that))
+		return org(that, state, options);
+	uint8_t fn = that->getFunctionNumber();
+	if (keepGpuOn && fn == 0 && state < PciOnState) {
+		pmLog(false, "pci.setPCIPowerState BLOCKED", state, "PCI fn%u setPCIPowerState(%u, 0x%x) BLOCKED (-crkeepgpuon)",
+			fn, state, options);
+		return kIOReturnSuccess;
+	}
+	pmLog(false, "pci.setPCIPowerState", state, "=> PCI fn%u setPCIPowerState(%u, 0x%x)", fn, state, options);
+	auto ret = org(that, state, options);
+	pmLog(false, "pci.setPCIPowerState ret", ret, "<= PCI fn%u setPCIPowerState(%u) = 0x%x", fn, state, ret);
+	return ret;
+}
+
+IOReturn CRDriver::wrapBridgeSetDevicePowerState(IOService *that, IOPCIDevice *device, uint32_t options,
+	unsigned long prevState, unsigned long newState) {
+	auto org = FunctionCast(wrapBridgeSetDevicePowerState, callback->orgBridgeSetDevicePowerState);
+	if (!isGpuFunction(device))
+		return org(that, device, options, prevState, newState);
+	uint8_t fn = device->getFunctionNumber();
+	if (keepGpuOn && fn == 0 && newState < PciOnState) {
+		pmLog(false, "bridge.setDevicePowerState BLOCKED", static_cast<uint32_t>(newState),
+			"PCI fn%u setDevicePowerState(%lu -> %lu, 0x%x) BLOCKED (-crkeepgpuon)", fn, prevState, newState, options);
+		return kIOReturnSuccess;
+	}
+	pmLog(false, "bridge.setDevicePowerState", static_cast<uint32_t>(newState),
+		"=> PCI fn%u setDevicePowerState(%lu -> %lu, 0x%x)", fn, prevState, newState, options);
+	auto ret = org(that, device, options, prevState, newState);
+	pmLog(false, "bridge.setDevicePowerState ret", ret, "<= PCI fn%u setDevicePowerState(-> %lu) = 0x%x", fn, newState,
+		ret);
+	return ret;
+}
+
+// Config-space writes to the iGPU functions: the first 200 are printed, all are counted (heartbeat "cfgwr").
+static void configWriteNote(IOPCIDevice *device, uint64_t offset, uint32_t value, unsigned bits) {
+	uint32_t n = __atomic_fetch_add(&pciConfigWrites, 1, __ATOMIC_RELAXED);
+	if (n >= 200)
+		return;
+	pmLog(false, "pci.configWrite off<<16|fn", static_cast<uint32_t>(offset << 16) | device->getFunctionNumber(),
+		"PCI fn%u config write%u 0x%llx = 0x%x", device->getFunctionNumber(), bits, offset, value);
+}
+
+void CRDriver::wrapConfigWrite8(IOPCIDevice *that, uint8_t offset, uint8_t value) {
+	if (isGpuFunction(that))
+		configWriteNote(that, offset, value, 8);
+	FunctionCast(wrapConfigWrite8, callback->orgConfigWrite8)(that, offset, value);
+}
+
+void CRDriver::wrapConfigWrite16(IOPCIDevice *that, uint8_t offset, uint16_t value) {
+	if (isGpuFunction(that))
+		configWriteNote(that, offset, value, 16);
+	FunctionCast(wrapConfigWrite16, callback->orgConfigWrite16)(that, offset, value);
+}
+
+void CRDriver::wrapConfigWrite32(IOPCIDevice *that, uint8_t offset, uint32_t value) {
+	if (isGpuFunction(that))
+		configWriteNote(that, offset, value, 32);
+	FunctionCast(wrapConfigWrite32, callback->orgConfigWrite32)(that, offset, value);
+}
+
+void CRDriver::wrapExtConfigWrite8(IOPCIDevice *that, uint64_t offset, uint8_t value) {
+	if (isGpuFunction(that))
+		configWriteNote(that, offset, value, 8);
+	FunctionCast(wrapExtConfigWrite8, callback->orgExtConfigWrite8)(that, offset, value);
+}
+
+void CRDriver::wrapExtConfigWrite16(IOPCIDevice *that, uint64_t offset, uint16_t value) {
+	if (isGpuFunction(that))
+		configWriteNote(that, offset, value, 16);
+	FunctionCast(wrapExtConfigWrite16, callback->orgExtConfigWrite16)(that, offset, value);
+}
+
+void CRDriver::wrapExtConfigWrite32(IOPCIDevice *that, uint64_t offset, uint32_t value) {
+	if (isGpuFunction(that))
+		configWriteNote(that, offset, value, 32);
+	FunctionCast(wrapExtConfigWrite32, callback->orgExtConfigWrite32)(that, offset, value);
+}
+
+// AGDP/AGDC → AMDSupport requests (thread context: user clients and the policy's work loop).
+void CRDriver::patchPolicy(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	if (checkKernelArgument("-crnotrace"))
+		return;
+	KernelPatcher::RouteRequest requests[] {
+		{"__ZN16AtiDeviceControl24vendor_doDeviceAttributeEjPmmS0_S0_P25IOExternalMethodArguments",
+			wrapDeviceControlAttribute, orgDeviceControlAttribute},
+		{"__ZN14AtiGpuWrangler24vendor_doDeviceAttributeEjPmmS0_S0_P25IOExternalMethodArguments",
+			wrapWranglerAttribute, orgWranglerAttribute},
+	};
+	for (auto &request : requests) {
+		if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+			SYSLOG("cr", "policy: failed to route %s (error %d)", request.symbol, patcher.getError());
+			patcher.clearError();
+		}
+	}
+}
+
+static uint64_t peekValue(const uint64_t *value) { return value ? *value : 0; }
+
+IOReturn CRDriver::wrapDeviceControlAttribute(void *that, uint32_t attribute, uint64_t *value, uint64_t size,
+	uint64_t *arg4, uint64_t *arg5, void *arguments) {
+	pmLog(true, "agdc.deviceControl attr", attribute, "=> AtiDeviceControl attribute 0x%x value 0x%llx size %llu",
+		attribute, peekValue(value), size);
+	auto ret = FunctionCast(wrapDeviceControlAttribute, callback->orgDeviceControlAttribute)(that, attribute, value,
+		size, arg4, arg5, arguments);
+	pmLog(true, "agdc.deviceControl ret", ret, "<= AtiDeviceControl attribute 0x%x = 0x%x, value 0x%llx", attribute,
+		ret, peekValue(value));
+	return ret;
+}
+
+IOReturn CRDriver::wrapWranglerAttribute(void *that, uint32_t attribute, uint64_t *value, uint64_t size,
+	uint64_t *arg4, uint64_t *arg5, void *arguments) {
+	pmLog(true, "agdc.wrangler attr", attribute, "=> AtiGpuWrangler attribute 0x%x value 0x%llx size %llu", attribute,
+		peekValue(value), size);
+	auto ret = FunctionCast(wrapWranglerAttribute, callback->orgWranglerAttribute)(that, attribute, value, size, arg4,
+		arg5, arguments);
+	pmLog(true, "agdc.wrangler ret", ret, "<= AtiGpuWrangler attribute 0x%x = 0x%x, value 0x%llx", attribute, ret,
+		peekValue(value));
+	return ret;
+}
+
+// Apple's controller writing config space itself (BaffinRegisterService::writePCIReg*, offset into config space).
+void CRDriver::wrapWritePCIReg8(void *that, uint32_t offset, uint8_t value) {
+	pmLog(false, "ctrl.writePCIReg8", offset, "controller config write8 0x%x = 0x%x", offset, value);
+	FunctionCast(wrapWritePCIReg8, callback->orgWritePCIReg8)(that, offset, value);
+}
+
+void CRDriver::wrapWritePCIReg16(void *that, uint32_t offset, uint16_t value) {
+	pmLog(false, "ctrl.writePCIReg16", offset, "controller config write16 0x%x = 0x%x", offset, value);
+	FunctionCast(wrapWritePCIReg16, callback->orgWritePCIReg16)(that, offset, value);
+}
+
+void CRDriver::wrapWritePCIReg32(void *that, uint32_t offset, uint32_t value) {
+	pmLog(false, "ctrl.writePCIReg32", offset, "controller config write32 0x%x = 0x%x", offset, value);
+	FunctionCast(wrapWritePCIReg32, callback->orgWritePCIReg32)(that, offset, value);
 }
 
 IOService *CRDriver::wrapProbeNoMatch(IOService *, IOService *, SInt32 *) { return nullptr; }

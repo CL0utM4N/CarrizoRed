@@ -58,6 +58,8 @@ uploads them (plus a debug `Lilu.kext`) as a workflow artifact.
 | `-crnoplllimit`, `-crnopllremap` | Don't limit the PLL assigner to 2 PLLs / don't remap Apple PLL 1 to `ATOM_PPLL0` |
 | `-crpipeguard` | Drop writes to, and read 0 from, display-pipe register blocks the APU doesn't have |
 | `-crreglogintsoff` | Print register-log lines from interrupts-off context directly instead of queueing them |
+| `-crkeepgpuon` | Refuse PCI power-down (below D0 / `kIOPCIDeviceOnState`) of the iGPU |
+| `-crnopcitrace` | Don't trace the iGPU's PCI power states and config-space writes |
 
 ## Layout
 

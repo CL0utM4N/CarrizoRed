@@ -74,6 +74,34 @@ private:
 	static bool wrapAtiStart(IOService *that, IOService *provider);
 	mach_vm_address_t orgAtiProbe {0}, orgAtiStart {0};
 
+	// Power / policy / config-space tracing (see patchPci in kern_cr.cpp).
+	void patchPci(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
+	void patchPolicy(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
+	static bool isGpuFunction(IOPCIDevice *device);
+	static IOReturn wrapPciSetPowerState(IOPCIDevice *that, unsigned long state, IOService *whatDevice);
+	static IOReturn wrapPciSetPCIPowerState(IOPCIDevice *that, uint8_t state, uint32_t options);
+	static IOReturn wrapBridgeSetDevicePowerState(IOService *that, IOPCIDevice *device, uint32_t options,
+		unsigned long prevState, unsigned long newState);
+	static void wrapConfigWrite8(IOPCIDevice *that, uint8_t offset, uint8_t value);
+	static void wrapConfigWrite16(IOPCIDevice *that, uint8_t offset, uint16_t value);
+	static void wrapConfigWrite32(IOPCIDevice *that, uint8_t offset, uint32_t value);
+	static void wrapExtConfigWrite8(IOPCIDevice *that, uint64_t offset, uint8_t value);
+	static void wrapExtConfigWrite16(IOPCIDevice *that, uint64_t offset, uint16_t value);
+	static void wrapExtConfigWrite32(IOPCIDevice *that, uint64_t offset, uint32_t value);
+	mach_vm_address_t orgPciSetPowerState {0}, orgPciSetPCIPowerState {0}, orgBridgeSetDevicePowerState {0},
+		orgConfigWrite8 {0}, orgConfigWrite16 {0}, orgConfigWrite32 {0}, orgExtConfigWrite8 {0},
+		orgExtConfigWrite16 {0}, orgExtConfigWrite32 {0};
+	static IOReturn wrapDeviceControlAttribute(void *that, uint32_t attribute, uint64_t *value, uint64_t size,
+		uint64_t *arg4, uint64_t *arg5, void *arguments);
+	static IOReturn wrapWranglerAttribute(void *that, uint32_t attribute, uint64_t *value, uint64_t size,
+		uint64_t *arg4, uint64_t *arg5, void *arguments);
+	mach_vm_address_t orgDeviceControlAttribute {0}, orgWranglerAttribute {0};
+	static void wrapWritePCIReg8(void *that, uint32_t offset, uint8_t value);
+	static void wrapWritePCIReg16(void *that, uint32_t offset, uint16_t value);
+	static void wrapWritePCIReg32(void *that, uint32_t offset, uint32_t value);
+	mach_vm_address_t orgWritePCIReg8 {0}, orgWritePCIReg16 {0}, orgWritePCIReg32 {0};
+	uint8_t gpuBus {0xFF}, gpuDevice {0xFF};
+
 	void startWatcher();
 	static void watcherThread(void *arg, wait_result_t);
 
