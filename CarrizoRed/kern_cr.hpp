@@ -99,6 +99,8 @@ private:
 		uint64_t *arg4, uint64_t *arg5, void *arguments);
 	mach_vm_address_t orgDeviceControlAttribute {0}, orgWranglerAttribute {0};
 	static IOReturn wrapInstallInterrupts(void *that);
+	static uint8_t wrapExecuteBiosCommandTable(void *that, uint32_t table, void *params, uint32_t flag);
+	mach_vm_address_t orgExecuteBiosCommandTable {0};
 	mach_vm_address_t orgInstallInterrupts {0};
 	static void wrapWritePCIReg8(void *that, uint32_t offset, uint8_t value);
 	static void wrapWritePCIReg16(void *that, uint32_t offset, uint16_t value);

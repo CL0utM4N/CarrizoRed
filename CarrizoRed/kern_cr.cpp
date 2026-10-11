@@ -113,6 +113,39 @@ static void printRegEvent(const RegEvent &event, const char *suffix);
 // Power-management / config-space events on the iGPU (see patchPci).
 static uint32_t pmEvents, pciConfigWrites;
 
+// Every VBIOS command table Apple runs (AtiAtomFirmwareInterface::executeBiosCommandTable): table index, the first 16
+// parameter bytes going in, the result and the first 8 bytes coming back. Spoof boot 22: eDP link training failed at
+// clock recovery although the firmware trained the same panel at boot, so what Apple passes the encoder / transmitter
+// tables (DIGxEncoderControl 1.4, DIG1TransmitterControl 1.5 on Stoney) is the next thing to see. AUX transactions
+// (ProcessAuxChannelTransaction, table 0x4E) are counted and kept in their own small ring; they would flood the main one.
+struct AtomCall {
+	uint16_t table;
+	uint8_t ok, done;
+	uint32_t in[4], out[2];
+};
+static constexpr uint32_t AtomRingSize = 24, AuxRingSize = 6, AtomAuxTable = 0x4E;
+static AtomCall atomRing[AtomRingSize], auxRing[AuxRingSize];
+static uint32_t atomHead, auxHead, atomCalls, auxCalls, auxFailures;
+
+template <typename Add>
+static void atomReport(Add &add) {
+	add("atom: %u calls (%u aux, %u aux failed); idx:table ok in[0..3] -> out[0..1]\n", atomCalls, auxCalls,
+		auxFailures);
+	uint32_t head = __atomic_load_n(&atomHead, __ATOMIC_RELAXED);
+	for (uint32_t i = head > AtomRingSize ? head - AtomRingSize : 0; i != head; i++) {
+		auto &call = atomRing[i % AtomRingSize];
+		add(" %u:%x %u %x %x %x %x -> %x %x\n", i, call.table, call.ok, call.in[0], call.in[1], call.in[2], call.in[3],
+			call.out[0], call.out[1]);
+	}
+	add("aux (last %u):", AuxRingSize);
+	head = __atomic_load_n(&auxHead, __ATOMIC_RELAXED);
+	for (uint32_t i = head > AuxRingSize ? head - AuxRingSize : 0; i != head; i++) {
+		auto &call = auxRing[i % AuxRingSize];
+		add(" [%u %x %x -> %x %x]", call.ok, call.in[0], call.in[1], call.out[0], call.out[1]);
+	}
+	add("\n");
+}
+
 // IH storm breaker. IH registers are dword offsets in BAR5, the same on Tonga (oss_3_0) and CZ (oss_3_0_1).
 namespace IhReg {
 	static constexpr uint32_t RB_CNTL = 0xE30, RB_BASE = 0xE31, RB_RPTR = 0xE32, RB_WPTR = 0xE33, RB_WPTR_ADDR_HI = 0xE34,
@@ -776,7 +809,7 @@ namespace {
 		bool summary;  // note the result in the repeated trace summary (start-up stages)
 		bool sync;     // thread context only: also print on entry and pause, so an instant hard hang still shows it
 		mach_vm_address_t org;
-		uint8_t arg {0};  // argument recorded in the entry event: 0 none, 1 b, 2 c, 3 b | c << 8, 4 c | d << 8
+		uint8_t arg {0};  // entry event argument: 0 none, 1 b, 2 c, 3 b | c << 8, 4 c | d << 8, 5 c + *d after return
 	};
 
 	TracedStage stages[] {
@@ -836,8 +869,8 @@ namespace {
 		// events record the action / crtc / power argument. DisplayPortUtilities::trainLink and fastTrainLink can't be
 		// wrapped (stack-protector prologue, see routeChecked), so their steps are traced instead.
 		{"__ZN20DisplayPortUtilities18prepareForTrainingEh", "dp.prepareForTraining", InSupport, false, false, 0, 1},
-		{"__ZN20DisplayPortUtilities18doTrainingPattern1EP19ActiveConnectorInfohPh", "dp.trainingPattern1", InSupport, false, false, 0, 2},
-		{"__ZN20DisplayPortUtilities18doTrainingPattern2EP19ActiveConnectorInfohPh", "dp.trainingPattern2", InSupport, false, false, 0, 2},
+		{"__ZN20DisplayPortUtilities18doTrainingPattern1EP19ActiveConnectorInfohPh", "dp.trainingPattern1", InSupport, false, false, 0, 5},
+		{"__ZN20DisplayPortUtilities18doTrainingPattern2EP19ActiveConnectorInfohPh", "dp.trainingPattern2", InSupport, false, false, 0, 5},
 		{"__ZN20DisplayPortUtilities13isLinkTrainedEv", "dp.isLinkTrained", InSupport, false, false, 0},
 		{"__ZN12ATIConnector18linkTrainingFailedEv", "dp.linkTrainingFailed", InSupport, true, false, 0},
 		{"__ZN20DisplayPortUtilities13setPanelPowerEh", "dp.setPanelPower", InSupport, false, false, 0, 1},
@@ -868,6 +901,7 @@ namespace {
 			case 2: arg = static_cast<uint32_t>(ac); break;
 			case 3: arg = static_cast<uint32_t>((ab & 0xFF) | (ac & 0xFF) << 8); break;
 			case 4: arg = static_cast<uint32_t>((ac & 0xFF) | (ad & 0xFF) << 8); break;
+			case 5: arg = static_cast<uint32_t>(ac); break;
 		}
 		traceEvent(stages[N].name, false, arg);
 		if (stages[N].sync) {
@@ -876,6 +910,9 @@ namespace {
 		}
 		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(a, b, c, d, e, f);
 		traceEvent(stages[N].name, true, static_cast<uint32_t>(ret));
+		// Mode 5: d points at a status buffer the call fills (DP training: per-lane status read from the DPCD).
+		if (stages[N].arg == 5 && d)
+			traceEvent("  status", true, *static_cast<uint32_t *>(d));
 		__atomic_fetch_sub(&stageOpen[N], 1, __ATOMIC_RELAXED);
 		if (stages[N].summary)
 			traceNote("%s=%x ", stages[N].name, static_cast<uint32_t>(ret));
@@ -1469,6 +1506,14 @@ void CRDriver::wrapExtConfigWrite32(IOPCIDevice *that, uint64_t offset, uint32_t
 
 // AGDP/AGDC → AMDSupport requests (thread context: user clients and the policy's work loop).
 void CRDriver::patchPolicy(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	if (!checkKernelArgument("-crnoatomlog")) {
+		KernelPatcher::RouteRequest request {"__ZN24AtiAtomFirmwareInterface23executeBiosCommandTableEjPvj",
+			wrapExecuteBiosCommandTable, orgExecuteBiosCommandTable};
+		if (!routeChecked(patcher, index, request, slide, size)) {
+			SYSLOG("cr", "failed to route executeBiosCommandTable (error %d)", patcher.getError());
+			patcher.clearError();
+		}
+	}
 	{
 		KernelPatcher::RouteRequest request {"__ZN21AtiFbInterruptManager28installInterruptsOnPciDeviceEv",
 			wrapInstallInterrupts, orgInstallInterrupts};
@@ -1545,6 +1590,33 @@ IOReturn CRDriver::wrapInstallInterrupts(void *that) {
 		printMsiState(gpu, "after interrupt install");
 	IOSleep(30);
 	return ret;
+}
+
+uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *params, uint32_t flag) {
+	__atomic_fetch_add(&atomCalls, 1, __ATOMIC_RELAXED);
+	bool aux = table == AtomAuxTable;
+	AtomCall *call;
+	if (aux) {
+		__atomic_fetch_add(&auxCalls, 1, __ATOMIC_RELAXED);
+		call = &auxRing[__atomic_fetch_add(&auxHead, 1, __ATOMIC_RELAXED) % AuxRingSize];
+	} else {
+		call = &atomRing[__atomic_fetch_add(&atomHead, 1, __ATOMIC_RELAXED) % AtomRingSize];
+	}
+	call->table = static_cast<uint16_t>(table);
+	call->done = 0;
+	if (params)
+		memcpy(call->in, params, sizeof(call->in));
+	else
+		memset(call->in, 0, sizeof(call->in));
+	uint8_t ok = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that, table, params,
+		flag);
+	call->ok = ok & 1;
+	if (params)
+		memcpy(call->out, params, sizeof(call->out));
+	call->done = 1;
+	if (aux && !(ok & 1))
+		__atomic_fetch_add(&auxFailures, 1, __ATOMIC_RELAXED);
+	return ok;
 }
 
 static uint64_t peekValue(const uint64_t *value) { return value ? *value : 0; }
@@ -1757,6 +1829,8 @@ namespace {
 		int pipe;  // -1 = display-wide
 		uint32_t offset, value, changes;
 		bool valid;  // value read (pipe powered)
+		uint32_t bootValue;  // as the firmware (GOP) left it
+		bool bootValid;
 	};
 	WatchedReg watchedRegs[MaxWatchedRegs];
 	size_t watchedRegCount;
@@ -1779,6 +1853,8 @@ void CRDriver::initDisplayRegs() {
 			continue;
 		reg.value = gpuMmio[reg.offset];
 		reg.valid = true;
+		reg.bootValue = reg.value;
+		reg.bootValid = true;
 	}
 	for (uint32_t pipe = 0; pipe < pipes && pipe < MaxWatchedPipes; pipe++)
 		SYSLOG("cr", "boot: PIPE%u_PG_STATUS 0x%08X", pipe, gpuMmio[Reg::PIPE0_PG_STATUS + 3 * pipe]);
@@ -1799,7 +1875,7 @@ void CRDriver::initDisplayRegs() {
 // connectors, mode), the current display/clock registers, the trace summary and the last trace events (setPixelClock,
 // setCrtcToPixelClock, framebuffer calls). Register values are read fresh (pipes only when powered).
 void CRDriver::panicReport(uint32_t t, const char *tree) {
-	static char report[4096];
+	static char report[6144];
 	size_t len = 0;
 	auto add = [&](const char *fmt, ...) {
 		if (len + 1 >= sizeof(report))
@@ -1816,7 +1892,9 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		__atomic_load_n(&pmEvents, __ATOMIC_RELAXED), __atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));
 	add("tree:\n%s", tree ? tree : "");
 	if (gpuMmio) {
-		add("regs:");
+		// Registers as offset=now/boot (boot = what the firmware's GOP left, with a working eDP link) where they
+		// changed, then the offsets that still hold their boot value.
+		add("regs now/boot:");
 		bool powered[MaxWatchedPipes] {};
 		for (uint32_t pipe = 0; pipe < MaxWatchedPipes && pipe < displayPipes(family); pipe++)
 			powered[pipe] = pipePowered(pipe);
@@ -1824,9 +1902,20 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 			auto &reg = watchedRegs[i];
 			if (reg.pipe >= 0 && !powered[reg.pipe])
 				continue;
-			add(" %x=%x", reg.offset, gpuMmio[reg.offset]);
+			uint32_t now = gpuMmio[reg.offset];
+			if (!reg.bootValid)
+				add(" %x=%x/-", reg.offset, now);
+			else if (now != reg.bootValue)
+				add(" %x=%x/%x", reg.offset, now, reg.bootValue);
+		}
+		add("\nunchanged:");
+		for (size_t i = 0; i < watchedRegCount; i++) {
+			auto &reg = watchedRegs[i];
+			if ((reg.pipe < 0 || powered[reg.pipe]) && reg.bootValid && gpuMmio[reg.offset] == reg.bootValue)
+				add(" %x=%x", reg.offset, reg.bootValue);
 		}
 		add("\n");
+		atomReport(add);
 	}
 	// Is CRTC 0 running? Position and frame count, 20 ms (more than one frame) apart.
 	if (gpuMmio && pipePowered(0)) {
@@ -1836,10 +1925,10 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		add("crtc0 position %x -> %x, frame %x -> %x\n", pos1, pos2, frame1, frame2);
 	}
 	add("trace: %s\nlast events:", traceSummary);
-	// Newest 40 events, oldest first, without the repetitive attribute and vblank-wait calls.
+	// Newest 24 events, oldest first, without the repetitive attribute and vblank-wait calls.
 	uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
-	uint32_t picked[40], count = 0;
-	for (uint32_t i = head; i != 0 && head - i < TraceRingSize && count < 40;) {
+	uint32_t picked[24], count = 0;
+	for (uint32_t i = head; i != 0 && head - i < TraceRingSize && count < 24;) {
 		i--;
 		auto &event = traceRing[i % TraceRingSize];
 		if (!event.name || !strncmp(event.name, "fb.setAttribute", 15) || !strncmp(event.name, "tg.wait", 7))

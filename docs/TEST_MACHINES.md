@@ -94,6 +94,15 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   `saved-config` for `PciRoot(0x0)/Pci(0x1,0x0)`: **1366×768, 76.30 MHz** (the panel's EDID mode). So the controller
   found the panel and set a mode; the picture is what's wrong. Next: `crpanicat=60` black-box report (registers,
   trace, framebuffer tree in the NVRAM panic text).
+- **Spoof boots 22–23 (`crpanicat=60` black box):** kernel alive at t=60 s. fb0 = internal panel (`conn 0x2`),
+  1366×768 @ 76.3 MHz on CRTC 0, which is running (frame counter 906→907 in 20 ms; totals 1592×798). Pixel clock
+  from the DP DTO: phase/modulo imply DPREFCLK 399.25 MHz vs 400 MHz from `DENTIST_DISPCLK_CNTL` (DID 0x24 → ÷9 of
+  3600 MHz), fine. Backlight PWM on and full. **eDP link training fails at clock recovery**
+  (`DisplayPortUtilities::doTrainingPattern1` = `0xE00002BC`, twice), after which Apple disables the transmitter
+  and encoder: all DIG front ends 0, DP video streams off, so the panel is lit but gets no picture. The firmware
+  trained the same panel at boot, so the encoder/transmitter parameters Apple passes Stoney's VBIOS
+  (DIGxEncoderControl 1.4, DIG1TransmitterControl 1.5) are the suspect. Next report: every VBIOS command with its
+  parameters, register values now vs at boot, and the training lane status.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
