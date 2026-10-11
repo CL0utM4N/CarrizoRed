@@ -60,7 +60,7 @@ enum RegOp : uint32_t { RegRead, RegWrite, RegPcieRead, RegPcieWrite, RegIndRead
 static const char *const regOpNames[RegOpCount] {"rd", "WR", "pcie-rd", "PCIE-WR", "ind-rd", "IND-WR"};
 static uint8_t regSeen[RegOpCount][0x10000 / 8];
 static uint64_t regLogFromMs;  // 0 = not yet (controller not started)
-static uint32_t regLogged;
+static uint32_t regLogged, regAccesses;
 
 // IH storm breaker. IH registers are dword offsets in BAR5, the same on Tonga (oss_3_0) and CZ (oss_3_0_1).
 namespace IhReg {
@@ -401,6 +401,11 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			IOLog("CarrizoRed: IH write-back as CPU sees it=%08x at %llx; ring cpu %llx gpu %llx\n", snap.wbValue,
 				snap.wbAddress, snap.ringCpu, snap.ringGpu);
 		}
+
+		// Heartbeat once the register log is armed: shows whether register traffic continues up to a freeze.
+		if (regLogFromMs && tick % 4 == 0)
+			IOLog("CarrizoRed: hb t=%us regs %u ih %u\n", t, __atomic_load_n(&regAccesses, __ATOMIC_RELAXED),
+				__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED));
 
 		// Watchdog: a traced call that never returns (a hard hang with this CPU still alive) becomes a panic that
 		// names it and stays on screen (debug=0x100). -crnowatchdog disables this.
@@ -774,6 +779,11 @@ void CRDriver::patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_add
 			{"__ZN21BaffinRegisterService10writeReg32Ejj", wrapRegWrite32, orgRegWrite32},
 			{"__ZN21BaffinRegisterService10readPCIe32Ej", wrapPcieRead32, orgPcieRead32},
 			{"__ZN21BaffinRegisterService11writePCIe32Ejj", wrapPcieWrite32, orgPcieWrite32},
+			{"__ZN21BaffinRegisterService11hwReadReg32Ej", wrapHwRead32, orgHwRead32},
+			{"__ZN21BaffinRegisterService9readReg16Ej", wrapRead16, orgRead16},
+			{"__ZN21BaffinRegisterService8readReg8Ej", wrapRead8, orgRead8},
+			{"__ZN21BaffinRegisterService10writeReg16Ejt", wrapWrite16, orgWrite16},
+			{"__ZN21BaffinRegisterService9writeReg8Ejh", wrapWrite8, orgWrite8},
 		};
 		for (auto &request : regRequests) {
 			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
@@ -788,17 +798,46 @@ void CRDriver::patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_add
 }
 
 static void regAccess(RegOp op, uint32_t offset, uint32_t extra, uint32_t value) {
+	__atomic_fetch_add(&regAccesses, 1, __ATOMIC_RELAXED);
 	uint32_t key = (op == RegRead || op == RegWrite ? offset >> 2 : offset ^ (extra << 4)) & 0xFFFF;
 	uint8_t bit = static_cast<uint8_t>(1u << (key & 7));
 	uint8_t old = __atomic_fetch_or(&regSeen[op][key >> 3], bit, __ATOMIC_RELAXED);
 	if (old & bit)
 		return;
 	uint64_t from = regLogFromMs;
-	if (!from || uptimeMs() < from || !ml_get_interrupts_enabled() || regLogged > 400)
+	if (!from || uptimeMs() < from || regLogged > 400)
 		return;
 	regLogged++;
-	IOLog("CarrizoRed: new reg %s 0x%x/0x%x = 0x%x\n", regOpNames[op], offset, extra, value);
+	// Printed even with interrupts disabled (spoof boot 12 showed nothing with them enabled).
+	bool ints = ml_get_interrupts_enabled();
+	IOLog("CarrizoRed: new reg %s 0x%x/0x%x = 0x%x%s\n", regOpNames[op], offset, extra, value, ints ? "" : " (ints off)");
 	IODelay(3000);
+}
+
+uint32_t CRDriver::wrapHwRead32(void *that, uint32_t offset) {
+	auto value = FunctionCast(wrapHwRead32, callback->orgHwRead32)(that, offset);
+	regAccess(RegRead, offset, 0, value);
+	return value;
+}
+
+uint32_t CRDriver::wrapRead16(void *that, uint32_t offset) {
+	regAccess(RegRead, offset & ~3u, 16, 0);
+	return FunctionCast(wrapRead16, callback->orgRead16)(that, offset);
+}
+
+uint32_t CRDriver::wrapRead8(void *that, uint32_t offset) {
+	regAccess(RegRead, offset & ~3u, 8, 0);
+	return FunctionCast(wrapRead8, callback->orgRead8)(that, offset);
+}
+
+void CRDriver::wrapWrite16(void *that, uint32_t offset, uint32_t value) {
+	regAccess(RegWrite, offset & ~3u, 16, value);
+	FunctionCast(wrapWrite16, callback->orgWrite16)(that, offset, value);
+}
+
+void CRDriver::wrapWrite8(void *that, uint32_t offset, uint32_t value) {
+	regAccess(RegWrite, offset & ~3u, 8, value);
+	FunctionCast(wrapWrite8, callback->orgWrite8)(that, offset, value);
 }
 
 uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {

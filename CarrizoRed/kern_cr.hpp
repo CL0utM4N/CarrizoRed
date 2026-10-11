@@ -37,6 +37,12 @@ private:
 	mach_vm_address_t orgIhSetHardwareEnabled {0}, orgIhHandler {0}, orgIhSetReadPointer {0};
 	bool stormBreak {true};
 	static uint32_t wrapRegRead32(void *that, uint32_t offset);
+	static uint32_t wrapHwRead32(void *that, uint32_t offset);
+	static uint32_t wrapRead16(void *that, uint32_t offset);
+	static uint32_t wrapRead8(void *that, uint32_t offset);
+	static void wrapWrite16(void *that, uint32_t offset, uint32_t value);
+	static void wrapWrite8(void *that, uint32_t offset, uint32_t value);
+	mach_vm_address_t orgHwRead32 {0}, orgRead16 {0}, orgRead8 {0}, orgWrite16 {0}, orgWrite8 {0};
 	static void wrapRegWrite32(void *that, uint32_t offset, uint32_t value);
 	static uint32_t wrapPcieRead32(void *that, uint32_t offset);
 	static void wrapPcieWrite32(void *that, uint32_t offset, uint32_t value);
