@@ -36,6 +36,8 @@ private:
 	void blockProbe(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, const char *probe,
 		const char *arg);
 	static bool wrapStartFail(IOService *that, IOService *provider);
+	void patchAgdpBoardId(KernelPatcher &patcher, size_t kext);
+	void setMacGpuProperties();
 
 	void patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
 	static void wrapIhSetHardwareEnabled(void *that, bool enable);

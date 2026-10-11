@@ -64,7 +64,7 @@ static const char *const regOpNames[RegOpCount] {"rd", "WR", "pcie-rd", "PCIE-WR
 static uint8_t regSeen[RegOpCount][0x10000 / 8];
 static uint64_t regLogFromMs;  // 0 = not yet (controller not started)
 static uint32_t regLogged, regAccesses;
-static bool regLogIntsOff, pipeGuard;
+static bool regLogIntsOff, pipeGuard, regLogAll;
 static uint32_t pipeLimit = 6, pipeAccesses, pipeLogged;
 struct RegEvent {
 	RegOp op;
@@ -220,8 +220,11 @@ void CRDriver::processPatcher(KernelPatcher &) {
 	pipeLimit = displayPipes(family);
 	pipeGuard = checkKernelArgument("-crpipeguard");
 	regLogIntsOff = checkKernelArgument("-crreglogintsoff");
+	regLogAll = checkKernelArgument("-crreglogall");
 
 	logPCIInfo();
+	if (checkKernelArgument("-crmacgpu"))
+		setMacGpuProperties();
 	if (!checkKernelArgument("-crnommio"))
 		probeMMIO();
 
@@ -283,11 +286,16 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 		else if (i == KextAgpm) {
 			blockProbe(patcher, index, slide, size, "__ZN14AGPMController5probeEP9IOServicePi", "-crnoagpm");
 			blockProbe(patcher, index, slide, size, "__ZN4AGPM5probeEP9IOServicePi", "-crnoagpm");
-		} else if (i == KextAgdp && checkKernelArgument("-crnoagdp")) {
-			KernelPatcher::RouteRequest request {"__ZN32AppleGraphicsDeviceControlClient5startEP9IOService", wrapStartFail};
-			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
-				SYSLOG("cr", "-crnoagdp: failed to route (error %d)", patcher.getError());
-				patcher.clearError();
+		} else if (i == KextAgdp) {
+			if (checkKernelArgument("-crmacgpu"))
+				patchAgdpBoardId(patcher, i);
+			if (checkKernelArgument("-crnoagdp")) {
+				KernelPatcher::RouteRequest request {"__ZN32AppleGraphicsDeviceControlClient5startEP9IOService",
+					wrapStartFail};
+				if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+					SYSLOG("cr", "-crnoagdp: failed to route (error %d)", patcher.getError());
+					patcher.clearError();
+				}
 			}
 		}
 		else if (i == KextRadeonX4000)
@@ -852,9 +860,12 @@ void CRDriver::traceSupport(KernelPatcher &patcher, size_t index, mach_vm_addres
 			}
 		}
 	}
-	if (checkKernelArgument("-crnotrace"))
+	// ATIController::probe/start are also needed by -crnoctl and -crreglogall.
+	bool trace = !checkKernelArgument("-crnotrace");
+	if (!trace && !checkKernelArgument("-crnoctl") && !regLogAll)
 		return;
-	routeStages(patcher, index, slide, size, InSupport);
+	if (trace)
+		routeStages(patcher, index, slide, size, InSupport);
 	KernelPatcher::RouteRequest requests[] {
 		{"__ZN13ATIController5probeEP9IOServicePi", wrapAtiProbe, orgAtiProbe},
 		{"__ZN13ATIController5startEP9IOService", wrapAtiStart, orgAtiStart},
@@ -867,7 +878,19 @@ void CRDriver::traceSupport(KernelPatcher &patcher, size_t index, mach_vm_addres
 	}
 }
 
+// -crnoctl: AMD9500Controller (any ATIController) never matches, while the spoof, the wrangler, AMDSupport and AGDP
+// still load. Tells whether the controller's start-up is what leads to the freeze ~20 s later.
+// -crreglogall: register logging starts here (every access, with values), instead of 2 s after start.
 IOService *CRDriver::wrapAtiProbe(IOService *that, IOService *provider, SInt32 *score) {
+	if (checkKernelArgument("-crnoctl")) {
+		IOLog("CarrizoRed: %s::probe -> NO MATCH (-crnoctl)\n", that->getMetaClass()->getClassName());
+		traceNote("%s.probe=blocked ", that->getMetaClass()->getClassName());
+		return nullptr;
+	}
+	if (regLogAll && !regLogFromMs) {
+		regLogFromMs = uptimeMs();
+		IOLog("CarrizoRed: logging every register access from probe (-crreglogall)\n");
+	}
 	IOLog("CarrizoRed: %s::probe ...\n", that->getMetaClass()->getClassName());
 	auto *ret = FunctionCast(wrapAtiProbe, callback->orgAtiProbe)(that, provider, score);
 	IOLog("CarrizoRed: %s::probe -> %s\n", that->getMetaClass()->getClassName(), ret ? "match" : "NO MATCH");
@@ -908,6 +931,38 @@ void CRDriver::blockProbe(KernelPatcher &patcher, size_t index, mach_vm_address_
 }
 
 bool CRDriver::wrapStartFail(IOService *, IOService *) { return false; }
+
+// -crmacgpu: make the iGPU look like a Mac's own GPU to Apple's policy code.
+// AGDP picks a per-board configuration from ConfigMap by the platform's "board-id". For the iMac19,1 SMBIOS that is
+// Config3 (GFX0: EDID override index 0, FeatureControl 12; IGPU: unload), written for that iMac's panel and GPUs.
+// Renaming the property it reads (the only "board-id" string in the binary, Sequoia 24H32) to "board-ix" makes the
+// lookup fail, so AGDP uses its Default config ("none"). Same approach as WhateverGreen's agdpmod=pikera.
+void CRDriver::patchAgdpBoardId(KernelPatcher &patcher, size_t kext) {
+	static const uint8_t find[] {'b', 'o', 'a', 'r', 'd', '-', 'i', 'd', 0};
+	static const uint8_t replace[] {'b', 'o', 'a', 'r', 'd', '-', 'i', 'x', 0};
+	KernelPatcher::LookupPatch patch {&kexts[kext], find, replace, sizeof(find), 1};
+	patcher.applyLookupPatch(&patch);
+	if (patcher.getError() == KernelPatcher::Error::NoError) {
+		SYSLOG("cr", "-crmacgpu: AGDP board-id lookup neutralised");
+	} else {
+		SYSLOG("cr", "-crmacgpu: AGDP board-id patch failed (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+}
+
+// -crmacgpu: the properties a Mac's own GPU has (the iGPU has none): "built-in" and AAPL,slot-name "built-in", so
+// Apple's code doesn't treat it as removable (the controller personality is IOPCITunnelCompatible and ATIController
+// has eGPU paths), and a "model". The device keeps its ACPI name (VGA): AGDP and AGPM attach per-name policies to
+// GFX0/IGPU.
+void CRDriver::setMacGpuProperties() {
+	uint8_t builtIn[] {0x00};
+	iGPU->setProperty("built-in", builtIn, sizeof(builtIn));
+	char slotName[] = "built-in";
+	iGPU->setProperty("AAPL,slot-name", slotName, sizeof(slotName));
+	const char *model = family == ChipFamily::Stoney ? "AMD Radeon R5 Graphics" : "AMD Radeon R7 Graphics";
+	iGPU->setProperty("model", const_cast<char *>(model), static_cast<unsigned>(strlen(model) + 1));
+	SYSLOG("cr", "-crmacgpu: built-in, AAPL,slot-name and model (%s) set", model);
+}
 
 // Display interrupts go through the IH ring, managed by BaffinInterruptManager. Polaris (Tonga IH) can acknowledge
 // entries with a doorbell; Carrizo/Stoney (CZ IH) only through IH_RB_RPTR (Linux tonga_ih_set_rptr vs
@@ -976,21 +1031,25 @@ static void printRegEvent(const RegEvent &event, const char *suffix) {
 		suffix);
 }
 
-// Called before every access. Returns true when -crpipeguard blocks it.
-static bool regAccess(RegOp op, uint32_t offset, uint32_t extra, uint32_t value) {
+// Called before every access. Returns RegBlocked when -crpipeguard blocks it, RegPrinted when a line was printed
+// (the read wrappers then print the value read).
+enum : int { RegBlocked = 1, RegPrinted = 2 };
+
+static int regAccess(RegOp op, uint32_t offset, uint32_t extra, uint32_t value) {
 	__atomic_fetch_add(&regAccesses, 1, __ATOMIC_RELAXED);
 	bool direct = op == RegRead || op == RegWrite;
 	int pipe = direct ? pipeOfRegister(offset >> 2) : -1;
 	bool outside = pipe >= static_cast<int>(pipeLimit);
 	if (outside)
 		__atomic_fetch_add(&pipeAccesses, 1, __ATOMIC_RELAXED);
-	bool block = outside && pipeGuard;
+	int block = outside && pipeGuard ? RegBlocked : 0;
 	uint32_t key = (direct ? offset >> 2 : offset ^ (extra << 4)) & 0xFFFF;
 	uint8_t bit = static_cast<uint8_t>(1u << (key & 7));
 	uint8_t old = __atomic_fetch_or(&regSeen[op][key >> 3], bit, __ATOMIC_RELAXED);
-	if (old & bit)
+	// -crreglogall prints every access, not only the first one per offset.
+	if ((old & bit) && !regLogAll)
 		return block;
-	if (outside) {
+	if (outside && !regLogAll) {
 		if (__atomic_fetch_add(&pipeLogged, 1, __ATOMIC_RELAXED) >= 100)
 			return block;
 	} else {
@@ -1003,54 +1062,67 @@ static bool regAccess(RegOp op, uint32_t offset, uint32_t extra, uint32_t value)
 	if (ml_get_interrupts_enabled() || regLogIntsOff) {
 		printRegEvent(event, ml_get_interrupts_enabled() ? "" : " (ints off)");
 		IODelay(3000);
-	} else {
-		regRing[__atomic_fetch_add(&regRingHead, 1, __ATOMIC_RELAXED) % RegRingSize] = event;
+		return block | RegPrinted;
 	}
+	regRing[__atomic_fetch_add(&regRingHead, 1, __ATOMIC_RELAXED) % RegRingSize] = event;
 	return block;
 }
 
+// Value of a read whose access line was printed (-crreglogall only).
+static uint32_t regReadDone(int flags, uint32_t value) {
+	if ((flags & RegPrinted) && regLogAll)
+		IOLog("CarrizoRed:     = 0x%x\n", value);
+	return value;
+}
+
+// readReg32 reads through hwReadReg32 (vtable +0x160), so with -crreglogall each such read shows twice; the inner one
+// is marked "/0x1".
 uint32_t CRDriver::wrapHwRead32(void *that, uint32_t offset) {
-	if (regAccess(RegRead, offset, 0, 0))
+	int flags = regAccess(RegRead, offset, 1, 0);
+	if (flags & RegBlocked)
 		return 0;
-	return FunctionCast(wrapHwRead32, callback->orgHwRead32)(that, offset);
+	return regReadDone(flags, FunctionCast(wrapHwRead32, callback->orgHwRead32)(that, offset));
 }
 
 uint32_t CRDriver::wrapRead16(void *that, uint32_t offset) {
-	if (regAccess(RegRead, offset & ~3u, 16, 0))
+	int flags = regAccess(RegRead, offset & ~3u, 16, 0);
+	if (flags & RegBlocked)
 		return 0;
-	return FunctionCast(wrapRead16, callback->orgRead16)(that, offset);
+	return regReadDone(flags, FunctionCast(wrapRead16, callback->orgRead16)(that, offset));
 }
 
 uint32_t CRDriver::wrapRead8(void *that, uint32_t offset) {
-	if (regAccess(RegRead, offset & ~3u, 8, 0))
+	int flags = regAccess(RegRead, offset & ~3u, 8, 0);
+	if (flags & RegBlocked)
 		return 0;
-	return FunctionCast(wrapRead8, callback->orgRead8)(that, offset);
+	return regReadDone(flags, FunctionCast(wrapRead8, callback->orgRead8)(that, offset));
 }
 
 void CRDriver::wrapWrite16(void *that, uint32_t offset, uint32_t value) {
-	if (!regAccess(RegWrite, offset & ~3u, 16, value))
+	if (!(regAccess(RegWrite, offset & ~3u, 16, value) & RegBlocked))
 		FunctionCast(wrapWrite16, callback->orgWrite16)(that, offset, value);
 }
 
 void CRDriver::wrapWrite8(void *that, uint32_t offset, uint32_t value) {
-	if (!regAccess(RegWrite, offset & ~3u, 8, value))
+	if (!(regAccess(RegWrite, offset & ~3u, 8, value) & RegBlocked))
 		FunctionCast(wrapWrite8, callback->orgWrite8)(that, offset, value);
 }
 
 uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {
-	if (regAccess(RegRead, offset, 0, 0))
+	int flags = regAccess(RegRead, offset, 0, 0);
+	if (flags & RegBlocked)
 		return 0;
-	return FunctionCast(wrapRegRead32, callback->orgRegRead32)(that, offset);
+	return regReadDone(flags, FunctionCast(wrapRegRead32, callback->orgRegRead32)(that, offset));
 }
 
 void CRDriver::wrapRegWrite32(void *that, uint32_t offset, uint32_t value) {
-	if (!regAccess(RegWrite, offset, 0, value))
+	if (!(regAccess(RegWrite, offset, 0, value) & RegBlocked))
 		FunctionCast(wrapRegWrite32, callback->orgRegWrite32)(that, offset, value);
 }
 
 uint32_t CRDriver::wrapPcieRead32(void *that, uint32_t offset) {
-	regAccess(RegPcieRead, offset, 0, 0);
-	return FunctionCast(wrapPcieRead32, callback->orgPcieRead32)(that, offset);
+	int flags = regAccess(RegPcieRead, offset, 0, 0);
+	return regReadDone(flags, FunctionCast(wrapPcieRead32, callback->orgPcieRead32)(that, offset));
 }
 
 void CRDriver::wrapPcieWrite32(void *that, uint32_t offset, uint32_t value) {
@@ -1059,8 +1131,8 @@ void CRDriver::wrapPcieWrite32(void *that, uint32_t offset, uint32_t value) {
 }
 
 uint32_t CRDriver::wrapIndRead(void *that, uint32_t index, uint32_t data, uint32_t offset) {
-	regAccess(RegIndRead, offset, index, 0);
-	return FunctionCast(wrapIndRead, callback->orgIndRead)(that, index, data, offset);
+	int flags = regAccess(RegIndRead, offset, index, 0);
+	return regReadDone(flags, FunctionCast(wrapIndRead, callback->orgIndRead)(that, index, data, offset));
 }
 
 void CRDriver::wrapIndWrite(void *that, uint32_t index, uint32_t data, uint32_t offset, uint32_t value) {
