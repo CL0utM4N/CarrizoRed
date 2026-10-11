@@ -51,6 +51,17 @@ static const char *stageNames[MaxTraceStages];
 // Interrupt-handler (IH ring) activity, shown by the watcher.
 static uint32_t ihHandlerCalls, ihReadPointerWrites, ihLastReadPointer;
 
+// Register first-access log. Spoof boots 10-11 froze the whole machine ~20 s after AMD9500Controller::start returned,
+// with no traced function running: most likely a periodic task touching a register that hangs the APU (e.g. one in a
+// power-gated block). Every register offset is marked on first access; once the controller has been up for 2 s, each
+// *new* offset is printed immediately (when interrupts are enabled), so the last line before a freeze names it.
+// -crnoreglog disables this.
+enum RegOp : uint32_t { RegRead, RegWrite, RegPcieRead, RegPcieWrite, RegIndRead, RegIndWrite, RegOpCount };
+static const char *const regOpNames[RegOpCount] {"rd", "WR", "pcie-rd", "PCIE-WR", "ind-rd", "IND-WR"};
+static uint8_t regSeen[RegOpCount][0x10000 / 8];
+static uint64_t regLogFromMs;  // 0 = not yet (controller not started)
+static uint32_t regLogged;
+
 // IH storm breaker. IH registers are dword offsets in BAR5, the same on Tonga (oss_3_0) and CZ (oss_3_0_1).
 namespace IhReg {
 	static constexpr uint32_t RB_CNTL = 0xE30, RB_BASE = 0xE31, RB_RPTR = 0xE32, RB_WPTR = 0xE33, RB_WPTR_ADDR_HI = 0xE34,
@@ -670,6 +681,18 @@ IODeviceMemory *CRDriver::wrapGetApertureRange(void *that, int aperture) {
 }
 
 void CRDriver::traceSupport(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	if (!checkKernelArgument("-crnoreglog")) {
+		KernelPatcher::RouteRequest regRequests[] {
+			{"__ZN16ARegisterService15readIndirectRegEjjj", wrapIndRead, orgIndRead},
+			{"__ZN16ARegisterService16writeIndirectRegEjjjj", wrapIndWrite, orgIndWrite},
+		};
+		for (auto &request : regRequests) {
+			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+				SYSLOG("cr", "reglog: failed to route %s (error %d)", request.symbol, patcher.getError());
+				patcher.clearError();
+			}
+		}
+	}
 	if (checkKernelArgument("-crnotrace"))
 		return;
 	routeStages(patcher, index, slide, size, InSupport);
@@ -698,6 +721,10 @@ bool CRDriver::wrapAtiStart(IOService *that, IOService *provider) {
 	bool ret = FunctionCast(wrapAtiStart, callback->orgAtiStart)(that, provider);
 	IOLog("CarrizoRed: %s::start -> %s\n", that->getMetaClass()->getClassName(), ret ? "OK" : "FAILED");
 	traceNote("%s.start=%s ", that->getMetaClass()->getClassName(), ret ? "OK" : "FAILED");
+	if (ret && !regLogFromMs) {
+		regLogFromMs = uptimeMs() + 2000;
+		IOLog("CarrizoRed: logging registers first touched from now + 2 s\n");
+	}
 	return ret;
 }
 
@@ -741,9 +768,68 @@ void CRDriver::patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_add
 		}
 	}
 	stormBreak = !checkKernelArgument("-crnostormbreak");
+	if (!checkKernelArgument("-crnoreglog")) {
+		KernelPatcher::RouteRequest regRequests[] {
+			{"__ZN21BaffinRegisterService9readReg32Ej", wrapRegRead32, orgRegRead32},
+			{"__ZN21BaffinRegisterService10writeReg32Ejj", wrapRegWrite32, orgRegWrite32},
+			{"__ZN21BaffinRegisterService10readPCIe32Ej", wrapPcieRead32, orgPcieRead32},
+			{"__ZN21BaffinRegisterService11writePCIe32Ejj", wrapPcieWrite32, orgPcieWrite32},
+		};
+		for (auto &request : regRequests) {
+			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+				SYSLOG("cr", "reglog: failed to route %s (error %d)", request.symbol, patcher.getError());
+				patcher.clearError();
+			}
+		}
+	}
 	ihGetWptrWbAddress = patcher.solveSymbol(index, "__ZN22BaffinInterruptManager23getWPTRWriteBackAddressEv", slide, size);
 	ihIsUsingVram = patcher.solveSymbol(index, "__ZN22BaffinInterruptManager24isUsingVRAMForRingBufferEv", slide, size);
 	patcher.clearError();
+}
+
+static void regAccess(RegOp op, uint32_t offset, uint32_t extra, uint32_t value) {
+	uint32_t key = (op == RegRead || op == RegWrite ? offset >> 2 : offset ^ (extra << 4)) & 0xFFFF;
+	uint8_t bit = static_cast<uint8_t>(1u << (key & 7));
+	uint8_t old = __atomic_fetch_or(&regSeen[op][key >> 3], bit, __ATOMIC_RELAXED);
+	if (old & bit)
+		return;
+	uint64_t from = regLogFromMs;
+	if (!from || uptimeMs() < from || !ml_get_interrupts_enabled() || regLogged > 400)
+		return;
+	regLogged++;
+	IOLog("CarrizoRed: new reg %s 0x%x/0x%x = 0x%x\n", regOpNames[op], offset, extra, value);
+	IODelay(3000);
+}
+
+uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {
+	auto value = FunctionCast(wrapRegRead32, callback->orgRegRead32)(that, offset);
+	regAccess(RegRead, offset, 0, value);
+	return value;
+}
+
+void CRDriver::wrapRegWrite32(void *that, uint32_t offset, uint32_t value) {
+	regAccess(RegWrite, offset, 0, value);
+	FunctionCast(wrapRegWrite32, callback->orgRegWrite32)(that, offset, value);
+}
+
+uint32_t CRDriver::wrapPcieRead32(void *that, uint32_t offset) {
+	regAccess(RegPcieRead, offset, 0, 0);
+	return FunctionCast(wrapPcieRead32, callback->orgPcieRead32)(that, offset);
+}
+
+void CRDriver::wrapPcieWrite32(void *that, uint32_t offset, uint32_t value) {
+	regAccess(RegPcieWrite, offset, 0, value);
+	FunctionCast(wrapPcieWrite32, callback->orgPcieWrite32)(that, offset, value);
+}
+
+uint32_t CRDriver::wrapIndRead(void *that, uint32_t index, uint32_t data, uint32_t offset) {
+	regAccess(RegIndRead, offset, index, 0);
+	return FunctionCast(wrapIndRead, callback->orgIndRead)(that, index, data, offset);
+}
+
+void CRDriver::wrapIndWrite(void *that, uint32_t index, uint32_t data, uint32_t offset, uint32_t value) {
+	regAccess(RegIndWrite, offset, index, value);
+	FunctionCast(wrapIndWrite, callback->orgIndWrite)(that, index, data, offset, value);
 }
 
 void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
