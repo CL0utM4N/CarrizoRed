@@ -123,7 +123,8 @@ struct AtomCall {
 	uint8_t ok, done;
 	uint32_t in[4], out[2];
 };
-static constexpr uint32_t AtomRingSize = 24, AuxRingSize = 6, AtomAuxTable = 0x4E;
+static constexpr uint32_t AtomRingSize = 24, AuxRingSize = 6, AtomAuxTable = 0x4E, AtomTransmitterTable = 0x4C;
+static bool dpExtClkOff;  // -crnodpextclk, see wrapExecuteBiosCommandTable
 static AtomCall atomRing[AtomRingSize], auxRing[AuxRingSize];
 static uint32_t atomHead, auxHead, atomCalls, auxCalls, auxFailures;
 
@@ -1506,7 +1507,10 @@ void CRDriver::wrapExtConfigWrite32(IOPCIDevice *that, uint64_t offset, uint32_t
 
 // AGDP/AGDC → AMDSupport requests (thread context: user clients and the policy's work loop).
 void CRDriver::patchPolicy(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
-	if (!checkKernelArgument("-crnoatomlog")) {
+	// The command-table hook records VBIOS calls and carries the DP PHY clock-source fix; it stays installed unless
+	// both are switched off.
+	dpExtClkOff = checkKernelArgument("-crnodpextclk");
+	if (!checkKernelArgument("-crnoatomlog") || !dpExtClkOff) {
 		// Legacy atombios VBIOSes (GCN 1-4, Stoney included) run through AtiAtomBiosParserService (→ _ParseTable);
 		// AtiAtomFirmwareInterface is the atomfirmware (Vega+) path and saw no calls on boot 23.
 		KernelPatcher::RouteRequest request {"__ZN24AtiAtomBiosParserService23executeBiosCommandTableEjPvj",
@@ -1622,13 +1626,28 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	}
 	call->table = static_cast<uint16_t>(table);
 	call->done = 0;
+	// DP PHY clock source. DIG1TransmitterControl (table 0x4C) v1.5 parameters: usSymClock, ucPhyId, ucAction,
+	// ucLaneNum, ucConnObjId, ucDigMode (+6), asConfig (+7: [1:0] ucPhyClkSrcId, [2] coherent, [6:4] HPD), ... Apple sets
+	// ucPhyClkSrcId 0 (P1PLL) for DP. The APU VBIOS FirmwareInfo has usUniphyDPModeExtClkFreq = 100 MHz ("otherwise
+	// [non-zero] input clock from external spread clock"), and Linux DC on DCE 11.0 only drives DP from
+	// CLOCK_SOURCE_ID_EXTERNAL (dce110_resource.c), i.e. ucPhyClkSrcId = REFCLK_SRC_EXT >> 2 = 3. Spoof boot 24: with
+	// P1PLL the eDP link failed clock recovery at every voltage swing. Use the external reference for DP modes (0 SST,
+	// 5 MST). -crnodpextclk disables.
+	uint8_t patched = 0;
+	if (table == AtomTransmitterTable && params && !dpExtClkOff) {
+		auto *bytes = static_cast<uint8_t *>(params);
+		if ((bytes[6] == 0 || bytes[6] == 5) && (bytes[7] & 3) != 3) {
+			bytes[7] = static_cast<uint8_t>((bytes[7] & ~3) | 3);
+			patched = 0x80;
+		}
+	}
 	if (params)
 		memcpy(call->in, params, sizeof(call->in));
 	else
 		memset(call->in, 0, sizeof(call->in));
 	uint8_t ok = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that, table, params,
 		flag);
-	call->ok = ok & 1;
+	call->ok = static_cast<uint8_t>((ok & 1) | patched);
 	if (params)
 		memcpy(call->out, params, sizeof(call->out));
 	call->done = 1;

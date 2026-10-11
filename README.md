@@ -65,6 +65,7 @@ uploads them (plus a debug `Lilu.kext`) as a workflow artifact.
 | `-crnovramwrite` | Skip `ATIController::TestVRAM` entirely (no test patterns written into the carve-out) |
 | `-crnoints` | Skip `AtiFbInterruptManager::installInterruptsOnPciDevice` (no interrupt registered or enabled) |
 | `-crnofblimit` | Keep Apple's framebuffer count (6) instead of limiting it to the display pipes via `CFG_FB_LIMIT` |
+| `-crnodpextclk` | Don't switch the DP PHY clock source to the external reference in `DIG1TransmitterControl` |
 | `-crnolanecap` | Don't cap DP training lanes at the lane count the firmware used for the eDP link |
 | `-crnoatomlog` | Don't record VBIOS command-table calls (`executeBiosCommandTable`) for the black-box report |
 | `crpanicat=N` | Panic on purpose N s after the controller kext loads (proves the kernel is alive behind a static screen) |

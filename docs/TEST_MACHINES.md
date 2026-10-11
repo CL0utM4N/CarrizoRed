@@ -109,6 +109,15 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   (`DPTrainingSettingsCalculator::maxLinkLanes` = min(LinkCaps, sink MAX_LANE_COUNT), blind to board wiring), failed
   clock recovery and powered the panel off (sequencer target off, state 9). Fix: cap the lanes at the firmware's.
   The VBIOS hook saw nothing: legacy atombios runs through `AtiAtomBiosParserService::executeBiosCommandTable`.
+- **Spoof boot 24 (lane cap on, VBIOS calls recorded):** the cap worked (encoder and transmitter both get 1 lane,
+  2.7 Gbps, DIG0, PHY A, HPD1, eDP connector 0x14), training still failed. Correction to boot 23: the buffer
+  `doTrainingPattern1` fills is the lane *settings* Apple writes to DPCD 0x103 (swing stepped 0, 1, 2, then 7 = max),
+  not the sink's status, so clock recovery failed even at maximum swing: a physical-layer problem. The VBIOS
+  `Object_Header` confirms eDP is on UNIPHY enum 1 = PHY A (HDMI on PHY B), so the PHY is right. The PHY clock is not:
+  `DIG1TransmitterControl` v1.5 gets `ucPhyClkSrcId = 0` (P1PLL), but FirmwareInfo `usUniphyDPModeExtClkFreq` =
+  100 MHz ("non-zero: DP-mode Uniphy input clock from the external spread clock"), and Linux DC on DCE 11.0 only
+  drives DP from `CLOCK_SOURCE_ID_EXTERNAL` (`ucPhyClkSrcId` 3). CarrizoRed now patches the transmitter parameters in
+  DP modes to the external reference.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
