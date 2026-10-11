@@ -19,6 +19,41 @@
 #include <kern/debug.h>
 #include <stdarg.h>
 
+// Lilu's createTrampoline copies a wrapped function's first instructions verbatim ("assuming it is PIC") and jumps back
+// after them; nothing is relocated. When the wrapper is more than 2 GB away (kext addresses change every boot) the copy
+// covers at least 14 bytes, and a stack-protector prologue's `mov rax, [rip + __stack_chk_guard@GOT]` at +0xb then reads
+// from the wrong address. Spoof boot 19's panic (AAPL,PanicInfo): WindowServer opening a framebuffer ran
+// AMD9500Controller::hwInitializeHardwareSettings through such a trampoline, loaded "aryP12OS" as the guard pointer and
+// took a general-protection fault, which never reached the screen. ATIController::start and initializeProjectInfo have
+// the same prologue. Every wrapper with an original therefore goes through routeChecked, which refuses (and logs) any
+// function with a RIP-relative operand or a relative branch in its first 14 bytes, whatever the jump size.
+static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::RouteRequest &request,
+	mach_vm_address_t slide, size_t size) {
+	if (request.org) {
+		auto func = patcher.solveSymbol(index, request.symbol, slide, size);
+		if (!func) {
+			SYSLOG("cr", "route: %s not found (error %d)", request.symbol, patcher.getError());
+			return false;
+		}
+		for (size_t copied = 0; copied < 14;) {
+			hde64s hs {};
+			size_t len = Disassembler::hdeDisasm(func + copied, &hs);
+			if (!len || (hs.flags & F_ERROR)) {
+				SYSLOG("cr", "route: REFUSED %s: cannot decode +0x%lx", request.symbol, copied);
+				return false;
+			}
+			bool ripRelative = (hs.flags & F_MODRM) && hs.modrm_mod == 0 && hs.modrm_rm == 5;
+			if (ripRelative || (hs.flags & F_RELATIVE)) {
+				SYSLOG("cr", "route: REFUSED %s: %s instruction at +0x%lx would be copied unrelocated", request.symbol,
+					ripRelative ? "RIP-relative" : "relative-branch", copied);
+				return false;
+			}
+			copied += len;
+		}
+	}
+	return patcher.routeMultiple(index, &request, 1, slide, size);
+}
+
 // Short summary of the bring-up trace, repeated by the watcher so it survives the console scrolling.
 static char traceSummary[1024];
 
@@ -292,7 +327,7 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 			if (checkKernelArgument("-crnoagdp")) {
 				KernelPatcher::RouteRequest request {"__ZN32AppleGraphicsDeviceControlClient5startEP9IOService",
 					wrapStartFail};
-				if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+				if (!routeChecked(patcher, index, request, slide, size)) {
 					SYSLOG("cr", "-crnoagdp: failed to route (error %d)", patcher.getError());
 					patcher.clearError();
 				}
@@ -332,7 +367,7 @@ void CRDriver::patchPolarisController(KernelPatcher &patcher, size_t index, mach
 
 	if (!checkKernelArgument("-crnodiglimit")) {
 		KernelPatcher::RouteRequest request {"__ZN22BaffinSharedController11getDigLimitEv", wrapGetDigLimit};
-		if (patcher.routeMultiple(index, &request, 1, slide, size)) {
+		if (routeChecked(patcher, index, request, slide, size)) {
 			SYSLOG("cr", "AMD9500Controller limited to %u DIGs", DisplayDigs);
 		} else {
 			SYSLOG("cr", "failed to route getDigLimit (error %d)", patcher.getError());
@@ -343,7 +378,7 @@ void CRDriver::patchPolarisController(KernelPatcher &patcher, size_t index, mach
 	// See patchPlls.
 	KernelPatcher::RouteRequest request {"__ZN17AMD9500Controller21hwSetCrtcToPixelClockEhhR11ClockParams",
 		wrapSetCrtcToPixelClock, orgSetCrtcToPixelClock};
-	if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+	if (!routeChecked(patcher, index, request, slide, size)) {
 		SYSLOG("cr", "failed to route hwSetCrtcToPixelClock (error %d)", patcher.getError());
 		patcher.clearError();
 	}
@@ -370,14 +405,14 @@ void CRDriver::patchPlls(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		KernelPatcher::RouteRequest request {
 			"__ZN21AtiPllAssignerFactory17createPllAssignerEP13ATIControllerPP12ATIConnectorhh",
 			wrapCreatePllAssigner, orgCreatePllAssigner};
-		if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+		if (!routeChecked(patcher, index, request, slide, size)) {
 			SYSLOG("cr", "failed to route createPllAssigner (error %d)", patcher.getError());
 			patcher.clearError();
 		}
 	}
 	KernelPatcher::RouteRequest request {"__ZN13AtomBiosProxy13setPixelClockEP11ClockParamsPK19ActiveConnectorInfo",
 		wrapSetPixelClock, orgSetPixelClock};
-	if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+	if (!routeChecked(patcher, index, request, slide, size)) {
 		SYSLOG("cr", "failed to route AtomBiosProxy::setPixelClock (error %d)", patcher.getError());
 		patcher.clearError();
 	}
@@ -639,7 +674,7 @@ void CRDriver::patchSupport(KernelPatcher &patcher, size_t index, mach_vm_addres
 	{
 		KernelPatcher::RouteRequest request {"__ZN13ATIController17getConfigPropertyEPKcPvj", wrapGetConfigProperty,
 			orgGetConfigProperty};
-		if (patcher.routeMultiple(index, &request, 1, slide, size)) {
+		if (routeChecked(patcher, index, request, slide, size)) {
 			SYSLOG("cr", "aty_config overrides active");
 		} else {
 			SYSLOG("cr", "failed to route ATIController::getConfigProperty (error %d)", patcher.getError());
@@ -653,7 +688,7 @@ void CRDriver::patchSupport(KernelPatcher &patcher, size_t index, mach_vm_addres
 	// -crnovramtest disables this.
 	if (!checkKernelArgument("-crnovramtest")) {
 		KernelPatcher::RouteRequest request {"__ZN13ATIController8TestVRAME13PCI_REG_INDEXb", wrapTestVram, orgTestVram};
-		if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+		if (!routeChecked(patcher, index, request, slide, size)) {
 			SYSLOG("cr", "failed to route ATIController::TestVRAM (error %d)", patcher.getError());
 			patcher.clearError();
 		}
@@ -827,7 +862,7 @@ namespace {
 			if (stages[i].kext != kext)
 				continue;
 			KernelPatcher::RouteRequest request {stages[i].symbol, wrappers[i], stages[i].org};
-			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+			if (!routeChecked(patcher, index, request, slide, size)) {
 				SYSLOG("cr", "trace: failed to route %s (error %d)", stages[i].name, patcher.getError());
 				patcher.clearError();
 			}
@@ -847,7 +882,7 @@ void CRDriver::traceFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_ad
 	routeStages(patcher, index, slide, size, InFramebuffer);
 	KernelPatcher::RouteRequest request {"__ZN14AMDFramebuffer16getApertureRangeEi", wrapGetApertureRange,
 		orgGetApertureRange};
-	if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+	if (!routeChecked(patcher, index, request, slide, size)) {
 		SYSLOG("cr", "trace: failed to route getApertureRange (error %d)", patcher.getError());
 		patcher.clearError();
 	}
@@ -876,7 +911,7 @@ void CRDriver::traceSupport(KernelPatcher &patcher, size_t index, mach_vm_addres
 			{"__ZN16ARegisterService16writeIndirectRegEjjjj", wrapIndWrite, orgIndWrite},
 		};
 		for (auto &request : regRequests) {
-			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+			if (!routeChecked(patcher, index, request, slide, size)) {
 				SYSLOG("cr", "reglog: failed to route %s (error %d)", request.symbol, patcher.getError());
 				patcher.clearError();
 			}
@@ -893,7 +928,7 @@ void CRDriver::traceSupport(KernelPatcher &patcher, size_t index, mach_vm_addres
 		{"__ZN13ATIController5startEP9IOService", wrapAtiStart, orgAtiStart},
 	};
 	for (auto &request : requests) {
-		if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+		if (!routeChecked(patcher, index, request, slide, size)) {
 			SYSLOG("cr", "trace: failed to route %s (error %d)", request.symbol, patcher.getError());
 			patcher.clearError();
 		}
@@ -917,6 +952,12 @@ IOService *CRDriver::wrapAtiProbe(IOService *that, IOService *provider, SInt32 *
 	auto *ret = FunctionCast(wrapAtiProbe, callback->orgAtiProbe)(that, provider, score);
 	IOLog("CarrizoRed: %s::probe -> %s\n", that->getMetaClass()->getClassName(), ret ? "match" : "NO MATCH");
 	traceNote("%s.probe=%s ", that->getMetaClass()->getClassName(), ret ? "match" : "NO");
+	// ATIController::start can't be wrapped safely (see routeChecked), so the first-touch register log opens a fixed
+	// time after a successful probe instead of 2 s after start returns (start takes about 1 s).
+	if (ret && !regLogFromMs) {
+		regLogFromMs = uptimeMs() + 5000;
+		IOLog("CarrizoRed: logging registers first touched from probe + 5 s\n");
+	}
 	return ret;
 }
 
@@ -944,7 +985,7 @@ void CRDriver::blockProbe(KernelPatcher &patcher, size_t index, mach_vm_address_
 	if (!checkKernelArgument(arg))
 		return;
 	KernelPatcher::RouteRequest request {probe, wrapProbeNoMatch};
-	if (patcher.routeMultiple(index, &request, 1, slide, size)) {
+	if (routeChecked(patcher, index, request, slide, size)) {
 		SYSLOG("cr", "%s: %s will not match", arg, probe);
 	} else {
 		SYSLOG("cr", "%s: failed to route %s (error %d)", arg, probe, patcher.getError());
@@ -998,7 +1039,7 @@ void CRDriver::patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_add
 		{"__ZN22BaffinInterruptManager16setRBReadPointerEj", wrapIhSetReadPointer, orgIhSetReadPointer},
 	};
 	for (auto &request : requests) {
-		if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+		if (!routeChecked(patcher, index, request, slide, size)) {
 			SYSLOG("cr", "interrupts: failed to route %s (error %d)", request.symbol, patcher.getError());
 			patcher.clearError();
 		}
@@ -1017,7 +1058,7 @@ void CRDriver::patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_add
 			{"__ZN21BaffinRegisterService9writeReg8Ejh", wrapWrite8, orgWrite8},
 		};
 		for (auto &request : regRequests) {
-			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+			if (!routeChecked(patcher, index, request, slide, size)) {
 				SYSLOG("cr", "reglog: failed to route %s (error %d)", request.symbol, patcher.getError());
 				patcher.clearError();
 			}
@@ -1030,7 +1071,7 @@ void CRDriver::patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_add
 			{"__ZN21BaffinRegisterService13writePCIReg32Ejj", wrapWritePCIReg32, orgWritePCIReg32},
 		};
 		for (auto &request : pciRequests) {
-			if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+			if (!routeChecked(patcher, index, request, slide, size)) {
 				SYSLOG("cr", "pci: failed to route %s (error %d)", request.symbol, patcher.getError());
 				patcher.clearError();
 			}
@@ -1284,7 +1325,7 @@ void CRDriver::patchPci(KernelPatcher &patcher, size_t index, mach_vm_address_t 
 	};
 	size_t routed = 0;
 	for (auto &request : requests) {
-		if (patcher.routeMultiple(index, &request, 1, slide, size)) {
+		if (routeChecked(patcher, index, request, slide, size)) {
 			routed++;
 		} else {
 			SYSLOG("cr", "pci: failed to route %s (error %d)", request.symbol, patcher.getError());
@@ -1394,7 +1435,7 @@ void CRDriver::patchPolicy(KernelPatcher &patcher, size_t index, mach_vm_address
 	{
 		KernelPatcher::RouteRequest request {"__ZN21AtiFbInterruptManager28installInterruptsOnPciDeviceEv",
 			wrapInstallInterrupts, orgInstallInterrupts};
-		if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+		if (!routeChecked(patcher, index, request, slide, size)) {
 			SYSLOG("cr", "failed to route installInterruptsOnPciDevice (error %d)", patcher.getError());
 			patcher.clearError();
 		}
@@ -1408,7 +1449,7 @@ void CRDriver::patchPolicy(KernelPatcher &patcher, size_t index, mach_vm_address
 			wrapWranglerAttribute, orgWranglerAttribute},
 	};
 	for (auto &request : requests) {
-		if (!patcher.routeMultiple(index, &request, 1, slide, size)) {
+		if (!routeChecked(patcher, index, request, slide, size)) {
 			SYSLOG("cr", "policy: failed to route %s (error %d)", request.symbol, patcher.getError());
 			patcher.clearError();
 		}

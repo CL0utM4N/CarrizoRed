@@ -77,6 +77,16 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   up by a registry path that doesn't resolve; now uses `IOService::getPlatform()`.
 - The `shared_region … vm_shared_region_start_address() failed` and launchd `error = 37` lines in verbose recovery
   are noise; processes keep running.
+- **Spoof boots 5–19 (2026-10-10/11), the "freeze ~20 s after start-up": it was a kernel panic caused by CarrizoRed's
+  own tracing, invisible on screen.** `AAPL,PanicInfo` from boot 19 (NVRAM dump via OpenShell `dmpstore`): general
+  protection fault in `AMD9500Controller::hwInitializeHardwareSettings + 0x12`, in WindowServer, under
+  `IOFramebuffer::open → AMDFramebuffer::enableController → initializeHardware`. Lilu's `createTrampoline` copies a
+  wrapped function's prologue without relocating it; with a 14-byte jump the copy includes the stack-protector load
+  `mov rax, [rip + guard@GOT]` at +0xb, which then reads the wrong address (`RAX` = "aryP12OS"). `ATIController::start`
+  and `initializeProjectInfo` have the same prologue; whether a boot crashed depended on kext load addresses. CarrizoRed
+  now refuses to wrap any function with a RIP-relative operand or relative branch in its first 14 bytes
+  (`routeChecked`). Lessons: read `AAPL,PanicInfo` before theorising about a "freeze"; the verbose console isn't
+  redrawn after a panic once WindowServer has taken the screen.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
