@@ -113,7 +113,7 @@ static void printRegEvent(const RegEvent &event, const char *suffix);
 // Power-management / config-space events on the iGPU (see patchPci).
 static uint32_t pmEvents, pciConfigWrites;
 
-// Every VBIOS command table Apple runs (AtiAtomFirmwareInterface::executeBiosCommandTable): table index, the first 16
+// Every VBIOS command table Apple runs (AtiAtomBiosParserService::executeBiosCommandTable): table index, the first 16
 // parameter bytes going in, the result and the first 8 bytes coming back. Spoof boot 22: eDP link training failed at
 // clock recovery although the firmware trained the same panel at boot, so what Apple passes the encoder / transmitter
 // tables (DIGxEncoderControl 1.4, DIG1TransmitterControl 1.5 on Stoney) is the next thing to see. AUX transactions
@@ -1507,10 +1507,28 @@ void CRDriver::wrapExtConfigWrite32(IOPCIDevice *that, uint64_t offset, uint32_t
 // AGDP/AGDC → AMDSupport requests (thread context: user clients and the policy's work loop).
 void CRDriver::patchPolicy(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	if (!checkKernelArgument("-crnoatomlog")) {
-		KernelPatcher::RouteRequest request {"__ZN24AtiAtomFirmwareInterface23executeBiosCommandTableEjPvj",
+		// Legacy atombios VBIOSes (GCN 1-4, Stoney included) run through AtiAtomBiosParserService (→ _ParseTable);
+		// AtiAtomFirmwareInterface is the atomfirmware (Vega+) path and saw no calls on boot 23.
+		KernelPatcher::RouteRequest request {"__ZN24AtiAtomBiosParserService23executeBiosCommandTableEjPvj",
 			wrapExecuteBiosCommandTable, orgExecuteBiosCommandTable};
 		if (!routeChecked(patcher, index, request, slide, size)) {
 			SYSLOG("cr", "failed to route executeBiosCommandTable (error %d)", patcher.getError());
+			patcher.clearError();
+		}
+	}
+	if (!checkKernelArgument("-crnolanecap")) {
+		KernelPatcher::RouteRequest request {"__ZNK28DPTrainingSettingsCalculator12maxLinkLanesEv", wrapMaxLinkLanes,
+			orgMaxLinkLanes};
+		if (!routeChecked(patcher, index, request, slide, size)) {
+			SYSLOG("cr", "failed to route maxLinkLanes (error %d)", patcher.getError());
+			patcher.clearError();
+		}
+	}
+	{
+		KernelPatcher::RouteRequest request {"__ZNK28DPTrainingSettingsCalculator11maxLinkRateEv", wrapMaxLinkRate,
+			orgMaxLinkRate};
+		if (!routeChecked(patcher, index, request, slide, size)) {
+			SYSLOG("cr", "failed to route maxLinkRate (error %d)", patcher.getError());
 			patcher.clearError();
 		}
 	}
@@ -1617,6 +1635,27 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	if (aux && !(ok & 1))
 		__atomic_fetch_add(&auxFailures, 1, __ATOMIC_RELAXED);
 	return ok;
+}
+
+// DP lane count. DPTrainingSettingsCalculator::maxLinkLanes() = min(LinkCaps lanes, sink DPCD MAX_LANE_COUNT), with no
+// knowledge of how many lanes the board wires to the eDP panel. Spoof boot 23: the firmware drove the panel on DIG0/DP0
+// with DP_CONFIG.DP_UDI_LANES = 0 (one lane); Apple's training reported lane 0 fully locked (DPCD 0x202 = 0x07) and
+// lane 1 dead, i.e. it trained more than one lane, failed clock recovery and powered the panel off. Cap the lane count
+// at what the firmware used for the link it left running (bootDpLanes, from initDisplayRegs). -crnolanecap disables.
+static uint8_t bootDpLanes;  // 0 = no DP link was running at boot
+
+uint8_t CRDriver::wrapMaxLinkLanes(const void *that) {
+	uint8_t lanes = FunctionCast(wrapMaxLinkLanes, callback->orgMaxLinkLanes)(that);
+	uint8_t capped = bootDpLanes && lanes > bootDpLanes ? bootDpLanes : lanes;
+	traceEvent("dp.maxLinkLanes apple<<8|used", true, (static_cast<uint32_t>(lanes) << 8) | capped);
+	return capped;
+}
+
+// Logged only: the link rate Apple trains at (DPCD units, 0x06 = 1.62, 0x0A = 2.7, 0x14 = 5.4 Gbps).
+uint8_t CRDriver::wrapMaxLinkRate(const void *that) {
+	uint8_t rate = FunctionCast(wrapMaxLinkRate, callback->orgMaxLinkRate)(that);
+	traceEvent("dp.maxLinkRate", true, rate);
+	return rate;
 }
 
 static uint64_t peekValue(const uint64_t *value) { return value ? *value : 0; }
@@ -1856,6 +1895,17 @@ void CRDriver::initDisplayRegs() {
 		reg.bootValue = reg.value;
 		reg.bootValid = true;
 	}
+	// The DP link the firmware left running (video stream enabled) and its lane count (DP_CONFIG.DP_UDI_LANES:
+	// 0 = 1, 1 = 2, 3 = 4 lanes); see wrapMaxLinkLanes.
+	for (uint32_t dp = 0; dp < 3; dp++) {
+		uint32_t stream = gpuMmio[0x4AA4 + 0x100 * dp], config = gpuMmio[0x4AA3 + 0x100 * dp];
+		if (stream & 1) {
+			uint32_t udi = config & 3;
+			bootDpLanes = udi == 0 ? 1 : udi == 1 ? 2 : 4;
+			SYSLOG("cr", "boot: DP%u link running, %u lane(s) (DP_CONFIG 0x%x)", dp, bootDpLanes, config);
+			break;
+		}
+	}
 	for (uint32_t pipe = 0; pipe < pipes && pipe < MaxWatchedPipes; pipe++)
 		SYSLOG("cr", "boot: PIPE%u_PG_STATUS 0x%08X", pipe, gpuMmio[Reg::PIPE0_PG_STATUS + 3 * pipe]);
 	for (size_t i = 0; i < watchedRegCount; i++) {
@@ -1887,6 +1937,7 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		if (n > 0)
 			len += static_cast<size_t>(n) < sizeof(report) - len ? static_cast<size_t>(n) : sizeof(report) - len - 1;
 	};
+	add("boot DP lanes %u (lane cap %s)\n", bootDpLanes, checkKernelArgument("-crnolanecap") ? "off" : "on");
 	add("t=%us regs %u ih %u missing-pipe %u pm %u cfgwr %u\n", t, __atomic_load_n(&regAccesses, __ATOMIC_RELAXED),
 		__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), __atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED),
 		__atomic_load_n(&pmEvents, __ATOMIC_RELAXED), __atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));

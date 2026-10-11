@@ -103,6 +103,12 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   trained the same panel at boot, so the encoder/transmitter parameters Apple passes Stoney's VBIOS
   (DIGxEncoderControl 1.4, DIG1TransmitterControl 1.5) are the suspect. Next report: every VBIOS command with its
   parameters, register values now vs at boot, and the training lane status.
+- **Spoof boot 23:** firmware vs Apple: at boot the firmware ran the panel on **DIG0 → DP0 with one lane**
+  (`DP_CONFIG.DP_UDI_LANES = 0`), link trained, stream on, panel power sequencer on. Apple's training status
+  `DPCD 0x202 = 0x07`: lane 0 fully locked, lane 1 dead, so Apple trained more than one lane
+  (`DPTrainingSettingsCalculator::maxLinkLanes` = min(LinkCaps, sink MAX_LANE_COUNT), blind to board wiring), failed
+  clock recovery and powered the panel off (sequencer target off, state 9). Fix: cap the lanes at the firmware's.
+  The VBIOS hook saw nothing: legacy atombios runs through `AtiAtomBiosParserService::executeBiosCommandTable`.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).

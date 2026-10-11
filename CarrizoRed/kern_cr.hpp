@@ -101,6 +101,9 @@ private:
 	static IOReturn wrapInstallInterrupts(void *that);
 	static uint8_t wrapExecuteBiosCommandTable(void *that, uint32_t table, void *params, uint32_t flag);
 	mach_vm_address_t orgExecuteBiosCommandTable {0};
+	static uint8_t wrapMaxLinkLanes(const void *that);
+	static uint8_t wrapMaxLinkRate(const void *that);
+	mach_vm_address_t orgMaxLinkLanes {0}, orgMaxLinkRate {0};
 	mach_vm_address_t orgInstallInterrupts {0};
 	static void wrapWritePCIReg8(void *that, uint32_t offset, uint8_t value);
 	static void wrapWritePCIReg16(void *that, uint32_t offset, uint16_t value);
