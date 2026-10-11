@@ -752,6 +752,18 @@ uint64_t CRDriver::wrapGetConfigProperty(void *that, const char *name, void *val
 				ret = 1;
 		}
 	}
+	// CFG_FB_LIMIT caps the framebuffer count ATIController::start uses (otherwise 6). Each framebuffer index is also a
+	// CRTC index (cleanUpConnections → setDisplayEnabled → AMD9500Controller::shutDownDisplayHardware(index)), but with
+	// the pipe limit only CRTCs 0..pipes-1 have timing generators: spoof boot 20 panicked "SiDisplay.cpp:1119 Assertion
+	// failed: NULL != timingGenerator" for CRTC 2 when WindowServer opened a framebuffer. Limit framebuffers to the pipe
+	// count too (-crnofblimit leaves Apple's value).
+	if (!strcmp(name, "CFG_FB_LIMIT") && !checkKernelArgument("-crnofblimit") && !checkKernelArgument("-crnopipes")) {
+		memset(value, 0, size);
+		*static_cast<uint8_t *>(value) = displayPipes(callback->family);
+		traceEvent("CFG_FB_LIMIT", true, displayPipes(callback->family));
+		if (!ret)
+			ret = 1;
+	}
 	return ret;
 }
 
