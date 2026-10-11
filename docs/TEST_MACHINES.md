@@ -87,6 +87,13 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   now refuses to wrap any function with a RIP-relative operand or relative branch in its first 14 bytes
   (`routeChecked`). Lessons: read `AAPL,PanicInfo` before theorising about a "freeze"; the verbose console isn't
   redrawn after a panic once WindowServer has taken the screen.
+- **Spoof boot 20:** Apple's own assertion `SiDisplay.cpp:1119 NULL != timingGenerator` in
+  `AMD9500Controller::shutDownDisplayHardware(2)` via `ATIController::cleanUpConnections`: 6 framebuffers but timing
+  generators only for the 2 real pipes. Fixed by forcing `aty_config` `CFG_FB_LIMIT` to the pipe count.
+- **Spoof boot 21:** panel went **black**, no panic in NVRAM. IOFramebuffer wrote `AAPL,PathProperties0000`
+  `saved-config` for `PciRoot(0x0)/Pci(0x1,0x0)`: **1366×768, 76.30 MHz** (the panel's EDID mode). So the controller
+  found the panel and set a mode; the picture is what's wrong. Next: `crpanicat=60` black-box report (registers,
+  trace, framebuffer tree in the NVRAM panic text).
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).

@@ -593,11 +593,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				__atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));
 
 		if (panicAt && t >= panicAt)
-			panic("CarrizoRed: deliberate panic at t=%us (crpanicat): the kernel was still running. regs %u ih %u "
-			      "missing-pipe %u pm %u cfgwr %u; trace: %s",
-				t, __atomic_load_n(&regAccesses, __ATOMIC_RELAXED), __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED),
-				__atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED), __atomic_load_n(&pmEvents, __ATOMIC_RELAXED),
-				__atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED), traceSummary);
+			self->panicReport(t, now);
 
 		// Watchdog: a traced call that never returns (a hard hang with this CPU still alive) becomes a panic that
 		// names it and stays on screen (debug=0x100). -crnowatchdog disables this.
@@ -1725,6 +1721,51 @@ void CRDriver::initDisplayRegs() {
 		else
 			SYSLOG("cr", "boot: p%d %s 0x%X = 0x%08X", reg.pipe, reg.name, reg.offset, reg.value);
 	}
+}
+
+// crpanicat=N black-box report. Spoof boot 21 went to a black panel with no panic in NVRAM, after IOFramebuffer saved a
+// 1366x768 / 76.30 MHz "saved-config", i.e. Apple's controller set a mode. With the screen black, the panic text in
+// NVRAM (AAPL,PanicInfo, read with OpenShell dmpstore) is the only way out: counters, the iGPU tree (framebuffers,
+// connectors, mode), the current display/clock registers, the trace summary and the last trace events (setPixelClock,
+// setCrtcToPixelClock, framebuffer calls). Register values are read fresh (pipes only when powered).
+void CRDriver::panicReport(uint32_t t, const char *tree) {
+	static char report[4096];
+	size_t len = 0;
+	auto add = [&](const char *fmt, ...) {
+		if (len + 1 >= sizeof(report))
+			return;
+		va_list va;
+		va_start(va, fmt);
+		int n = vsnprintf(report + len, sizeof(report) - len, fmt, va);
+		va_end(va);
+		if (n > 0)
+			len += static_cast<size_t>(n) < sizeof(report) - len ? static_cast<size_t>(n) : sizeof(report) - len - 1;
+	};
+	add("t=%us regs %u ih %u missing-pipe %u pm %u cfgwr %u\n", t, __atomic_load_n(&regAccesses, __ATOMIC_RELAXED),
+		__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), __atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED),
+		__atomic_load_n(&pmEvents, __ATOMIC_RELAXED), __atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));
+	add("tree:\n%s", tree ? tree : "");
+	if (gpuMmio) {
+		add("regs:");
+		bool powered[MaxWatchedPipes] {};
+		for (uint32_t pipe = 0; pipe < MaxWatchedPipes && pipe < displayPipes(family); pipe++)
+			powered[pipe] = pipePowered(pipe);
+		for (size_t i = 0; i < watchedRegCount; i++) {
+			auto &reg = watchedRegs[i];
+			if (reg.pipe >= 0 && !powered[reg.pipe])
+				continue;
+			add(" %x=%x", reg.offset, gpuMmio[reg.offset]);
+		}
+		add("\n");
+	}
+	add("trace: %s\nlast events:", traceSummary);
+	uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
+	for (uint32_t i = head > 24 ? head - 24 : 0; i != head; i++) {
+		auto &event = traceRing[i % TraceRingSize];
+		if (event.name)
+			add(" %s%s=%x", event.exit ? "" : ">", event.name, event.value);
+	}
+	panic("CarrizoRed: deliberate panic (crpanicat), the kernel was still running.\n%s", report);
 }
 
 void CRDriver::checkDisplayRegs(uint32_t t) {

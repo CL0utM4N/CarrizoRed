@@ -114,6 +114,7 @@ private:
 	void probeMMIO();
 	void initDisplayRegs();
 	void checkDisplayRegs(uint32_t t);
+	void panicReport(uint32_t t, const char *tree);
 	void disableKextCallbacks();
 
 	IOPCIDevice *iGPU {nullptr};
