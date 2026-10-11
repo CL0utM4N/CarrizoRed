@@ -776,6 +776,7 @@ namespace {
 		bool summary;  // note the result in the repeated trace summary (start-up stages)
 		bool sync;     // thread context only: also print on entry and pause, so an instant hard hang still shows it
 		mach_vm_address_t org;
+		uint8_t arg {0};  // argument recorded in the entry event: 0 none, 1 b, 2 c, 3 b | c << 8, 4 c | d << 8
 	};
 
 	TracedStage stages[] {
@@ -831,6 +832,24 @@ namespace {
 		{"__ZN13ATIController15setDisplayStateEP20IOACPIPlatformDevicej", "setDisplayState(acpi)", InSupport, true, true, 0},
 		{"__ZN13ATIController20initializeMUXControlEv", "initializeMUXControl", InSupport, true, true, 0},
 		{"__ZN13ATIController14setAppleRGBMUXEb", "setAppleRGBMUX", InSupport, true, true, 0},
+		// eDP bring-up (spoof boot 21/22: CRTC 0 enabled on the DP DTO with DISPOUT_FIFO_ERROR, panel black). Entry
+		// events record the action / crtc / power argument. DisplayPortUtilities::trainLink and fastTrainLink can't be
+		// wrapped (stack-protector prologue, see routeChecked), so their steps are traced instead.
+		{"__ZN20DisplayPortUtilities18prepareForTrainingEh", "dp.prepareForTraining", InSupport, false, false, 0, 1},
+		{"__ZN20DisplayPortUtilities18doTrainingPattern1EP19ActiveConnectorInfohPh", "dp.trainingPattern1", InSupport, false, false, 0, 2},
+		{"__ZN20DisplayPortUtilities18doTrainingPattern2EP19ActiveConnectorInfohPh", "dp.trainingPattern2", InSupport, false, false, 0, 2},
+		{"__ZN20DisplayPortUtilities13isLinkTrainedEv", "dp.isLinkTrained", InSupport, false, false, 0},
+		{"__ZN12ATIConnector18linkTrainingFailedEv", "dp.linkTrainingFailed", InSupport, true, false, 0},
+		{"__ZN20DisplayPortUtilities13setPanelPowerEh", "dp.setPanelPower", InSupport, false, false, 0, 1},
+		{"__ZN13ATIController24turnOnInternalPanelPowerEP11CRTC_PARAMSb", "turnOnInternalPanelPower", InSupport, false, false, 0, 2},
+		{"__ZN13AtomBiosProxy25digitalTransmitterControlEPK19ActiveConnectorInfo24AtiAtomTransmitterAction", "atom.transmitter", InSupport, false, false, 0, 2},
+		{"__ZN13AtomBiosProxy21digitalEncoderControlEPK19ActiveConnectorInfo20AtiAtomEncoderAction", "atom.encoder", InSupport, false, false, 0, 2},
+		{"__ZN13AtomBiosProxy10enableCrtcEhb", "atom.enableCrtc", InSupport, false, false, 0, 3},
+		{"__ZN13AtomBiosProxy15setDisplayClockEhj", "atom.setDisplayClock", InSupport, false, false, 0, 2},
+		{"__ZN13AtomBiosProxy16selectCrtcSourceEPK19ActiveConnectorInfo", "atom.selectCrtcSource", InSupport, false, false, 0},
+		{"__ZN27BaffinDisplayPortConnection13eDPPanelPowerEb", "eDPPanelPower", InController, false, false, 0, 1},
+		{"__ZN27BaffinBiosDigitalConnection12setBacklightEh", "setBacklight", InController, false, false, 0, 1},
+		{"__ZN17AMD9500Controller11turnOnDigonEb", "turnOnDigon", InController, false, false, 0, 1},
 	};
 
 	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
@@ -842,7 +861,15 @@ namespace {
 		stageNames[N] = stages[N].name;
 		stageEnterMs[N] = uptimeMs();
 		__atomic_fetch_add(&stageOpen[N], 1, __ATOMIC_RELAXED);
-		traceEvent(stages[N].name, false, 0);
+		uint64_t ab = reinterpret_cast<uint64_t>(b), ac = reinterpret_cast<uint64_t>(c), ad = reinterpret_cast<uint64_t>(d);
+		uint32_t arg = 0;
+		switch (stages[N].arg) {
+			case 1: arg = static_cast<uint32_t>(ab); break;
+			case 2: arg = static_cast<uint32_t>(ac); break;
+			case 3: arg = static_cast<uint32_t>((ab & 0xFF) | (ac & 0xFF) << 8); break;
+			case 4: arg = static_cast<uint32_t>((ac & 0xFF) | (ad & 0xFF) << 8); break;
+		}
+		traceEvent(stages[N].name, false, arg);
 		if (stages[N].sync) {
 			IOLog("CarrizoRed: => %s\n", stages[N].name);
 			IOSleep(30);
@@ -857,14 +884,16 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 46, "one wrapper per stage");
+		static_assert(arrsize(stages) == 61, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
 			CR_WRAP(16), CR_WRAP(17), CR_WRAP(18), CR_WRAP(19), CR_WRAP(20), CR_WRAP(21), CR_WRAP(22), CR_WRAP(23),
 			CR_WRAP(24), CR_WRAP(25), CR_WRAP(26), CR_WRAP(27), CR_WRAP(28), CR_WRAP(29), CR_WRAP(30), CR_WRAP(31),
 			CR_WRAP(32), CR_WRAP(33), CR_WRAP(34), CR_WRAP(35), CR_WRAP(36), CR_WRAP(37), CR_WRAP(38), CR_WRAP(39),
-			CR_WRAP(40), CR_WRAP(41), CR_WRAP(42), CR_WRAP(43), CR_WRAP(44), CR_WRAP(45),
+			CR_WRAP(40), CR_WRAP(41), CR_WRAP(42), CR_WRAP(43), CR_WRAP(44), CR_WRAP(45), CR_WRAP(46), CR_WRAP(47),
+			CR_WRAP(48), CR_WRAP(49), CR_WRAP(50), CR_WRAP(51), CR_WRAP(52), CR_WRAP(53), CR_WRAP(54), CR_WRAP(55),
+			CR_WRAP(56), CR_WRAP(57), CR_WRAP(58), CR_WRAP(59), CR_WRAP(60),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -1659,6 +1688,43 @@ namespace {
 		{"PHYPLL_PIXCLK_CNTL", Reg::PHYPLL_PIXCLK_CNTL},
 		{"CRTC0_PIXEL_RATE_CNTL", Reg::CRTC0_PIXEL_RATE_CNTL},
 		{"CRTC1_PIXEL_RATE_CNTL", Reg::CRTC0_PIXEL_RATE_CNTL + 4},
+		// Pixel clock from the DP DTO (eDP): phase / modulo = pixel clock / DPREFCLK; DPREFCLK from DENTIST.
+		{"DP_DTO0_PHASE", 0x141},
+		{"DP_DTO0_MODULO", 0x142},
+		{"DP_DTO1_PHASE", 0x145},
+		{"DP_DTO1_MODULO", 0x146},
+		{"DPREFCLK_CNTL", 0x118},
+		{"DENTIST_DISPCLK_CNTL", 0x124},
+		{"DISPCLK_FREQ_CHANGE_CNTL", 0x131},
+		{"DCCG_DISP_CNTL_REG", 0x13F},
+		// Encoders / DP link (DIG0-2, DP0-2).
+		{"DIG0_DIG_FE_CNTL", 0x4A00},
+		{"DIG0_DIG_BE_CNTL", 0x4A47},
+		{"DP0_DP_LINK_CNTL", 0x4AA0},
+		{"DP0_DP_CONFIG", 0x4AA3},
+		{"DP0_DP_VID_STREAM_CNTL", 0x4AA4},
+		{"DP0_DP_LINK_FRAMING_CNTL", 0x4AAB},
+		{"DP0_DP_DPHY_CNTL", 0x4AAF},
+		{"DIG1_DIG_FE_CNTL", 0x4B00},
+		{"DIG1_DIG_BE_CNTL", 0x4B47},
+		{"DP1_DP_LINK_CNTL", 0x4BA0},
+		{"DP1_DP_CONFIG", 0x4BA3},
+		{"DP1_DP_VID_STREAM_CNTL", 0x4BA4},
+		{"DP1_DP_LINK_FRAMING_CNTL", 0x4BAB},
+		{"DP1_DP_DPHY_CNTL", 0x4BAF},
+		{"DIG2_DIG_FE_CNTL", 0x4C00},
+		{"DIG2_DIG_BE_CNTL", 0x4C47},
+		{"DP2_DP_LINK_CNTL", 0x4CA0},
+		{"DP2_DP_CONFIG", 0x4CA3},
+		{"DP2_DP_VID_STREAM_CNTL", 0x4CA4},
+		{"DP2_DP_DPHY_CNTL", 0x4CAF},
+		// Panel power sequencer, backlight PWM, HPD.
+		{"LVTMA_PWRSEQ_CNTL", 0x481B},
+		{"LVTMA_PWRSEQ_STATE", 0x481C},
+		{"BL_PWM_CNTL", 0x4820},
+		{"BL_PWM_CNTL2", 0x4821},
+		{"BL_PWM_PERIOD_CNTL", 0x4822},
+		{"DC_GPIO_HPD_A", 0x488D},
 	};
 
 	const WatchedRegDef pipeRegDefs[] {
@@ -1675,6 +1741,10 @@ namespace {
 		{"DPG_PIPE_NB_PSTATE_CHANGE_CONTROL", Reg::DPG_PIPE_NB_PSTATE_CHANGE_CONTROL},
 		{"DPG_PIPE_STUTTER_CONTROL_NONLPTCH", Reg::DPG_PIPE_STUTTER_CONTROL_NONLPTCH},
 		{"CRTC_CONTROL", Reg::CRTC_CONTROL},
+		{"CRTC_H_TOTAL", 0x1B80},
+		{"CRTC_V_TOTAL", 0x1B87},
+		{"CRTC_BLANK_CONTROL", 0x1B9D},
+		{"CRTC_STATUS", 0x1BA3},
 	};
 
 	constexpr size_t MaxWatchedPipes = 3;
@@ -1758,12 +1828,27 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		}
 		add("\n");
 	}
+	// Is CRTC 0 running? Position and frame count, 20 ms (more than one frame) apart.
+	if (gpuMmio && pipePowered(0)) {
+		uint32_t pos1 = gpuMmio[0x1BA4], frame1 = gpuMmio[0x1BA6];
+		IODelay(20000);
+		uint32_t pos2 = gpuMmio[0x1BA4], frame2 = gpuMmio[0x1BA6];
+		add("crtc0 position %x -> %x, frame %x -> %x\n", pos1, pos2, frame1, frame2);
+	}
 	add("trace: %s\nlast events:", traceSummary);
+	// Newest 40 events, oldest first, without the repetitive attribute and vblank-wait calls.
 	uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
-	for (uint32_t i = head > 24 ? head - 24 : 0; i != head; i++) {
+	uint32_t picked[40], count = 0;
+	for (uint32_t i = head; i != 0 && head - i < TraceRingSize && count < 40;) {
+		i--;
 		auto &event = traceRing[i % TraceRingSize];
-		if (event.name)
-			add(" %s%s=%x", event.exit ? "" : ">", event.name, event.value);
+		if (!event.name || !strncmp(event.name, "fb.setAttribute", 15) || !strncmp(event.name, "tg.wait", 7))
+			continue;
+		picked[count++] = i;
+	}
+	while (count) {
+		auto &event = traceRing[picked[--count] % TraceRingSize];
+		add(" %s%s=%x", event.exit ? "" : ">", event.name, event.value);
 	}
 	panic("CarrizoRed: deliberate panic (crpanicat), the kernel was still running.\n%s", report);
 }
