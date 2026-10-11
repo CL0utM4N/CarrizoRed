@@ -487,6 +487,14 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 	bool print = !checkKernelArgument("-crnowatch");
 	bool watchdog = !checkKernelArgument("-crnowatchdog");
 	bool controllerRequested = checkKernelArgument("-crnoloadctl");
+	// crpanicat=N: panic on purpose at t=N s. Every "freeze" so far happened as the GUI session started (IOConsoleUsers,
+	// hidd), which is also when the kernel's verbose console stops drawing and WindowServer takes the screen; with only
+	// display-less AMD framebuffers, nothing would replace the last console image, and our heartbeat (printed through
+	// that console) would vanish too. A panic screen (debug=0x100) and the panic text in NVRAM prove the kernel was
+	// still running; no panic means a real hang.
+	uint32_t panicAt = 0;
+	if (!PE_parse_boot_argn("crpanicat", &panicAt, sizeof(panicAt)))
+		panicAt = 0;
 	uint32_t printed = 0;
 	last[0] = '\0';
 	// Tick every 500 ms for 30 minutes.
@@ -548,6 +556,13 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				__atomic_load_n(&regAccesses, __ATOMIC_RELAXED), __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED),
 				__atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED), __atomic_load_n(&pmEvents, __ATOMIC_RELAXED),
 				__atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));
+
+		if (panicAt && t >= panicAt)
+			panic("CarrizoRed: deliberate panic at t=%us (crpanicat): the kernel was still running. regs %u ih %u "
+			      "missing-pipe %u pm %u cfgwr %u; trace: %s",
+				t, __atomic_load_n(&regAccesses, __ATOMIC_RELAXED), __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED),
+				__atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED), __atomic_load_n(&pmEvents, __ATOMIC_RELAXED),
+				__atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED), traceSummary);
 
 		// Watchdog: a traced call that never returns (a hard hang with this CPU still alive) becomes a panic that
 		// names it and stays on screen (debug=0x100). -crnowatchdog disables this.

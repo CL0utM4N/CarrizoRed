@@ -64,6 +64,7 @@ uploads them (plus a debug `Lilu.kext`) as a workflow artifact.
 | `-crnoctl` | Keep `AMD9500Controller` from matching (spoof, wrangler, AMDSupport and AGDP still load) |
 | `-crnovramwrite` | Skip `ATIController::TestVRAM` entirely (no test patterns written into the carve-out) |
 | `-crnoints` | Skip `AtiFbInterruptManager::installInterruptsOnPciDevice` (no interrupt registered or enabled) |
+| `crpanicat=N` | Panic on purpose N s after the controller kext loads (proves the kernel is alive behind a static screen) |
 | `-crmacgpu` | Neutralise AGDP's board-id config lookup; set `built-in`, `AAPL,slot-name` and `model` on the iGPU |
 
 ## Layout
