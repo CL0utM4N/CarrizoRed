@@ -204,6 +204,9 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   and no accelerator patch ran. The graphics policy now sets `LoadController` by itself, so CarrizoRed's request
   (which also set `LoadHWServices` / `LoadAccelerator`) was skipped. The acceleration request is now separate and made
   once `AMD9500Controller` is attached.
+- **Second `usb-spoof-accel` boot (nvram28): still no accelerator,** and no trace of the request either. The black box
+  now records which acceleration kexts load (`kext:X4000/HWServices/HWLibs`), the request (or that `LoadAccelerator`
+  was already set), both `probe()` calls, and the iGPU's `Load*` properties.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).

@@ -398,6 +398,9 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 			continue;
 		SYSLOG("cr", "%s loaded: slide 0x%llX size 0x%lX", kexts[i].id, static_cast<uint64_t>(slide),
 			static_cast<unsigned long>(size));
+		// The acceleration kexts load late (IOKit matching), if at all: note it, for the black box.
+		if (i == KextRadeonX4000 || i == KextRadeonX4000HWServices || i == KextRadeonX4000HWLibs)
+			traceNote("kext:%s ", i == KextRadeonX4000 ? "X4000" : i == KextRadeonX4000HWServices ? "HWServices" : "HWLibs");
 		if (i == KextPolarisController)
 		{
 			patchPolarisController(patcher, index, slide, size);
@@ -745,13 +748,14 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		static bool accelRequested;
 		if (!accelRequested && strstr(now, "AMD9500Controller (")) {
 			accelRequested = true;
-			if (!checkKernelArgument("-crnoaccel") && !self->iGPU->getProperty("LoadAccelerator")) {
+			bool already = self->iGPU->getProperty("LoadAccelerator") != nullptr;
+			if (!checkKernelArgument("-crnoaccel") && !already) {
 				self->iGPU->setProperty("LoadHWServices", true);
 				self->iGPU->setProperty("LoadAccelerator", true);
 				self->iGPU->registerService();
 				IOLog("CarrizoRed: t=%us set LoadHWServices + LoadAccelerator on the iGPU and re-registered it\n", t);
-				traceNote("LoadAccelerator@%us ", t);
 			}
+			traceNote("LoadAccelerator@%us%s ", t, already ? "(already)" : "");
 		}
 
 		// Every 15 s, or when the tree changes: launchd keeps scrolling the console once the GUI starts.
@@ -977,6 +981,8 @@ namespace {
 		// Acceleration (Phase 3): HWServices loads the HWLibs plug-in (CAIL, which has its own Stoney support: device
 		// table row 0x98E4 -> STONEY_A0, Cail_Stoney_InitFunctionPointer), then the AMDRadeonX4000 accelerator brings up
 		// the AMDBaffinHardware interface, its engines (PM4 = GFX/compute, sDMA, UVD, VCE, SAMU) and GPU VM.
+		{"__ZN42AMDRadeonX4000_AMDRadeonHWServicesAbstract5probeEP9IOServicePi", "hws.probe", InHWServices, true, true, 0},
+		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator5probeEP9IOServicePi", "accel.probe", InAccel, true, true, 0},
 		{"__ZN42AMDRadeonX4000_AMDRadeonHWServicesAbstract5startEP9IOService", "hws.start", InHWServices, true, true, 0},
 		{"__ZN38AMDRadeonX4000_AMDRadeonHWServicesCAIL19createCailInterfaceEP11IOPCIDevice", "hws.createCailInterface", InHWServices, true, true, 0},
 		{"__ZN42AMDRadeonX4000_AMDRadeonHWServicesAbstract24createPowerPlayInterfaceEP18PowerPlayCallbacks", "hws.createPowerPlay", InHWServices, true, true, 0},
@@ -1042,7 +1048,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 88, "one wrapper per stage");
+		static_assert(arrsize(stages) == 90, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -1055,6 +1061,7 @@ namespace {
 			CR_WRAP(64), CR_WRAP(65), CR_WRAP(66), CR_WRAP(67), CR_WRAP(68), CR_WRAP(69), CR_WRAP(70), CR_WRAP(71),
 			CR_WRAP(72), CR_WRAP(73), CR_WRAP(74), CR_WRAP(75), CR_WRAP(76), CR_WRAP(77), CR_WRAP(78), CR_WRAP(79),
 			CR_WRAP(80), CR_WRAP(81), CR_WRAP(82), CR_WRAP(83), CR_WRAP(84), CR_WRAP(85), CR_WRAP(86), CR_WRAP(87),
+			CR_WRAP(88), CR_WRAP(89),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -2630,6 +2637,12 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 	add("assr: DPCD 0x00D cap 0x%02x, 0x10A before Apple 0x%02x, %u writes%s, readback 0x%02x\n", assrCap, assrBoot,
 		assrWrites, assrOff ? " (off)" : "", assrReadback);
 	if (!checkKernelArgument("-crnoaccel")) {
+		auto flag = [&](const char *name) {
+			auto *value = OSDynamicCast(OSBoolean, iGPU->getProperty(name));
+			return value ? (value->isTrue() ? "1" : "0") : "-";
+		};
+		add("iGPU Load* props: AMDSupport %s Controller %s HWServices %s Accelerator %s\n", flag("LoadAMDSupport"),
+			flag("LoadController"), flag("LoadHWServices"), flag("LoadAccelerator"));
 		add("accel: sDMA1 dropped %u, sDMA0-only starts %u, caps fixed %u (CUs %u); vm fix %s FB %llx-%llx carve-out "
 			"%llx: %u converted (%u MC, %u offset, %u other)",
 			accelSdma1Dropped, accelStartPatched, accelCapsFixed, accelCapsCu, vmFixOn ? "on" : "off", vmFbStart,
