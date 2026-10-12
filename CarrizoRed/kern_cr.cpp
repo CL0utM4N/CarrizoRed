@@ -323,6 +323,7 @@ namespace {
 	IOFilterInterruptEventSource *xhciSources[4];
 	uint32_t xhciSourceCount, xhciForwards, xhciPolls;
 	IOPCIDevice *xhciDevice;
+	uint32_t xhciMode = 2;  // crxhcimode=1: signal only when USBSTS.EINT is set; 2: on every poll
 
 	void xhciPublish(const char *what) {
 		if (!xhciDevice)
@@ -424,19 +425,27 @@ namespace {
 			uint32_t usbsts = (cap & 0xFF) + 4;
 			uint32_t sts = r32(usbsts);
 			uint32_t polls = __atomic_add_fetch(&xhciPolls, 1, __ATOMIC_RELAXED);
-			if (sts != ~0u && (sts & 8)) {  // EINT
+			// Mode 2 (default): signal on every poll. XHCIProbe 0.5.3 with mode 1 (signal only when EINT is set) showed
+			// the IO interrupter completing 1-4 batches per 2 s and EINT set just as rarely, i.e. the controller raises
+			// no new interrupt (and so no EINT) until something it is waiting for happens, which only the 2 s fallback
+			// timer appeared to provide. AppleUSBXHCI::interruptOccurred returns quickly when the rings are empty.
+			bool eint = sts != ~0u && (sts & 8);
+			if (eint)
 				*reinterpret_cast<volatile uint32_t *>(base + usbsts) = 8;
+			if (eint || xhciMode >= 2) {
 				for (uint32_t i = 0; i < xhciSourceCount; i++)
 					xhciSources[i]->signalInterrupt();
 				__atomic_fetch_add(&xhciForwards, 1, __ATOMIC_RELAXED);
 			}
 			if (polls % 1000 == 1)
-				xhciPublish("running");
+				xhciPublish(xhciMode >= 2 ? "running, mode 2 (every poll)" : "running, mode 1 (on EINT)");
 			IOSleep(1);
 		}
 	}
 
 	void xhciStartForwarding() {
+		if (!PE_parse_boot_argn("crxhcimode", &xhciMode, sizeof(xhciMode)) || !xhciMode)
+			xhciMode = 2;
 		thread_t thread;
 		if (kernel_thread_start(xhciForwardThread, nullptr, &thread) == KERN_SUCCESS)
 			thread_deallocate(thread);

@@ -256,3 +256,6 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   starts before Lilu's patcher. The forwarder now finds the source after the fact: a thread waits for
   `AppleUSBXHCIPCI` on `1022:7914`, walks its work loop's event chain inside the gate and takes the
   `IOFilterInterruptEventSource` whose provider is the controller.
+- **Forwarder running (mode 1, on EINT): no faster.** XHCIProbe 0.5.3: interrupter batches `ev 1/1/0`..`2/4/0` per
+  2 s (primary/IO/isochronous), EINT set as rarely, forwards ~0.5/s. The controller flags new events only every 1-2 s
+  even when handled immediately. Mode 2 signals AppleUSBXHCI on every poll (~2.6 ms) regardless of EINT.
