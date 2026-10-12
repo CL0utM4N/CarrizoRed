@@ -231,3 +231,11 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   another machine; (2) xHCI link power management / suspend: compare a USB 2.0 port (EHCI, no U1/U2); (3) lost
   interrupts (driver falls back to timeouts): `usb-spoof-xhciprobe` (XHCIProbe 0.3 with `-xhciprobe_noact`) prints
   `XHCIProbe: irq … msi msix … IP x/y EINT x/y events n` every 2 s.
+- Apple's side (AppleUSBXHCIPCI, 15.8.1 KDK): `1022:7914` gets the generic `AppleUSBXHCIPCI` class (the only AMD class
+  matches `1002:73a4/73a6`). `start()` walks the provider's interrupt indexes and takes the first message-signalled
+  one (MSI or MSI-X) for an `IOFilterInterruptEventSource`; no vendor quirks for this controller. It supports runtime
+  D3 (`RTD3 capable`, `inhibitD3Timer`, boot-arg `usb-no-rtd3`, property `DisableD3Hot`) and USB 3 LPM
+  (`getLPMExitLatencyGated`, `updateLPMPolicy`). XHCIProbe 0.4 (`usb-spoof-xhciprobe`) reports, every 2 s, the
+  interrupt target and pending-interrupt share, IMOD, host errors, the controller's D-state, and per connected port
+  the U0/U1/U2/U3/Recovery shares, drop-offs and U1/U2 timeouts.
+- The USB 2.0 Type-A ports are on XHC0 (PRT7/PRT8), not EHCI; see `docs/opencore/USBMap.md`.
