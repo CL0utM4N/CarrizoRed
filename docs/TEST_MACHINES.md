@@ -259,3 +259,8 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
 - **Forwarder running (mode 1, on EINT): no faster.** XHCIProbe 0.5.3: interrupter batches `ev 1/1/0`..`2/4/0` per
   2 s (primary/IO/isochronous), EINT set as rarely, forwards ~0.5/s. The controller flags new events only every 1-2 s
   even when handled immediately. Mode 2 signals AppleUSBXHCI on every poll (~2.6 ms) regardless of EINT.
+- **Mode 2 works (2026-10-13): USB at normal speed.** With AppleUSBXHCI signalled on every poll the full installer
+  got through `validate_root_image` quickly. So the controller does complete transfers promptly; its events simply
+  never raise an interrupt macOS sees, and the EINT-only forwarder missed most of them. Root cause still open (likely
+  the controller not re-asserting after the first event: EHB / IMAN handling on this FCH); the workaround costs a
+  work-loop wake-up every ~2.5 ms. To do: move the forwarder out of CarrizoRed into its own Lilu plugin.
