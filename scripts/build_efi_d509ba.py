@@ -9,6 +9,7 @@ Build an OpenCore EFI for the ASUS VivoBook 15 D509BA (A9-9425, Stoney Ridge) te
     unpacked/<Kext>-<ver>-RELEASE/          Lilu, VirtualSMC, ECEnabler, VoodooPS2Controller, RestrictEvents, NVMeFix,
                                             VoodooI2C (release zip: VoodooI2C.kext + VoodooI2CHID.kext)
     downloads/AMD_Vanilla-patches.plist     github.com/AMD-OSX/AMD_Vanilla patches.plist
+    downloads/HfsPlus.efi                   github.com/acidanthera/OcBinaryData Drivers/HfsPlus.efi
     acpi/SSDT-*.aml                         compiled from docs/opencore/SSDT-*.dsl (see SSDTS)
 and receives:
     usb/EFI/...                             copy usb/ (EFI + com.apple.recovery.boot) to a FAT32 USB stick
@@ -67,7 +68,10 @@ XHCIPROBE_KEXT = ("XHCIProbe/XHCIProbe.kext", "XHCIProbe", "Diagnostic: log/atte
 # Optional (--carrizored): the CarrizoRed kext from CI (CarrizoRed-*-Release.zip), unpacked to unpacked/CarrizoRed/.
 CARRIZORED_KEXT = ("CarrizoRed/CarrizoRed.kext", "CarrizoRed", "CarrizoRed (Lilu plugin, iGPU)")
 
-DRIVERS = ["OpenRuntime.efi", "OpenHfsPlus.efi", "ResetNvramEntry.efi"]
+# HfsPlus.efi (Apple's HFS+ driver, from github.com/acidanthera/OcBinaryData Drivers/, in downloads/) instead of
+# OpenCore's OpenHfsPlus.efi, which is much slower: booting the full installer's HFS+ partition, the firmware took 112 s
+# to load BootKernelExtensions.kc (2026-10-10). Drivers not in OpenCore's release come from downloads/.
+DRIVERS = ["OpenRuntime.efi", "HfsPlus.efi", "ResetNvramEntry.efi"]
 
 SSDTS = {  # compiled from docs/opencore/<name>.dsl into <work dir>/acpi/
     "SSDT-EC-USBX-LAPTOP.aml": "Fake EC + USBX (laptop, real EC0 under SBRG)",
@@ -160,7 +164,12 @@ def main():
     for ssdt in ssdts:
         shutil.copy2(ssdt, ocdir / "ACPI")
     for d in DRIVERS:
-        shutil.copy2(oc / "X64" / "EFI" / "OC" / "Drivers" / d, ocdir / "Drivers")
+        src = oc / "X64" / "EFI" / "OC" / "Drivers" / d
+        if not src.exists():
+            src = work / "downloads" / d
+            if not src.exists():
+                die(f"{d} missing: put it in {work / 'downloads'}")
+        shutil.copy2(src, ocdir / "Drivers")
     shutil.copy2(oc / "X64" / "EFI" / "OC" / "Tools" / "OpenShell.efi", ocdir / "Tools")
 
     cfg = plistlib.load(open(oc / "Docs" / "Sample.plist", "rb"))
