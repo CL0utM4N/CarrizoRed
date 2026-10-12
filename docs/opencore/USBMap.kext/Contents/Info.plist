@@ -79,7 +79,7 @@
 					<key>PRT1</key>
 					<dict>
 						<key>Comment</key>
-						<string>Blue USB-A, USB 2 side (_PLD group 5)</string>
+						<string>Blue USB-A, USB 3 side (_PLD group 5)</string>
 						<key>UsbConnector</key>
 						<integer>3</integer>
 						<key>name</key>
@@ -92,7 +92,7 @@
 					<key>PRT2</key>
 					<dict>
 						<key>Comment</key>
-						<string>USB-C, USB 2 side (_PLD group 6)</string>
+						<string>USB-C, USB 3 side (_PLD group 6)</string>
 						<key>UsbConnector</key>
 						<integer>9</integer>
 						<key>name</key>
@@ -105,7 +105,7 @@
 					<key>PRT5</key>
 					<dict>
 						<key>Comment</key>
-						<string>Blue USB-A, USB 3 side (_PLD group 5)</string>
+						<string>Blue USB-A, USB 2 side (_PLD group 5)</string>
 						<key>UsbConnector</key>
 						<integer>3</integer>
 						<key>name</key>
@@ -118,7 +118,7 @@
 					<key>PRT6</key>
 					<dict>
 						<key>Comment</key>
-						<string>USB-C, USB 3 side (_PLD group 6)</string>
+						<string>USB-C, USB 2 side (_PLD group 6)</string>
 						<key>UsbConnector</key>
 						<integer>9</integer>
 						<key>name</key>
