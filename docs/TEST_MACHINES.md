@@ -195,6 +195,10 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   `PCI0._INI`) clears only `XHCD` under Darwin, so XHC0's `_S0W`/`_PS0`/`_PS3` act as under Windows 7. Windows 8+ also
   makes the AMD I2C (touchpad bus), GPIO and UART devices present and routes the brightness Fn keys as ACPI
   `Notify (VGA.LCD, 0x86/0x87)`. Previous (Windows 7) EFI kept as `efi-d509ba/usb-spoof-win7`.
+- **Windows 10 mode tested:** boots from the USB stick and the USB mouse works, so clearing `XHCD` alone keeps the
+  xHCI alive. The mouse still disconnects and reconnects now and then (seen in the verbose log). Touchpad: the EFI now
+  injects VoodooI2C 2.9.1 (AMD `AMD0010` I2C and `AMD0030` GPIO support) with VoodooI2CHID for the ELAN
+  HID-over-I2C touchpad (`\_SB.I2CD.ETPD`, address 0x15, GPIO interrupt).
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).

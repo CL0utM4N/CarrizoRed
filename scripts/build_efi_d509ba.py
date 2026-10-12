@@ -6,7 +6,8 @@ Build an OpenCore EFI for the ASUS VivoBook 15 D509BA (A9-9425, Stoney Ridge) te
 
 <work dir> must contain:
     unpacked/OpenCore-<ver>-RELEASE/        OpenCorePkg release zip, extracted
-    unpacked/<Kext>-<ver>-RELEASE/          Lilu, VirtualSMC, ECEnabler, VoodooPS2Controller, RestrictEvents, NVMeFix
+    unpacked/<Kext>-<ver>-RELEASE/          Lilu, VirtualSMC, ECEnabler, VoodooPS2Controller, RestrictEvents, NVMeFix,
+                                            VoodooI2C (release zip: VoodooI2C.kext + VoodooI2CHID.kext)
     downloads/AMD_Vanilla-patches.plist     github.com/AMD-OSX/AMD_Vanilla patches.plist
     acpi/SSDT-*.aml                         compiled from docs/opencore/SSDT-*.dsl (see SSDTS)
 and receives:
@@ -17,7 +18,7 @@ so rebuilding keeps the same identity. They never go into the repository.
 
 Choices follow the Dortania OpenCore Install Guide for AMD Family 15h/16h, adjusted from the machine's own data
 (docs/TEST_MACHINES.md): AMI UEFI 2.7 *without* a Memory Attributes Table, no Above-4G option, 2 CPU cores, real EC
-named EC0 under \\_SB.PCI0.SBRG, PS/2 keyboard, I2C trackpad (not supported here), Qualcomm Wi-Fi (no macOS driver).
+named EC0 under \\_SB.PCI0.SBRG, PS/2 keyboard, ELAN I2C trackpad (VoodooI2C), Qualcomm Wi-Fi (no macOS driver).
 """
 
 import plistlib
@@ -47,6 +48,14 @@ KEXTS = [  # (bundle path inside its release folder, executable, comment)
      "PS/2 keyboard"),
     ("RestrictEvents-*/RestrictEvents.kext", "RestrictEvents", "CPU name, misc. fixes"),
     ("NVMeFix-*/NVMeFix.kext", "NVMeFix", "NVMe power management"),
+    # ELAN HID-over-I2C touchpad (\_SB.I2CD.ETPD, PNP0C50 at 0x15) on the FCH I2C controller AMD0010, interrupt through
+    # the AMD0030 GPIO controller. VoodooI2C 2.9+ matches both AMD IDs. They only report present with the firmware in
+    # Windows 8+ mode (SSDT-XOSI). Dependencies first: VoodooGPIO, VoodooI2CServices, VoodooInput, VoodooI2C, HID.
+    ("VoodooI2C-*/VoodooI2C.kext/Contents/PlugIns/VoodooGPIO.kext", "VoodooGPIO", "GPIO (AMD0030) for I2C interrupts"),
+    ("VoodooI2C-*/VoodooI2C.kext/Contents/PlugIns/VoodooI2CServices.kext", "VoodooI2CServices", "VoodooI2C services"),
+    ("VoodooI2C-*/VoodooI2C.kext/Contents/PlugIns/VoodooInput.kext", "VoodooInput", "Trackpad input (Magic Trackpad)"),
+    ("VoodooI2C-*/VoodooI2C.kext", "VoodooI2C", "I2C controller (AMD0010)"),
+    ("VoodooI2C-*/VoodooI2CHID.kext", "VoodooI2CHID", "HID-over-I2C touchpad (ELAN)"),
 ]
 
 # Optional (--gux): GenericUSBXHCI "RyzenXHCIFix" (github.com/RattletraPM/GUX-RyzenXHCIFix, unpacked to unpacked/GUX/).
