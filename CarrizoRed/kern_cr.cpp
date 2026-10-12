@@ -1367,6 +1367,14 @@ void CRDriver::wrapIndWrite(void *that, uint32_t index, uint32_t data, uint32_t 
 
 static uint32_t ihEnableCalls, ihLastEnable = 0xFF;  // BaffinInterruptManager::setHardwareEnabled, for the black box
 
+// IH interrupt enable. BaffinInterruptManager::setHardwareEnabled() enables the ring the Tonga (oss 3.0) way:
+// IH_RB_CNTL.RB_ENABLE (bit 0) and IH_RB_CNTL.ENABLE_INTR (bit 17). Carrizo/Stoney's IH (oss 3.0.1, Linux cz_ih) has
+// ENABLE_INTR in IH_CNTL bit 0 instead, and needs IH_CNTL.RPTR_REARM (bit 4) for MSI so that each read-pointer write
+// re-arms the message; bit 17 of IH_RB_CNTL does nothing. Spoof boot 36: the IH wrote 2316 entries into the ring
+// (WPTR 0x90C0, write-back agreeing) with IH_CNTL = 0x01080000, and the handler was never called. Mirror Apple's enable
+// state into IH_CNTL after it runs. -crnoihfix disables.
+static constexpr uint32_t IhCntlEnableIntr = 0x1, IhCntlRptrRearm = 0x10;
+
 void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
 	bool off = enable && checkKernelArgument("-crnoih");
 	ihEnableCalls++;
@@ -1374,6 +1382,15 @@ void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
 	ihManager = that;
 	traceEvent(off ? "IH enable (forced off by -crnoih)" : enable ? "IH enable" : "IH disable", true, enable);
 	FunctionCast(wrapIhSetHardwareEnabled, callback->orgIhSetHardwareEnabled)(that, enable && !off);
+	if (gpuMmio && !checkKernelArgument("-crnoihfix")) {
+		uint32_t cntl = gpuMmio[IhReg::CNTL];
+		if (enable && !off)
+			cntl |= IhCntlEnableIntr | IhCntlRptrRearm;
+		else
+			cntl &= ~IhCntlEnableIntr;
+		gpuMmio[IhReg::CNTL] = cntl;
+		traceEvent("IH_CNTL (CZ enable)", true, cntl);
+	}
 }
 
 // Storm breaker: more than 500 handler calls within 100 ms means the IH keeps re-raising an interrupt the driver

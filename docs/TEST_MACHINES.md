@@ -178,6 +178,13 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   again just before training fixes the picture. Interrupt handler calls: 0, so WindowServer's vblank waits never
   complete. Next: the black box records the whole interrupt path (CRTC source, DISP_INTERRUPT_STATUS, IH ring and
   pointers, BIF INTERRUPT_CNTL, MSI).
+- **Spoof boot 36 (ASSR only, `crpanicat=60`):** white (light-grey) recovery background again, so the ASSR re-enable alone
+  fixes the picture; `-crrestore` is not needed.
+- **Spoof boot 37 (irq report):** white screen with the normal cursor, frozen. The IH works: ring enabled, 2316 entries
+  written (WPTR 0x90C0, write-back agreeing, RPTR 0), MSI enabled (address 0xFEE10000, data 0x4072, INTx disabled).
+  But `IH_CNTL` = 0x01080000: `ENABLE_INTR` off, so the IH never signals. Apple's `setHardwareEnabled` sets
+  `ENABLE_INTR` in `IH_RB_CNTL` bit 17 (Tonga layout); CZ keeps it in `IH_CNTL` bit 0 and needs `RPTR_REARM` (bit 4)
+  for MSI (Linux `cz_ih` vs `tonga_ih`). CarrizoRed now mirrors the enable into `IH_CNTL` (`-crnoihfix` disables).
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
