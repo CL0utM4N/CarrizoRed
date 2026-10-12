@@ -1365,8 +1365,13 @@ void CRDriver::wrapIndWrite(void *that, uint32_t index, uint32_t data, uint32_t 
 	FunctionCast(wrapIndWrite, callback->orgIndWrite)(that, index, data, offset, value);
 }
 
+static uint32_t ihEnableCalls, ihLastEnable = 0xFF;  // BaffinInterruptManager::setHardwareEnabled, for the black box
+
 void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
 	bool off = enable && checkKernelArgument("-crnoih");
+	ihEnableCalls++;
+	ihLastEnable = enable && !off;
+	ihManager = that;
 	traceEvent(off ? "IH enable (forced off by -crnoih)" : enable ? "IH enable" : "IH disable", true, enable);
 	FunctionCast(wrapIhSetHardwareEnabled, callback->orgIhSetHardwareEnabled)(that, enable && !off);
 }
@@ -2340,6 +2345,48 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 			restoreWrites, restoreHolds);
 	add("assr: DPCD 0x00D cap 0x%02x, 0x10A before Apple 0x%02x, %u writes%s, readback 0x%02x\n", assrCap, assrBoot,
 		assrWrites, assrOff ? " (off)" : "", assrReadback);
+	if (gpuMmio) {
+		// Interrupt path, end to end (spoof boot 35: picture right, beach ball frozen, handler never called). Display
+		// sources (CRTC0 V_UPDATE enable / status, DISP_INTERRUPT_STATUS..CONTINUE2) -> IH (ring, pointers, write-back,
+		// CNTL / STATUS) -> BIF (INTERRUPT_CNTL / CNTL2) -> MSI in config space -> BaffinInterruptManager::handler.
+		auto *m = gpuMmio;
+		add("irq: IH enable calls %u last %u; RB_CNTL %x BASE %x RPTR %x WPTR %x WPTR_ADDR %x:%x CNTL %x STATUS %x
+",
+			ihEnableCalls, ihLastEnable, m[IhReg::RB_CNTL], m[IhReg::RB_BASE], m[IhReg::RB_RPTR], m[IhReg::RB_WPTR],
+			m[IhReg::RB_WPTR_ADDR_HI], m[IhReg::RB_WPTR_ADDR_LO], m[IhReg::CNTL], m[IhReg::STATUS]);
+		uint32_t wb = 0xFFFFFFFF;
+		uint64_t ringGpu = 0;
+		bool vram = false;
+		if (auto *manager = static_cast<uint8_t *>(ihManager)) {
+			ringGpu = *reinterpret_cast<uint64_t *>(manager + 0x48);
+			if (ihGetWptrWbAddress)
+				if (auto *p = reinterpret_cast<volatile uint32_t *(*)(void *)>(ihGetWptrWbAddress)(manager))
+					wb = *p;
+			if (ihIsUsingVram)
+				vram = reinterpret_cast<bool (*)(void *)>(ihIsUsingVram)(manager);
+		}
+		add(" wb %x ring gpu %llx %s; BIF INTERRUPT_CNTL %x CNTL2 %x; DISP_INT %x %x %x; CRTC0 INT_CTL %x VUPD_STAT %x "
+			"VINT0 %x
+",
+			wb, ringGpu, vram ? "vram" : "sysmem", m[0x151A], m[0x151B], m[0x1857], m[0x1858], m[0x1859], m[0x1BB4],
+			m[0x1BC4], m[0x1BCF]);
+		if (auto *gpu = iGPU) {
+			uint16_t command = gpu->configRead16(0x04), status = gpu->configRead16(0x06);
+			uint8_t cap = gpu->configRead8(0x34) & 0xFC;
+			for (int guard = 0; cap && guard < 48; guard++) {
+				if (gpu->configRead8(cap) == 0x05) {
+					uint16_t control = gpu->configRead16(cap + 2);
+					bool wide = control & 0x80;
+					add(" pci cmd %x status %x; msi control %x address %x%08x data %x
+", command, status, control,
+						wide ? gpu->configRead32(cap + 8) : 0, gpu->configRead32(cap + 4),
+						gpu->configRead16(cap + (wide ? 12 : 8)));
+					break;
+				}
+				cap = gpu->configRead8(cap + 1) & 0xFC;
+			}
+		}
+	}
 	add("underflow: %u samples, xdma count %u, dmif %u, blnd %u, LB data level %u..%u (firmware 0x37 = 55)\n",
 		underflowSamples, xdmaUnderflowMax, dmifUnderflows, blndUnderflows, lbLevelMin == ~0U ? 0 : lbLevelMin,
 		lbLevelMax);

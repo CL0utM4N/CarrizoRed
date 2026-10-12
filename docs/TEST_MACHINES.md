@@ -171,6 +171,13 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   (0x4A49..0x4A4D). Apple's training writes DPCD 0x100/0x101/0x107/0x108 but never 0x10A (eDP ASSR), and a scrambler
   seed mismatch turns a uniform picture into identical rows of wrong colour. Next: record DPCD 0x00D / 0x10A before
   Apple's link setup and re-enable ASSR in the panel when Apple writes 0x108; restore the unnamed DIG0 registers at t=45.
+- **Spoof boot 35 (ASSR re-enable + `-crrestore`):** **first correct picture**: the light-grey recovery background with
+  the beach-ball cursor, which then stopped. The "freeze" at 75 s was the deliberate panic (`debug=0x100` halts, and
+  the panic text is not drawn once the framebuffer owns the screen). The panel reports ASSR capable (DPCD 0x00D =
+  0x0B) and 0x10A = 0x01 before Apple's first AUX transaction, so it loses ASSR during Apple's link setup; setting it
+  again just before training fixes the picture. Interrupt handler calls: 0, so WindowServer's vblank waits never
+  complete. Next: the black box records the whole interrupt path (CRTC source, DISP_INTERRUPT_STATUS, IH ring and
+  pointers, BIF INTERRUPT_CNTL, MSI).
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
