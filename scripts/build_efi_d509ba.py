@@ -2,7 +2,7 @@
 """
 Build an OpenCore EFI for the ASUS VivoBook 15 D509BA (A9-9425, Stoney Ridge) test laptop.
 
-    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe] [--carrizored [--spoof [--accel] [--minimal]]] [--args="..."] [--oclog]
+    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe] [--carrizored [--spoof [--accel] [--minimal]]] [--args="..."] [--oclog] [--nousbmap]
 
 <work dir> must contain:
     unpacked/OpenCore-<ver>-RELEASE/        OpenCorePkg release zip, extracted
@@ -222,6 +222,12 @@ def main():
         adds.append({"Arch": "Any", "BundlePath": rel, "Comment": comment, "Enabled": True,
                      "ExecutablePath": f"Contents/MacOS/{exe}", "MaxKernel": "", "MinKernel": "",
                      "PlistPath": "Contents/Info.plist"})
+    # USB map (codeless kext from the DSDT's _UPC / _PLD, docs/opencore/USBMap.md). --nousbmap leaves it out.
+    if "--nousbmap" not in sys.argv[1:]:
+        usbmap = Path(__file__).resolve().parent.parent / "docs" / "opencore" / "USBMap.kext"
+        shutil.copytree(usbmap, ocdir / "Kexts" / usbmap.name)
+        adds.append({"Arch": "Any", "BundlePath": usbmap.name, "Comment": "USB map (XHC0, EHC1)", "Enabled": True,
+                     "ExecutablePath": "", "MaxKernel": "", "MinKernel": "", "PlistPath": "Contents/Info.plist"})
     cfg["Kernel"]["Add"] = adds
     cfg["Kernel"]["Block"] = []
     cfg["Kernel"]["Force"] = []
