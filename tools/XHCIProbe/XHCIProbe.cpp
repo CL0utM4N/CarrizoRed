@@ -56,6 +56,7 @@
 extern "C" IOReturn XHCIProbeConfigureInterrupts(IOPCIDevice *device, UInt32 type, UInt32 numRequired,
 	UInt32 numRequested, IOOptionBits options) __asm("__ZN11IOPCIDevice19configureInterruptsEjjjj");
 static constexpr UInt32 InterruptTypePCIMessagedX = 0x00020000;  // IOPCIFamilyDefinitions.h
+static IOReturn msixResult = 0xFFFFFFFF;  // configureInterrupts(MSI-X) result, shown in every irq line (FFFFFFFF = not tried)
 
 class XHCIProbe : public IOService {
 	OSDeclareDefaultStructors(XHCIProbe)
@@ -190,7 +191,7 @@ namespace {
 	constexpr int TraceMs = 60000;     // state-change trace only for the first minute
 	constexpr int WindowMs = 2000;     // interrupt summary period
 	// Runtime registers (xHCI 5.5): RTSOFF in the capability registers, interrupter 0 at +0x20.
-	constexpr UInt32 RegRtsOff = 0x18, RegIman = 0x20, RegImod = 0x24, RegErdp = 0x38;
+	constexpr UInt32 RegRtsOff = 0x18, RegIman = 0x20, RegErdp = 0x38;
 	constexpr UInt32 ImanPending = 1 << 0;
 	constexpr UInt32 StsEventInterrupt = 1 << 3;
 	constexpr UInt32 StsNoisy = (1 << 3) | (1 << 4);  // EINT, PCD: change on normal port activity
@@ -226,7 +227,7 @@ namespace {
 		// Interrupt statistics per window: if MSI/MSI-X is enabled and interrupts are serviced, IMAN.IP and
 		// USBSTS.EINT are cleared within microseconds and are almost never seen set at a 1 ms sample. If they stay
 		// set, interrupts aren't reaching the driver and it only notices events on its own timeouts.
-		UInt32 samples = 0, ipSet = 0, eintSet = 0, erdpMoves = 0, lastErdp = 0, iman = 0, imod = 0, hse = 0;
+		UInt32 samples = 0, ipSet = 0, eintSet = 0, erdpMoves = 0, lastErdp = 0, iman = 0, hse = 0;
 		UInt64 windowStart = 0;
 		// Per-port link states (0.4): a USB 3 link that keeps dropping into U1/U2 or Recovery, or a device that drops
 		// off (CCS 1 -> 0), points at link power management or signal problems rather than lost interrupts.
@@ -240,7 +241,6 @@ namespace {
 			if (c.r32(RegCapLength) != ~0u) {
 				UInt32 rt = c.r32(RegRtsOff) & ~0x1Fu;
 				iman = c.r32(rt + RegIman);
-				imod = c.r32(rt + RegImod);
 				UInt32 erdp = c.r32(rt + RegErdp) & ~0xFu;
 				UInt32 sts = c.r32(c.op(RegUsbSts));
 				samples++;
@@ -288,9 +288,9 @@ namespace {
 					}
 				}
 				char w[200];
-				snprintf(w, sizeof(w), "t=%llus D%u msi=%d msix=%d to %x/%x%s iman=%x IP %u/%u EINT %u/%u ev %u imod=%x hse %u",
-					t / 1000, c.pm ? c.pci->configRead16(c.pm + 4) & 3 : 0xF, msi, msix, target, data,
-					mask ? " MASKED" : "", iman, ipSet, samples, eintSet, samples, erdpMoves, imod, hse);
+				snprintf(w, sizeof(w), "v0.5.1 t=%llus D%u msi=%d msix=%d cfgX=%x to %x/%x%s IP %u/%u EINT %u/%u ev %u hse %u",
+					t / 1000, c.pm ? c.pci->configRead16(c.pm + 4) & 3 : 0xF, msi, msix, msixResult, target, data,
+					mask ? " MASKED" : "", ipSet, samples, eintSet, samples, erdpMoves, hse);
 				IOLog("XHCIProbe: irq %s\n", w);
 				c.pci->setProperty("XHCIProbe-irq", w);
 				// Connected ports: link-state shares in percent, drops, speed and the U1/U2 timeouts.
@@ -481,6 +481,7 @@ IOService *XHCIProbe::probe(IOService *provider, SInt32 *score) {
 	// AppleUSBXHCIPCI::start looks for. -xhciprobe_nomsix keeps MSI. Independent of -xhciprobe_noact.
 	if (vendor == 0x1022 && device == 0x7914 && c.msix && !PE_parse_boot_argn("-xhciprobe_nomsix", arg, sizeof(arg))) {
 		IOReturn ret = XHCIProbeConfigureInterrupts(pci, InterruptTypePCIMessagedX, 1, 1, 0);
+		msixResult = ret;
 		char msix[96];
 		snprintf(msix, sizeof(msix), "configureInterrupts(MSI-X, 1, 1) = 0x%x, MSI-X control %04x", ret,
 			pci->configRead16(c.msix + 2));
