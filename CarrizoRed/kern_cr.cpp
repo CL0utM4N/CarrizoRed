@@ -732,17 +732,25 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (!controllerRequested && strstr(now, "AMD9500ControllerWrangler")) {
 			controllerRequested = true;
 			if (!self->iGPU->getProperty("LoadController")) {
-				bool accel = !checkKernelArgument("-crnoaccel");
 				self->iGPU->setProperty("LoadAMDSupport", true);
 				self->iGPU->setProperty("LoadController", true);
-				if (accel) {
-					self->iGPU->setProperty("LoadHWServices", true);
-					self->iGPU->setProperty("LoadAccelerator", true);
-				}
 				self->iGPU->registerService();
-				IOLog("CarrizoRed: t=%us set LoadController%s on the iGPU and re-registered it\n", t,
-					accel ? " + LoadHWServices + LoadAccelerator" : "");
-				traceNote("LoadController%s@%us ", accel ? "+accel" : "", t);
+				IOLog("CarrizoRed: t=%us set LoadController on the iGPU and re-registered it\n", t);
+				traceNote("LoadController@%us ", t);
+			}
+		}
+		// Acceleration, separately: since the interrupt fix the graphics policy (AGDP) sets LoadController itself
+		// (first usb-spoof-accel boot, nvram27: no LoadController note in the trace, controller attached, no HWServices or
+		// accelerator), but never the acceleration bit, and the request above is skipped. Ask once the controller is up.
+		static bool accelRequested;
+		if (!accelRequested && strstr(now, "AMD9500Controller (")) {
+			accelRequested = true;
+			if (!checkKernelArgument("-crnoaccel") && !self->iGPU->getProperty("LoadAccelerator")) {
+				self->iGPU->setProperty("LoadHWServices", true);
+				self->iGPU->setProperty("LoadAccelerator", true);
+				self->iGPU->registerService();
+				IOLog("CarrizoRed: t=%us set LoadHWServices + LoadAccelerator on the iGPU and re-registered it\n", t);
+				traceNote("LoadAccelerator@%us ", t);
 			}
 		}
 

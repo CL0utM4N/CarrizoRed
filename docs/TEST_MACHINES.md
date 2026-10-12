@@ -199,6 +199,11 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   xHCI alive. The mouse still disconnects and reconnects now and then (seen in the verbose log). Touchpad: the EFI now
   injects VoodooI2C 2.9.1 (AMD `AMD0010` I2C and `AMD0030` GPIO support) with VoodooI2CHID for the ELAN
   HID-over-I2C touchpad (`\_SB.I2CD.ETPD`, address 0x15, GPIO interrupt).
+- **`usb-spoof` (no deliberate panic) boots fully into Recovery** on Apple's Polaris display driver.
+- **First `usb-spoof-accel` boot (nvram27): the accelerator never attached.** Only the display drivers were on the iGPU
+  and no accelerator patch ran. The graphics policy now sets `LoadController` by itself, so CarrizoRed's request
+  (which also set `LoadHWServices` / `LoadAccelerator`) was skipped. The acceleration request is now separate and made
+  once `AMD9500Controller` is attached.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
