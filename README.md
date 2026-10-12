@@ -65,7 +65,8 @@ uploads them (plus a debug `Lilu.kext`) as a workflow artifact.
 | `-crnovramwrite` | Skip `ATIController::TestVRAM` entirely (no test patterns written into the carve-out) |
 | `-crnoints` | Skip `AtiFbInterruptManager::installInterruptsOnPciDevice` (no interrupt registered or enabled) |
 | `-crnofblimit` | Keep Apple's framebuffer count (6) instead of limiting it to the display pipes via `CFG_FB_LIMIT` |
-| `-crrestore` | At t=30 write the firmware's boot values back into pipe 0's FMT, LB, DCP colour / cursor / regamma, SCL and CRTC control registers, and hold them there |
+| `-crrestore` | At t=30 write the firmware's boot values back into pipe 0's FMT, LB, DCP colour / cursor / regamma, SCL and CRTC control registers, and hold them there; at t=45 also four unnamed DIG0 registers (0x4A49..0x4A4D) |
+| `-crnoassr` | Don't re-enable eDP ASSR in the panel (DPCD 0x10A) when Apple sets up the link |
 | `-crnobpccap` | Don't cap the DP colour depth at the firmware's (encoder `ucBitPerColor`, `DP_PIXEL_FORMAT`) |
 | `-crnolbfix` | Keep Apple's line-buffer size instead of DCE 11.0's 0x6B0 in `LB_MEMORY_CTRL` |
 | `-crnoedppoweron` | Don't run the eDP panel POWER_ON transmitter action before Apple enables the eDP transmitter |

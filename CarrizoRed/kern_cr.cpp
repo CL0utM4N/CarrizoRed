@@ -119,6 +119,7 @@ static uint32_t regRingHead;
 static void printRegEvent(const RegEvent &event, const char *suffix);
 static void restoreTick(uint32_t t);  // -crrestore, defined with the display-path diff
 static bool restoreOn;
+static bool assrOff;  // -crnoassr, see wrapAuxWriteBytes
 static uint32_t restoreDone, restoreWrites, restoreHolds;
 static void underflowTick();  // pipe 0 underflow sampling, defined with the display-path diff
 static uint32_t underflowSamples, xdmaUnderflowMax, dmifUnderflows, blndUnderflows, lbLevelMin = ~0U, lbLevelMax;
@@ -346,6 +347,7 @@ void CRDriver::processPatcher(KernelPatcher &) {
 	lbFixOff = checkKernelArgument("-crnolbfix");
 	bpcCapOff = checkKernelArgument("-crnobpccap");
 	restoreOn = checkKernelArgument("-crrestore");
+	assrOff = checkKernelArgument("-crnoassr");
 
 	logPCIInfo();
 	if (checkKernelArgument("-crmacgpu"))
@@ -1827,15 +1829,56 @@ static void dpcdRecord(uint32_t address, uint32_t length, bool write, const uint
 	});
 }
 
+// eDP alternate scrambler seed reset (ASSR). Spoof boot 34: with pipe 0 held at the firmware's values the CRTC read back
+// the right pixels (CRTC_PIXEL_DATA_READBACK = 0xBF8 per channel, the grey in memory) and DIG0 / DP0 matched the
+// firmware's, yet the panel still showed identical rows of random colour. Uniform pixels scrambled with one seed and
+// descrambled with another decode to the same wrong colours on every line, since the scrambler resets each line.
+// An eDP source and panel that support it use ASSR (DPCD 0x00D bit 0 = capable, 0x10A bit 0 = enabled): the firmware
+// sets it in both the DIG (VBIOS panel mode) and the panel, but Apple's training never writes 0x10A, and the panel
+// forgets it when its power is cycled. Record 0x00D / 0x10A before Apple's first AUX transaction, and when Apple sets
+// the link's channel coding (DPCD 0x108, just before training pattern 1) enable ASSR in the panel again if it is
+// capable. -crnoassr disables the write (the values are still recorded).
+static uint8_t assrCap = 0xFF, assrBoot = 0xFF, assrReadback = 0xFF;
+static uint32_t assrWrites;
+static bool assrProbed;
+
+static void assrProbe(void *that, uint8_t flags, IOReturn (*read)(void *, uint32_t, uint32_t, uint8_t *, uint8_t)) {
+	if (assrProbed)
+		return;
+	assrProbed = true;
+	uint8_t value = 0;
+	if (read(that, 0x00D, 1, &value, flags) == kIOReturnSuccess)
+		assrCap = value;
+	if (read(that, 0x10A, 1, &value, flags) == kIOReturnSuccess)
+		assrBoot = value;
+	IOLog("CarrizoRed: eDP DPCD 0x00D (eDP config cap) = 0x%02x, 0x10A (eDP config set) = 0x%02x before Apple's link "
+		  "setup\n", assrCap, assrBoot);
+}
+
 IOReturn CRDriver::wrapAuxReadBytes(void *that, uint32_t address, uint32_t length, uint8_t *data, uint8_t flags) {
-	IOReturn ret = FunctionCast(wrapAuxReadBytes, callback->orgAuxReadBytes)(that, address, length, data, flags);
+	auto read = FunctionCast(wrapAuxReadBytes, callback->orgAuxReadBytes);
+	assrProbe(that, flags, read);
+	IOReturn ret = read(that, address, length, data, flags);
 	dpcdRecord(address, length, false, data, ret);
 	return ret;
 }
 
 IOReturn CRDriver::wrapAuxWriteBytes(void *that, uint32_t address, uint32_t length, uint8_t *data, uint8_t flags) {
-	IOReturn ret = FunctionCast(wrapAuxWriteBytes, callback->orgAuxWriteBytes)(that, address, length, data, flags);
+	auto read = FunctionCast(wrapAuxReadBytes, callback->orgAuxReadBytes);
+	auto write = FunctionCast(wrapAuxWriteBytes, callback->orgAuxWriteBytes);
+	assrProbe(that, flags, read);
+	IOReturn ret = write(that, address, length, data, flags);
 	dpcdRecord(address, length, true, data, ret);
+	if (!assrOff && assrCap != 0xFF && (assrCap & 1) && address <= 0x108 && address + length > 0x108 &&
+		ret == kIOReturnSuccess) {
+		uint8_t value = 1;  // ALTERNATE_SCRAMBLER_RESET_ENABLE
+		IOReturn r = write(that, 0x10A, 1, &value, flags);
+		dpcdRecord(0x10A, 1, true, &value, r);
+		if (r == kIOReturnSuccess)
+			assrWrites++;
+		if (read(that, 0x10A, 1, &value, flags) == kIOReturnSuccess)
+			assrReadback = value;
+	}
 	return ret;
 }
 
@@ -1881,6 +1924,11 @@ static const uint32_t restoreColor[] {0x1A10, 0x1A2D, 0x1A50, 0x1A59, 0x1A5A, 0x
 // Scaler, CRTC update / trigger control and CRTC_CONTROL (CRTC_START_POINT_CNTL).
 static const uint32_t restoreScl[] {0x1B40, 0x1B44, 0x1B4A, 0x1B4C, 0x1B4E, 0x1B53, 0x1B86, 0x1B88, 0x1B89, 0x1B8A,
 	0x1B9C, 0x1BB6, 0x1BBE, 0x1BE7};
+// Spoof boot 34: with all of the above held, the last control-looking differences after the CRTC are four DIG0
+// registers the Linux DCE 11.0 headers don't name (0x4A49..0x4A4D; 0x4A58/59/66/67 change constantly and look like
+// CRC / seed values, so they are left alone). Restored later than the rest, at t=30 + 15, so a change on the panel at
+// that point names them.
+static const uint32_t restoreDig[] {0x4A49, 0x4A4A, 0x4A4B, 0x4A4D};
 static const struct {
 	uint32_t at;
 	const char *name;
@@ -1891,6 +1939,7 @@ static const struct {
 	{30, "LB", restoreLb, sizeof(restoreLb) / sizeof(restoreLb[0])},
 	{30, "DCP colour + cursor + regamma", restoreColor, sizeof(restoreColor) / sizeof(restoreColor[0])},
 	{30, "SCL + CRTC", restoreScl, sizeof(restoreScl) / sizeof(restoreScl[0])},
+	{45, "DIG0 unnamed", restoreDig, sizeof(restoreDig) / sizeof(restoreDig[0])},
 };
 static bool diffBootValue(uint32_t offset, uint32_t &value) {
 	if (!diffBootValid)
@@ -2289,6 +2338,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 	if (restoreOn)
 		add("restore: %u steps done, %u registers written, %u re-written after Apple changed them\n", restoreDone,
 			restoreWrites, restoreHolds);
+	add("assr: DPCD 0x00D cap 0x%02x, 0x10A before Apple 0x%02x, %u writes%s, readback 0x%02x\n", assrCap, assrBoot,
+		assrWrites, assrOff ? " (off)" : "", assrReadback);
 	add("underflow: %u samples, xdma count %u, dmif %u, blnd %u, LB data level %u..%u (firmware 0x37 = 55)\n",
 		underflowSamples, xdmaUnderflowMax, dmifUnderflows, blndUnderflows, lbLevelMin == ~0U ? 0 : lbLevelMin,
 		lbLevelMax);

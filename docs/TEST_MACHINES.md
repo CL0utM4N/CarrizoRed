@@ -164,6 +164,13 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   been restored. Apple's framebuffer now held the verbose console text (black/white), and the line-buffer data level
   was 0x10 against the firmware's 0x37, which suggests underflow. Next: restore everything at t=30 and hold it, and
   count underflows (XDMA counter, DMIF / blender flags, LB level range).
+- **Spoof boot 34 (`-crrestore`, all at once and held):** no visible change. Pipe 0's chain now equals the firmware's
+  except the surface address and pitch (Apple's framebuffer, uniform grey), and `CRTC_PIXEL_DATA_READBACK` shows
+  0xBF8 per channel: the CRTC outputs the right pixels. No XDMA or DMIF underflow (blender flag twice, at mode set).
+  So the fault is after the CRTC, with DIG0/DP0 registers equal to the firmware's except four unnamed ones
+  (0x4A49..0x4A4D). Apple's training writes DPCD 0x100/0x101/0x107/0x108 but never 0x10A (eDP ASSR), and a scrambler
+  seed mismatch turns a uniform picture into identical rows of wrong colour. Next: record DPCD 0x00D / 0x10A before
+  Apple's link setup and re-enable ASSR in the panel when Apple writes 0x108; restore the unnamed DIG0 registers at t=45.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
