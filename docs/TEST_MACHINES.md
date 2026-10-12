@@ -239,3 +239,9 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   interrupt target and pending-interrupt share, IMOD, host errors, the controller's D-state, and per connected port
   the U0/U1/U2/U3/Recovery shares, drop-offs and U1/U2 timeouts.
 - The USB 2.0 Type-A ports are on XHC0 (PRT7/PRT8), not EHCI; see `docs/opencore/USBMap.md`.
+- **XHCIProbe 0.4 result (full installer, stick in USB-C at 5 Gbps, during `validate_root_image`): interrupts are
+  lost.** `msi=1 msix=0 to fee10000/4071`, `EINT 1451/1451` (never acknowledged), `ev 1` (event ring serviced once per
+  2 s, by AppleUSBXHCI's fallback timer), `IP 0` (MSI clears it on send), port 2 U0 100 %, no U1/U2/Recovery, no drops,
+  D0, no host errors. The GPU's MSI to the same address (vector 0x72) works, so this controller's plain MSI never
+  reaches the CPU. Linux uses MSI-X on it. XHCIProbe 0.5 switches it to MSI-X with
+  `IOPCIDevice::configureInterrupts(kIOInterruptTypePCIMessagedX)` before AppleUSBXHCIPCI starts.
