@@ -56,7 +56,7 @@
 extern "C" IOReturn XHCIProbeConfigureInterrupts(IOPCIDevice *device, UInt32 type, UInt32 numRequired,
 	UInt32 numRequested, IOOptionBits options) __asm("__ZN11IOPCIDevice19configureInterruptsEjjjj");
 static constexpr UInt32 InterruptTypePCIMessagedX = 0x00020000;  // IOPCIFamilyDefinitions.h
-static IOReturn msixResult = 0xFFFFFFFF;  // configureInterrupts(MSI-X) result, shown in every irq line (FFFFFFFF = not tried)
+static IOReturn msixResult = -1;  // configureInterrupts(MSI-X) result, shown in every irq line (FFFFFFFF = not tried)
 
 class XHCIProbe : public IOService {
 	OSDeclareDefaultStructors(XHCIProbe)
