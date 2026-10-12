@@ -67,6 +67,11 @@ uploads them (plus a debug `Lilu.kext`) as a workflow artifact.
 | `-crnofblimit` | Keep Apple's framebuffer count (6) instead of limiting it to the display pipes via `CFG_FB_LIMIT` |
 | `-crrestore` | At t=30 write the firmware's boot values back into pipe 0's FMT, LB, DCP colour / cursor / regamma, SCL and CRTC control registers, and hold them there; at t=45 also four unnamed DIG0 registers (0x4A49..0x4A4D) |
 | `-crnoassr` | Don't re-enable eDP ASSR in the panel (DPCD 0x10A) when Apple sets up the link |
+| `-crnoaccel` | Keep the acceleration stack (AMDRadeonX4000, HWServices/CAIL) off the iGPU; otherwise CarrizoRed requests it (`LoadHWServices` + `LoadAccelerator`) with the controller |
+| `-crnosdmafix` | Stoney: keep Apple's second sDMA engine instead of releasing it and starting sDMA0 alone |
+| `-crnocapsfix` | Stoney: keep Apple's Polaris 11 shader-engine / CU counts (2 SE, 8 CUs per SH) |
+| `-crnovmfix` | Don't convert local GPU page-table entries to the carve-out's physical address (`MC_VM_FB_OFFSET << 22`) |
+| `-crdisplaydiag` | Keep the display sections (VBIOS calls, DPCD, register diff, pixels) in the black box on accelerated boots |
 | `-crnoihfix` | Don't mirror Apple's IH interrupt enable (Tonga `IH_RB_CNTL.ENABLE_INTR`) into Carrizo/Stoney's `IH_CNTL` (`ENABLE_INTR`, `RPTR_REARM`) |
 | `-crnobpccap` | Don't cap the DP colour depth at the firmware's (encoder `ucBitPerColor`, `DP_PIXEL_FORMAT`) |
 | `-crnolbfix` | Keep Apple's line-buffer size instead of DCE 11.0's 0x6B0 in `LB_MEMORY_CTRL` |

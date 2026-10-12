@@ -114,6 +114,20 @@ private:
 	mach_vm_address_t orgWritePCIReg8 {0}, orgWritePCIReg16 {0}, orgWritePCIReg32 {0};
 	uint8_t gpuBus {0xFF}, gpuDevice {0xFF};
 
+	// Acceleration (AMDRadeonX4000): Stoney has one sDMA engine and one shader engine, and its "VRAM" is a carve-out
+	// in system RAM, so local page-table entries need the carve-out's physical address (see patchAccelerator).
+	void traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, int kext);
+	void patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
+	static bool wrapAllocateHWEngines(void *that);
+	static bool wrapStartHWEngines(void *that);
+	static uint64_t wrapSetupHWCapabilities(void *that);
+	static uint64_t wrapUpdatePTEsDMA(void *that, uint64_t dst, uint64_t count, uint64_t addr, uint64_t flags,
+		uint64_t incr);
+	static uint64_t wrapGetPTEValue(void *that, uint32_t level, uint64_t addr, uint32_t flags, uint32_t fragment);
+	static uint64_t wrapGetPDEValue(void *that, uint32_t level, uint64_t addr);
+	mach_vm_address_t orgAllocateHWEngines {0}, orgStartHWEngines {0}, orgSetupHWCapabilities {0}, orgUpdatePTEsDMA {0},
+		orgGetPTEValue {0}, orgGetPDEValue {0};
+
 	void startWatcher();
 	static void watcherThread(void *arg, wait_result_t);
 

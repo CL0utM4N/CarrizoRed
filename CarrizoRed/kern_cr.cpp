@@ -77,7 +77,7 @@ struct TraceEvent {
 	bool exit;
 };
 
-static constexpr size_t TraceRingSize = 512, MaxTraceStages = 64;
+static constexpr size_t TraceRingSize = 512, MaxTraceStages = 96;
 static TraceEvent traceRing[TraceRingSize];
 static uint32_t traceHead;
 static uint32_t stageOpen[MaxTraceStages];
@@ -238,6 +238,8 @@ static void traceEvent(const char *name, bool exit, uint32_t value) {
 static const char *pathRadeonX4000[] {"/System/Library/Extensions/AMDRadeonX4000.kext/Contents/MacOS/AMDRadeonX4000"};
 static const char *pathRadeonX4000HWServices[] {
 	"/System/Library/Extensions/AMDRadeonX4000HWServices.kext/Contents/MacOS/AMDRadeonX4000HWServices"};
+static const char *pathRadeonX4000HWLibs[] {"/System/Library/Extensions/AMDRadeonX4000HWServices.kext/Contents/PlugIns/"
+										   "AMDRadeonX4000HWLibs.kext/Contents/MacOS/AMDRadeonX4000HWLibs"};
 static const char *pathPolarisController[] {
 	"/System/Library/Extensions/AMD9500Controller.kext/Contents/MacOS/AMD9500Controller"};
 static const char *pathSupport[] {"/System/Library/Extensions/AMDSupport.kext/Contents/MacOS/AMDSupport"};
@@ -250,6 +252,7 @@ static const char *pathPci[] {"/System/Library/Extensions/IOPCIFamily.kext/Conte
 enum KextIndex : size_t {
 	KextRadeonX4000,
 	KextRadeonX4000HWServices,
+	KextRadeonX4000HWLibs,
 	KextPolarisController,
 	KextSupport,
 	KextFramebuffer,
@@ -264,6 +267,8 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 		KernelPatcher::KextInfo::Unloaded},
 	[KextRadeonX4000HWServices] = {"com.apple.kext.AMDRadeonX4000HWServices", pathRadeonX4000HWServices,
 		arrsize(pathRadeonX4000HWServices), {}, {}, KernelPatcher::KextInfo::Unloaded},
+	[KextRadeonX4000HWLibs] = {"com.apple.kext.AMDRadeonX4000HWLibs", pathRadeonX4000HWLibs,
+		arrsize(pathRadeonX4000HWLibs), {}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextPolarisController] = {"com.apple.kext.AMD9500Controller", pathPolarisController,
 		arrsize(pathPolarisController), {}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextSupport] = {"com.apple.kext.AMDSupport", pathSupport, arrsize(pathSupport), {}, {},
@@ -425,12 +430,20 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 				}
 			}
 		}
-		else if (i == KextRadeonX4000)
+		else if (i == KextRadeonX4000) {
 			blockProbe(patcher, index, slide, size, "__ZN37AMDRadeonX4000_AMDGraphicsAccelerator5probeEP9IOServicePi",
 				"-crnoaccel");
-		else if (i == KextRadeonX4000HWServices)
+			if (!checkKernelArgument("-crnoaccel")) {
+				patchAccelerator(patcher, index, slide, size);
+				traceKext(patcher, index, slide, size, i);
+			}
+		} else if (i == KextRadeonX4000HWServices) {
 			blockProbe(patcher, index, slide, size,
 				"__ZN42AMDRadeonX4000_AMDRadeonHWServicesAbstract5probeEP9IOServicePi", "-crnoaccel");
+			if (!checkKernelArgument("-crnoaccel"))
+				traceKext(patcher, index, slide, size, i);
+		} else if (i == KextRadeonX4000HWLibs && !checkKernelArgument("-crnoaccel"))
+			traceKext(patcher, index, slide, size, i);
 		return;
 	}
 }
@@ -713,16 +726,23 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		// AMD9500Controller's personality only matches once the iGPU has LoadController=true. On a Mac the graphics
 		// policy asks the wrangler for that (AtiGpuWrangler::vendor_doDeviceAttribute, attribute 3, flag bit 0: set
 		// LoadAMDSupport + LoadController, then registerService()); nothing asks for the iGPU, so the wrangler holds the
-		// framebuffer slot and the GUI has no display. Do the same once the wrangler has attached. Acceleration
-		// (flag bit 1: LoadHWServices + LoadAccelerator) is left for later. -crnoloadctl disables this.
+		// framebuffer slot and the GUI has no display. Do the same once the wrangler has attached, and also ask for
+		// acceleration (flag bit 1: LoadHWServices + LoadAccelerator, the AMDRadeonX4000HWServices and AMDRadeonX4000
+		// personalities) unless -crnoaccel. -crnoloadctl disables this.
 		if (!controllerRequested && strstr(now, "AMD9500ControllerWrangler")) {
 			controllerRequested = true;
 			if (!self->iGPU->getProperty("LoadController")) {
+				bool accel = !checkKernelArgument("-crnoaccel");
 				self->iGPU->setProperty("LoadAMDSupport", true);
 				self->iGPU->setProperty("LoadController", true);
+				if (accel) {
+					self->iGPU->setProperty("LoadHWServices", true);
+					self->iGPU->setProperty("LoadAccelerator", true);
+				}
 				self->iGPU->registerService();
-				IOLog("CarrizoRed: t=%us set LoadController on the iGPU and re-registered it\n", t);
-				traceNote("LoadController@%us ", t);
+				IOLog("CarrizoRed: t=%us set LoadController%s on the iGPU and re-registered it\n", t,
+					accel ? " + LoadHWServices + LoadAccelerator" : "");
+				traceNote("LoadController%s@%us ", accel ? "+accel" : "", t);
 			}
 		}
 
@@ -863,7 +883,7 @@ uint64_t CRDriver::wrapGetConfigProperty(void *that, const char *name, void *val
 // AMD9500Controller initialisation stage on the console, so a controller that matches and then fails to start (and
 // disappears again) shows which stage failed.
 namespace {
-	enum TraceKext { InController, InSupport, InFramebuffer };
+	enum TraceKext { InController, InSupport, InFramebuffer, InAccel, InHWServices, InHWLibs };
 
 	struct TracedStage {
 		const char *symbol;
@@ -946,6 +966,36 @@ namespace {
 		{"__ZN27BaffinDisplayPortConnection13eDPPanelPowerEb", "eDPPanelPower", InController, false, false, 0, 1},
 		{"__ZN27BaffinBiosDigitalConnection12setBacklightEh", "setBacklight", InController, false, false, 0, 1},
 		{"__ZN17AMD9500Controller11turnOnDigonEb", "turnOnDigon", InController, false, false, 0, 1},
+		// Acceleration (Phase 3): HWServices loads the HWLibs plug-in (CAIL, which has its own Stoney support: device
+		// table row 0x98E4 -> STONEY_A0, Cail_Stoney_InitFunctionPointer), then the AMDRadeonX4000 accelerator brings up
+		// the AMDBaffinHardware interface, its engines (PM4 = GFX/compute, sDMA, UVD, VCE, SAMU) and GPU VM.
+		{"__ZN42AMDRadeonX4000_AMDRadeonHWServicesAbstract5startEP9IOService", "hws.start", InHWServices, true, true, 0},
+		{"__ZN38AMDRadeonX4000_AMDRadeonHWServicesCAIL19createCailInterfaceEP11IOPCIDevice", "hws.createCailInterface", InHWServices, true, true, 0},
+		{"__ZN42AMDRadeonX4000_AMDRadeonHWServicesAbstract24createPowerPlayInterfaceEP18PowerPlayCallbacks", "hws.createPowerPlay", InHWServices, true, true, 0},
+		{"__ZN15AmdCailServices10initializeEP15_CailInitialize", "cail.initialize", InHWLibs, true, true, 0},
+		{"__ZN15AmdCailServices17initializeAdapterEv", "cail.initializeAdapter", InHWLibs, true, true, 0},
+		{"_CAILPostVBIOS", "CAILPostVBIOS", InHWLibs, true, true, 0},
+		{"_CAILInitialize", "CAILInitialize", InHWLibs, true, true, 0},
+		{"_CAILQueryASICInfo", "CAILQueryASICInfo", InHWLibs, true, false, 0},
+		{"_Stoney_SetupASIC", "Stoney_SetupASIC", InHWLibs, true, true, 0},
+		{"_Stoney_LoadRlcUcode", "Stoney_LoadRlcUcode", InHWLibs, true, true, 0},
+		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator5startEP9IOService", "accel.start", InAccel, true, true, 0},
+		{"__ZN26AMDRadeonX4000_AMDHardware4initEP11IOPCIDeviceP28AMDRadeonX4000_IAMDHWHandlerRjP16_GART_PARAMETERSP14_FB_PARAMETERS", "hw.init", InAccel, true, true, 0},
+		{"__ZN26AMDRadeonX4000_AMDHardware8initCAILEv", "hw.initCAIL", InAccel, true, true, 0},
+		{"__ZN26AMDRadeonX4000_AMDHardware9setupCAILEv", "hw.setupCAIL", InAccel, true, true, 0},
+		{"__ZN26AMDRadeonX4000_AMDHardware11powerUpCAILEv", "hw.powerUpCAIL", InAccel, true, true, 0},
+		{"__ZN32AMDRadeonX4000_AMDBaffinHardware7powerUpEv", "hw.powerUp", InAccel, true, true, 0},
+		{"__ZN26AMDRadeonX4000_AMDHardware23allocateMemoryResourcesEv", "hw.allocateMemoryResources", InAccel, true, true, 0},
+		{"__ZN28AMDRadeonX4000_AMDVIHardware16initializeVMRegsEv", "hw.initializeVMRegs", InAccel, true, true, 0},
+		{"__ZN26AMDRadeonX4000_AMDHardware27initializeHardwareRegistersEv", "hw.initializeHardwareRegisters", InAccel, true, true, 0},
+		{"__ZN26AMDRadeonX4000_AMDHardware19initializeHWEnginesEv", "hw.initializeHWEngines", InAccel, true, true, 0},
+		{"__ZN26AMDRadeonX4000_AMDHardware16powerUpHWEnginesEv", "hw.powerUpHWEngines", InAccel, true, true, 0},
+		{"__ZN29AMDRadeonX4000_AMDVIPM4Engine7powerUpEv", "pm4.powerUp", InAccel, true, true, 0},
+		{"__ZN29AMDRadeonX4000_AMDVIPM4Engine21initializeMicroEngineEv", "pm4.initializeMicroEngine", InAccel, true, true, 0},
+		{"__ZN29AMDRadeonX4000_AMDVIPM4Engine5startEv", "pm4.start", InAccel, true, true, 0},
+		{"__ZN30AMDRadeonX4000_AMDVIsDMAEngine5startEv", "sdma.start", InAccel, true, true, 0},
+		{"__ZN26AMDRadeonX4000_AMDHardware28initializeExternalInterfacesEv", "hw.initializeExternalInterfaces", InAccel, true, true, 0},
+		{"__ZN26AMDRadeonX4000_AMDHardware16enableInterruptsEv", "hw.enableInterrupts", InAccel, true, false, 0},
 	};
 
 	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
@@ -984,7 +1034,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 61, "one wrapper per stage");
+		static_assert(arrsize(stages) == 88, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -993,7 +1043,10 @@ namespace {
 			CR_WRAP(32), CR_WRAP(33), CR_WRAP(34), CR_WRAP(35), CR_WRAP(36), CR_WRAP(37), CR_WRAP(38), CR_WRAP(39),
 			CR_WRAP(40), CR_WRAP(41), CR_WRAP(42), CR_WRAP(43), CR_WRAP(44), CR_WRAP(45), CR_WRAP(46), CR_WRAP(47),
 			CR_WRAP(48), CR_WRAP(49), CR_WRAP(50), CR_WRAP(51), CR_WRAP(52), CR_WRAP(53), CR_WRAP(54), CR_WRAP(55),
-			CR_WRAP(56), CR_WRAP(57), CR_WRAP(58), CR_WRAP(59), CR_WRAP(60),
+			CR_WRAP(56), CR_WRAP(57), CR_WRAP(58), CR_WRAP(59), CR_WRAP(60), CR_WRAP(61), CR_WRAP(62), CR_WRAP(63),
+			CR_WRAP(64), CR_WRAP(65), CR_WRAP(66), CR_WRAP(67), CR_WRAP(68), CR_WRAP(69), CR_WRAP(70), CR_WRAP(71),
+			CR_WRAP(72), CR_WRAP(73), CR_WRAP(74), CR_WRAP(75), CR_WRAP(76), CR_WRAP(77), CR_WRAP(78), CR_WRAP(79),
+			CR_WRAP(80), CR_WRAP(81), CR_WRAP(82), CR_WRAP(83), CR_WRAP(84), CR_WRAP(85), CR_WRAP(86), CR_WRAP(87),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -1011,6 +1064,212 @@ namespace {
 void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	if (!checkKernelArgument("-crnotrace"))
 		routeStages(patcher, index, slide, size, InController);
+}
+
+// --- Acceleration (AMDRadeonX4000) ----------------------------------------------------------------------------------
+// HWServices loads AMDRadeonX4000HWLibs (the "Load4000" default for a non-Apple subsystem ID), whose CAIL has full Stoney
+// support and reads the real device ID from config space. The accelerator itself (AMDBaffinGraphicsAccelerator ->
+// AMDBaffinHardware) assumes a Polaris 11:
+//  - allocateHWEngines creates two sDMA engines (+0x3B8, +0x3C0); Stoney has one (Linux sdma_v3_0, 1 instance). The
+//    second slot is released again, and startHWEngines, which requires both, starts only the first. initializeHWEngines
+//    and getHWChannel already skip empty engine slots.
+//  - setupAndInitializeHWCapabilities hard-codes 2 shader engines (+0x64), 1 SH per SE (+0x6C) and 8 CUs per SH (+0xA0)
+//    (Ellesmere: 4/1/9). The VI base class then reads the real active-CU bitmaps from CAIL into +0x70.. and the
+//    minimum active CUs into +0xA4. Stoney: 1 SE, 1 SH, 3 CUs.
+//  - Local (non-system) page-table entries hold a VRAM address. On a dGPU that is an FB offset; on an APU the "VRAM" is
+//    a carve-out in system RAM and the entries need its physical address, MC_VM_FB_OFFSET << 22 (Linux gmc_v8_0:
+//    vm_manager.vram_base_offset, gmc_v8_0_get_vm_pde). PTEs are written by sDMA (updateContiguousPTEsWithDMAUsingAddr:
+//    base address + PTE flags template) or built by getPTEValue / getPDEValue; both are converted. -crnovmfix disables.
+// Field offsets come from the 15.8.1 KDK; each patch first checks the instructions that carry them (the D509BA boots
+// the 15.4 recovery) and stays off if they differ.
+static bool accelSdma1Dropped, accelCapsFixed, vmFixOn, vmFixReady;
+static uint32_t accelStartPatched, accelCapsCu;
+static uint64_t vmFbStart, vmFbEnd, vmCarveout;
+static uint32_t vmConverted, vmMcAddresses, vmOffsets, vmOther;
+static struct {
+	uint64_t from, to;
+	uint8_t kind;  // 'D' sDMA update, 'T' getPTEValue, 'P' getPDEValue
+} vmSamples[4];
+
+static bool codeHas(mach_vm_address_t fn, size_t len, const char *hex) {
+	uint8_t pattern[16];
+	size_t n = 0;
+	for (; hex[2 * n] && n < sizeof(pattern); n++) {
+		auto nib = [](char c) { return static_cast<uint8_t>(c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10); };
+		pattern[n] = static_cast<uint8_t>(nib(hex[2 * n]) << 4 | nib(hex[2 * n + 1]));
+	}
+	auto *code = reinterpret_cast<const uint8_t *>(fn);
+	for (size_t i = 0; fn && i + n <= len; i++)
+		if (!memcmp(code + i, pattern, n))
+			return true;
+	return false;
+}
+
+template <typename T>
+static T vfunc(void *object, size_t offset) {
+	return reinterpret_cast<T>((*reinterpret_cast<uintptr_t **>(object))[offset / sizeof(uintptr_t)]);
+}
+
+static bool vmFixInit() {
+	if (vmFixReady || !vmFixOn || !gpuMmio)
+		return vmFixReady;
+	uint32_t location = gpuMmio[0x809], offset = gpuMmio[0x81A];  // MC_VM_FB_LOCATION, MC_VM_FB_OFFSET
+	vmFbStart = static_cast<uint64_t>(location & 0xFFFF) << 24;
+	vmFbEnd = static_cast<uint64_t>((location >> 16) & 0xFFFF) << 24 | 0xFFFFFF;
+	vmCarveout = static_cast<uint64_t>(offset & 0x3FFFF) << 22;
+	vmFixReady = true;
+	if (!vmCarveout || vmFbEnd <= vmFbStart)
+		vmFixOn = false;  // not an APU carve-out: leave the entries alone
+	return vmFixReady;
+}
+
+// VRAM address in a page-table entry -> the carve-out's physical address. MC addresses (inside MC_VM_FB_LOCATION) and
+// FB offsets (below the FB size) are converted; anything else (already physical, or system memory) is left alone.
+static uint64_t vmToPhysical(uint64_t address, uint8_t kind) {
+	if (!vmFixInit() || !vmFixOn)
+		return address;
+	uint64_t result = address;
+	if (address >= vmFbStart && address <= vmFbEnd) {
+		result = address - vmFbStart + vmCarveout;
+		__atomic_fetch_add(&vmMcAddresses, 1, __ATOMIC_RELAXED);
+	} else if (address <= vmFbEnd - vmFbStart) {
+		result = address + vmCarveout;
+		__atomic_fetch_add(&vmOffsets, 1, __ATOMIC_RELAXED);
+	} else {
+		__atomic_fetch_add(&vmOther, 1, __ATOMIC_RELAXED);
+	}
+	uint32_t n = __atomic_fetch_add(&vmConverted, 1, __ATOMIC_RELAXED);
+	if (n < arrsize(vmSamples))
+		vmSamples[n] = {address, result, kind};
+	return result;
+}
+
+void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	auto route = [&](const char *symbol, mach_vm_address_t wrapper, mach_vm_address_t &org, const char *const *checks,
+					 size_t checkLen, const char *what) {
+		mach_vm_address_t fn = patcher.solveSymbol(index, symbol, slide, size);
+		if (!fn) {
+			SYSLOG("cr", "accel: %s not found (error %d)", what, patcher.getError());
+			patcher.clearError();
+			return false;
+		}
+		for (size_t i = 0; checks && checks[i]; i++) {
+			if (!codeHas(fn, checkLen, checks[i])) {
+				IOLog("CarrizoRed: accel: %s left alone, its code differs from the 15.8.1 KDK (%s)\n", what, checks[i]);
+				traceNote("%s=nomatch ", what);
+				return false;
+			}
+		}
+		KernelPatcher::RouteRequest request {symbol, wrapper, org};
+		if (!routeChecked(patcher, index, request, slide, size)) {
+			SYSLOG("cr", "accel: failed to route %s (error %d)", what, patcher.getError());
+			patcher.clearError();
+			return false;
+		}
+		return true;
+	};
+
+	if (family == ChipFamily::Stoney && !checkKernelArgument("-crnosdmafix")) {
+		static const char *const allocChecks[] {"4c89b3b8030000", "4c89b3c0030000", nullptr};
+		static const char *const startChecks[] {"4a8bbcf3b8030000", "ff9048010000", "488b7b18", "ff9078010000",
+			"66895008", nullptr};
+		if (route("__ZN32AMDRadeonX4000_AMDBaffinHardware17allocateHWEnginesEv",
+				reinterpret_cast<mach_vm_address_t>(wrapAllocateHWEngines), orgAllocateHWEngines, allocChecks, 0x100,
+				"allocateHWEngines"))
+			route("__ZN26AMDRadeonX4000_AMDHardware14startHWEnginesEv",
+				reinterpret_cast<mach_vm_address_t>(wrapStartHWEngines), orgStartHWEngines, startChecks, 0xA0,
+				"startHWEngines");
+	}
+	if (family == ChipFamily::Stoney && !checkKernelArgument("-crnocapsfix")) {
+		static const char *const capsChecks[] {"c7476402000000", "c7476c01000000", "c787a000000008000000", nullptr};
+		route("__ZN32AMDRadeonX4000_AMDBaffinHardware32setupAndInitializeHWCapabilitiesEv",
+			reinterpret_cast<mach_vm_address_t>(wrapSetupHWCapabilities), orgSetupHWCapabilities, capsChecks, 0x30,
+			"setupAndInitializeHWCapabilities");
+	}
+	vmFixOn = !checkKernelArgument("-crnovmfix");
+	if (vmFixOn) {
+		route("__ZN29AMDRadeonX4000_AMDHWVMContext36updateContiguousPTEsWithDMAUsingAddrEyyyyy",
+			reinterpret_cast<mach_vm_address_t>(wrapUpdatePTEsDMA), orgUpdatePTEsDMA, nullptr, 0,
+			"updateContiguousPTEsWithDMAUsingAddr");
+		route("__ZN23AMDRadeonX4000_AMDVIVMM11getPTEValueE15eAMD_VMPT_LEVELyN24AMDRadeonX4000_IAMDHWVMM10VmMapFlagsEj",
+			reinterpret_cast<mach_vm_address_t>(wrapGetPTEValue), orgGetPTEValue, nullptr, 0, "getPTEValue");
+		route("__ZN23AMDRadeonX4000_AMDVIVMM11getPDEValueE15eAMD_VMPT_LEVELy",
+			reinterpret_cast<mach_vm_address_t>(wrapGetPDEValue), orgGetPDEValue, nullptr, 0, "getPDEValue");
+	}
+}
+
+bool CRDriver::wrapAllocateHWEngines(void *that) {
+	bool ret = FunctionCast(wrapAllocateHWEngines, callback->orgAllocateHWEngines)(that);
+	auto &sdma1 = *reinterpret_cast<OSObject **>(static_cast<uint8_t *>(that) + 0x3C0);
+	if (sdma1) {
+		sdma1->release();
+		sdma1 = nullptr;
+		accelSdma1Dropped = true;
+	}
+	traceEvent("hw.allocateHWEngines (sDMA1 dropped)", true, ret);
+	return ret;
+}
+
+// AMDHardware::startHWEngines starts both sDMA engines and fails if either is missing; with one engine, start it and set
+// the same "sDMA started" bit (bit 9 of the 16-bit word at +8 of the info block from this+0x18, vtable +0x178).
+bool CRDriver::wrapStartHWEngines(void *that) {
+	auto *self = static_cast<uint8_t *>(that);
+	if (*reinterpret_cast<void **>(self + 0x3C0))
+		return FunctionCast(wrapStartHWEngines, callback->orgStartHWEngines)(that);
+	void *sdma0 = *reinterpret_cast<void **>(self + 0x3B8);
+	bool ok = sdma0 && vfunc<bool (*)(void *)>(sdma0, 0x148)(sdma0);
+	void *info = *reinterpret_cast<void **>(self + 0x18);
+	auto *state = vfunc<uint8_t *(*)(void *)>(info, 0x178)(info);
+	uint32_t word = *reinterpret_cast<uint32_t *>(state + 8);
+	*reinterpret_cast<uint16_t *>(state + 8) = static_cast<uint16_t>((word & 0xFFFFFDFF) | (ok ? 0x200 : 0));
+	accelStartPatched++;
+	traceEvent("hw.startHWEngines (sDMA0 only)", true, ok);
+	traceNote("startHWEngines=%x ", ok);
+	return ok;
+}
+
+uint64_t CRDriver::wrapSetupHWCapabilities(void *that) {
+	uint64_t ret = FunctionCast(wrapSetupHWCapabilities, callback->orgSetupHWCapabilities)(that);
+	auto *self = static_cast<uint8_t *>(that);
+	uint32_t activeCu = *reinterpret_cast<uint32_t *>(self + 0xA4);  // minimum active CUs per SH, from CAIL
+	*reinterpret_cast<uint32_t *>(self + 0x64) = 1;                   // shader engines
+	*reinterpret_cast<uint32_t *>(self + 0x6C) = 1;                   // SH per SE
+	if (activeCu)
+		*reinterpret_cast<uint32_t *>(self + 0xA0) = activeCu;        // CUs per SH
+	accelCapsFixed = true;
+	accelCapsCu = activeCu;
+	traceEvent("hw.capabilities (1 SE, active CUs)", true, activeCu);
+	return ret;
+}
+
+uint64_t CRDriver::wrapUpdatePTEsDMA(void *that, uint64_t dst, uint64_t count, uint64_t addr, uint64_t flags,
+	uint64_t incr) {
+	if ((flags & 1) && !(flags & 2))  // valid, not system memory
+		addr = vmToPhysical(addr, 'D');
+	return FunctionCast(wrapUpdatePTEsDMA, callback->orgUpdatePTEsDMA)(that, dst, count, addr, flags, incr);
+}
+
+uint64_t CRDriver::wrapGetPTEValue(void *that, uint32_t level, uint64_t addr, uint32_t flags, uint32_t fragment) {
+	uint64_t pte = FunctionCast(wrapGetPTEValue, callback->orgGetPTEValue)(that, level, addr, flags, fragment);
+	constexpr uint64_t mask = 0xFFFFFFF000;
+	if (addr && (pte & 1) && !(pte & 2))  // address 0 = a flags template for sDMA updates
+		pte = (pte & ~mask) | (vmToPhysical(addr & mask, 'T') & mask);
+	return pte;
+}
+
+uint64_t CRDriver::wrapGetPDEValue(void *that, uint32_t level, uint64_t addr) {
+	uint64_t pde = FunctionCast(wrapGetPDEValue, callback->orgGetPDEValue)(that, level, addr);
+	constexpr uint64_t mask = 0xFFFFFFFFC0;
+	if (addr)
+		pde = (pde & ~mask) | (vmToPhysical(addr & mask, 'P') & mask);
+	return pde;
+}
+
+void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, int kext) {
+	if (checkKernelArgument("-crnotrace"))
+		return;
+	routeStages(patcher, index, slide, size,
+		kext == KextRadeonX4000 ? InAccel : kext == KextRadeonX4000HWServices ? InHWServices : InHWLibs);
 }
 
 void CRDriver::traceFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
@@ -2362,6 +2621,15 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 			restoreWrites, restoreHolds);
 	add("assr: DPCD 0x00D cap 0x%02x, 0x10A before Apple 0x%02x, %u writes%s, readback 0x%02x\n", assrCap, assrBoot,
 		assrWrites, assrOff ? " (off)" : "", assrReadback);
+	if (!checkKernelArgument("-crnoaccel")) {
+		add("accel: sDMA1 dropped %u, sDMA0-only starts %u, caps fixed %u (CUs %u); vm fix %s FB %llx-%llx carve-out "
+			"%llx: %u converted (%u MC, %u offset, %u other)",
+			accelSdma1Dropped, accelStartPatched, accelCapsFixed, accelCapsCu, vmFixOn ? "on" : "off", vmFbStart,
+			vmFbEnd, vmCarveout, vmConverted, vmMcAddresses, vmOffsets, vmOther);
+		for (uint32_t i = 0; i < vmConverted && i < arrsize(vmSamples); i++)
+			add(" %c %llx->%llx", vmSamples[i].kind, vmSamples[i].from, vmSamples[i].to);
+		add("\n");
+	}
 	if (gpuMmio) {
 		// Interrupt path, end to end (spoof boot 35: picture right, beach ball frozen, handler never called). Display
 		// sources (CRTC0 V_UPDATE enable / status, DISP_INTERRUPT_STATUS..CONTINUE2) -> IH (ring, pointers, write-back,
@@ -2408,6 +2676,9 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), __atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED),
 		__atomic_load_n(&pmEvents, __ATOMIC_RELAXED), __atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));
 	add("tree:\n%s", tree ? tree : "");
+	// The display-debugging sections (VBIOS calls, DPCD, link training, block diff, surface and pixels) are left out of
+	// accelerated boots, whose trace summary needs the room in NVRAM; -crdisplaydiag keeps them.
+	bool displayDiag = checkKernelArgument("-crnoaccel") || checkKernelArgument("-crdisplaydiag");
 	if (gpuMmio) {
 		// Registers as offset=now/boot (boot = what the firmware's GOP left, with a working eDP link) where they
 		// changed, then the offsets that still hold their boot value.
@@ -2427,9 +2698,10 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		}
 		// The unchanged registers were listed in boots 22-25; leave them out to fit the DPCD transcript in NVRAM.
 		add("\n");
-		atomReport(add);
+		if (displayDiag)
+			atomReport(add);
 	}
-	if (gpuMmio && diffBootValid) {
+	if (gpuMmio && diffBootValid && displayDiag) {
 		add("diff now/boot:");
 		uint32_t n = 0, changed = 0;
 		for (auto &block : diffBlocks) {
@@ -2445,7 +2717,7 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 	// middle and bottom rows of the surface, read through BAR0 (the carve-out from MC_VM_FB_LOCATION's base). Spoof boot
 	// 28 showed identical rows on the panel (vertical stripes): different rows in memory mean the display fetch
 	// (underflow) is at fault, identical rows mean the content is.
-	if (gpuMmio) {
+	if (gpuMmio && displayDiag) {
 		static const uint32_t surfaceRegs[] {0x1A00, 0x1A01, 0x1A03, 0x1A04, 0x1A06, 0x1A07, 0x1A09, 0x1A0A, 0x1A0B, 0x1A0C,
 			0x1A0D, 0x1A0E, 0x1AC0, 0x1AC1, 0x1AC3, 0x1B42, 0x1B45, 0x1B5C, 0x1B5D, 0x2F7, 0x2F8, 0x304, 0x140};
 		add("surface now/boot:");

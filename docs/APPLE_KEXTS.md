@@ -339,3 +339,40 @@ the boot console ghosted while it ran, so it writes test patterns into the displ
 same error, `createAsicInfo` (`AtiAsicInfo::initWithController` → `ASIC_INFO__BAFFIN::populate{DeviceInfo,FbLocation,
 MemoryConfig}`), wasn't reached. CarrizoRed now reports TestVRAM as passed (logging the real result; `-crnovramtest`
 disables) to see what fails next.
+
+## Acceleration (`AMDRadeonX4000`) on Stoney (Sequoia 15.8.1 KDK, 2026-10-12)
+
+**Loading.** Both personalities need a property on the iGPU: HWServices `IOPropertyMatch {LoadHWServices}`, the
+accelerator `{LoadAccelerator}` (set by `AtiGpuWrangler::vendor_doDeviceAttribute` flag bit 1 on a Mac). CarrizoRed now
+sets both with `LoadController` unless `-crnoaccel`.
+
+**HWLibs / CAIL.** `AMDRadeonX4000_AMDRadeonHWServicesPolaris::getMatchProperty` picks the HWLibs plug-in from a table of
+Apple subsystem IDs (`Load4100`/`Load4400`/`Load4700`); anything else gets `Load4000` → **`AMDRadeonX4000HWLibs`**. Its
+CAIL has full Stoney support: `_CAILAsicCapsInitTable` (rows: family, device, internal rev, external rev, PCI rev, caps,
+golden) has an any-revision row `0x98E4 → CAIL_DDI_CAPS_STONEY_A0, STONEY_GoldenSettings_A0_3CU, external rev 0x61`,
+and `_CAILInitFunctionPointer` sends family 0x87 with external revision 0x61–0xFE to `_Cail_Stoney_InitFunctionPointer`.
+There are `StoneyAsicSetupTable`, `Stoney_{CE,ME,PFP,MEC1,RLC}_UCODE`, `Stoney_HwConstants_2CU/3CU`, `Stoney_LoadRlcUcode`,
+power gating and hang detection. Since CAIL reads the device ID from config space, the spoof doesn't affect it.
+
+**Accelerator.** `AMDBaffinGraphicsAccelerator` (← `AMDVIGraphicsAccelerator`) creates `AMDBaffinHardware`
+(← `AMDVIHardware` ← `AMDHardware`). Its `getDeviceType` compares the *config-space* device ID with Polaris IDs, so
+Stoney gets type 0. Polaris 11 assumptions that CarrizoRed patches on Stoney:
+- `AMDBaffinHardware::allocateHWEngines` fills the engine array at `+0x3B0`: PM4 (`+0x3B0`), sDMA0 (`+0x3B8`), sDMA1
+  (`+0x3C0`), UVD 6.3 (`+0x3D8`), VCE 3.4 (`+0x3E8`), SAMU (`+0x400`). Stoney has one sDMA. `initializeHWEngines` (11
+  slots) and `getHWChannel` skip empty slots, but `AMDHardware::startHWEngines` starts `+0x3B8` and `+0x3C0` and fails if
+  either is missing. CarrizoRed releases sDMA1 and starts sDMA0 alone, setting the same status bit (bit 9 of the word
+  at `+8` of the block returned by `(this+0x18)->vtable[0x178]`).
+- `AMDBaffinHardware::setupAndInitializeHWCapabilities` sets `+0x64` = 2 shader engines, `+0x6C` = 1 SH per SE,
+  `+0xA0` = 8 CUs per SH (Ellesmere 4/1/9), then `AMDVIHardware`'s version reads `GB_ADDR_CONFIG` (0x263E),
+  `PA_SC_RASTER_CONFIG(_1)` (0xA0D4/5) and the active-CU bitmaps from CAIL (query 3) into `+0x70…`, and the minimum
+  active CUs into `+0xA4`. CarrizoRed sets 1 SE and `+0xA0` = `+0xA4` afterwards.
+- Tiling: `AMDHWAlignManager::init` takes its configuration from the hardware interface at run time (AddrLib), i.e.
+  from what CAIL programmed for Stoney, so the kernel side should follow the real 2-pipe layout. User space is unchecked.
+- GPU VM: `AMDVIVMM::getPTEValue(level, addr, flags, fragment)` = `addr & 0xFFFFFFF000 | flags` (bit 0 valid, bit 1
+  system); `getPDEValue` = `addr & 0xFFFFFFFFC0 | 1`. Bulk updates go through sDMA:
+  `AMDHWVMContext::updateContiguousPTEsWithDMAUsingAddr(dst, count, addr, flagsTemplate, increment)`, with the
+  template from `getPTE/PDEValue(…, 0, …)`. On an APU local entries need the carve-out's physical address
+  (`MC_VM_FB_OFFSET << 22`, Linux `gmc_v8_0_get_vm_pde` / `vram_base_offset`), so CarrizoRed converts MC addresses
+  (inside `MC_VM_FB_LOCATION`) and FB offsets in all three. The black box records which form Apple actually uses.
+- Not handled yet: BAR0 (256 MB) is smaller than the 512 MB carve-out (CPU mappings of VRAM above 256 MB); UVD/VCE/SAMU
+  on Stoney (UVD 6.2, VCE 3.4, no GPUVM for UVD/VCE on APUs); power management (SMU8 vs SMU7 messages); user space.
