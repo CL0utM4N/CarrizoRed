@@ -68,7 +68,7 @@ bool FCHXHCIFix::start(IOService *provider) {
 	if (PE_parse_boot_argn("-fchxhcioff", arg, sizeof(arg)))
 		return false;
 	pci = OSDynamicCast(IOPCIDevice, provider);
-	if (!pci || !super::start(provider))
+	if (!pci || !IOService::start(provider))
 		return false;
 	if (!PE_parse_boot_argn("fchxhcimode", &mode, sizeof(mode)) || !mode)
 		mode = 2;
@@ -87,7 +87,7 @@ bool FCHXHCIFix::start(IOService *provider) {
 
 void FCHXHCIFix::stop(IOService *provider) {
 	stopping = true;
-	super::stop(provider);
+	IOService::stop(provider);
 }
 
 void FCHXHCIFix::publish(const char *what) {
