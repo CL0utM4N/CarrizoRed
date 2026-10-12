@@ -145,6 +145,9 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   memory is a uniform grey (0xFFBFBFBF on the top, middle and bottom rows), yet the panel shows identical coloured
   rows. Apple writes `LB_MEMORY_CTRL.LB_MEMORY_SIZE` = 0x404 (sized for Polaris's 13-bit DCE 11.2 field); the firmware
   and Linux (`LB_TOTAL_NUMBER_OF_ENTRIES`) use 0x6B0. CarrizoRed now forces 0x6B0 (`-crnolbfix` disables).
+- **Spoof boot 30 (LB size fixed, `LB_MEMORY_CTRL` 0x706B0):** no change. Every watched surface register equals the
+  firmware's apart from the surface address (+3 MB) and pitch (1536 px). Next: an exhaustive boot-vs-now diff of
+  DCCG, DMIF/DCI, all of pipe 0 (DCP incl. DVMM, LB, SCL, BLND, CRTC, FMT), LVTMA/HPD and DIG0/DP0.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).

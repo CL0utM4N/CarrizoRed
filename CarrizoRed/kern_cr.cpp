@@ -151,7 +151,7 @@ struct DpcdTx {
 };
 static constexpr uint32_t DpcdRingSize = 40;
 // Entries printed in the black box (the newest), sized so the whole report fits AAPL,PanicInfo.
-static constexpr uint32_t AtomPrinted = 20, DpcdPrinted = 20;
+static constexpr uint32_t AtomPrinted = 4, DpcdPrinted = 4;
 static DpcdTx dpcdRing[DpcdRingSize];
 static uint32_t dpcdHead, dpcdCount;
 
@@ -1807,6 +1807,23 @@ IOReturn CRDriver::wrapAuxWriteBytes(void *that, uint32_t address, uint32_t leng
 // at what the firmware used for the link it left running (bootDpLanes, from initDisplayRegs). -crnolanecap disables.
 static uint8_t bootDpLanes;  // 0 = no DP link was running at boot
 
+// Exhaustive display-path diff. Spoof boot 30: link trained, video on, scanout memory uniform grey, every watched
+// surface register equal to the firmware's (bar address and pitch), yet the panel shows identical coloured rows. So
+// the difference is in a register not watched: snapshot whole blocks at boot (firmware/GOP state, working picture)
+// and report every register that differs at crpanicat time.
+static const struct {
+	uint32_t start, count;
+} diffBlocks[] {
+	{0x100, 0x60},   // DCCG: pixel rate, DTOs, DPREFCLK, DENTIST, resync
+	{0x2C0, 0x80},   // pipe power gating, DMIF, DCI, MCIF
+	{0x1A00, 0x200}, // pipe 0: DCP (surface, DVMM, CSC, gamma), LB, DCFE, DMIF_PG/DPG, SCL, BLND, CRTC, FMT
+	{0x4800, 0x100}, // LVTMA power sequencer, backlight, HPD, DCIO
+	{0x4A00, 0x100}, // DIG0 / DP0
+};
+static constexpr uint32_t DiffRegCount = 0x60 + 0x80 + 0x200 + 0x100 + 0x100;
+static uint32_t diffBoot[DiffRegCount];
+static bool diffBootValid;
+
 uint8_t CRDriver::wrapMaxLinkLanes(const void *that) {
 	uint8_t lanes = FunctionCast(wrapMaxLinkLanes, callback->orgMaxLinkLanes)(that);
 	uint8_t capped = bootDpLanes && lanes > bootDpLanes ? bootDpLanes : lanes;
@@ -2076,6 +2093,13 @@ void CRDriver::initDisplayRegs() {
 		reg.bootValue = reg.value;
 		reg.bootValid = true;
 	}
+	{
+		uint32_t n = 0;
+		for (auto &block : diffBlocks)
+			for (uint32_t i = 0; i < block.count; i++)
+				diffBoot[n++] = gpuMmio[block.start + i];
+		diffBootValid = true;
+	}
 	// The DP link the firmware left running (video stream enabled) and its lane count (DP_CONFIG.DP_UDI_LANES:
 	// 0 = 1, 1 = 2, 3 = 4 lanes); see wrapMaxLinkLanes.
 	for (uint32_t dp = 0; dp < 3; dp++) {
@@ -2144,6 +2168,18 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		// The unchanged registers were listed in boots 22-25; leave them out to fit the DPCD transcript in NVRAM.
 		add("\n");
 		atomReport(add);
+	}
+	if (gpuMmio && diffBootValid) {
+		add("diff now/boot:");
+		uint32_t n = 0, changed = 0;
+		for (auto &block : diffBlocks) {
+			for (uint32_t i = 0; i < block.count; i++, n++) {
+				uint32_t now = gpuMmio[block.start + i];
+				if (now != diffBoot[n] && changed++ < 200)
+					add(" %x=%x/%x", block.start + i, now, diffBoot[n]);
+			}
+		}
+		add(" (%u changed)\n", changed);
 	}
 	// Pipe 0 surface registers, always (now/boot), and what the scanout memory actually holds: a few pixels on the top,
 	// middle and bottom rows of the surface, read through BAR0 (the carve-out from MC_VM_FB_LOCATION's base). Spoof boot
