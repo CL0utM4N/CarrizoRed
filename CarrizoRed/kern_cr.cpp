@@ -1265,7 +1265,7 @@ uint64_t CRDriver::wrapGetPDEValue(void *that, uint32_t level, uint64_t addr) {
 	return pde;
 }
 
-void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, int kext) {
+void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, size_t kext) {
 	if (checkKernelArgument("-crnotrace"))
 		return;
 	routeStages(patcher, index, slide, size,

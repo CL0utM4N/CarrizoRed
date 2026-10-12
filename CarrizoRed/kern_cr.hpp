@@ -116,7 +116,7 @@ private:
 
 	// Acceleration (AMDRadeonX4000): Stoney has one sDMA engine and one shader engine, and its "VRAM" is a carve-out
 	// in system RAM, so local page-table entries need the carve-out's physical address (see patchAccelerator).
-	void traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, int kext);
+	void traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, size_t kext);
 	void patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
 	static bool wrapAllocateHWEngines(void *that);
 	static bool wrapStartHWEngines(void *that);
