@@ -185,6 +185,10 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   But `IH_CNTL` = 0x01080000: `ENABLE_INTR` off, so the IH never signals. Apple's `setHardwareEnabled` sets
   `ENABLE_INTR` in `IH_RB_CNTL` bit 17 (Tonga layout); CZ keeps it in `IH_CNTL` bit 0 and needs `RPTR_REARM` (bit 4)
   for MSI (Linux `cz_ih` vs `tonga_ih`). CarrizoRed now mirrors the enable into `IH_CNTL` (`-crnoihfix` disables).
+- **Spoof boot 38 (IH_CNTL fix, `crpanicat=120`): reached the macOS Recovery setup screen** on the internal panel.
+  115 interrupts handled, ring drained (RPTR = WPTR = 0x730), IH idle, `IH_CNTL` = 0x01080011. Apple masks CRTC0
+  V_UPDATE again when idle (`CRTC_INTERRUPT_CONTROL` 0x8000020). The scanout memory holds the setup screen's dark
+  gradient. The stop at 120 s was the deliberate panic.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
