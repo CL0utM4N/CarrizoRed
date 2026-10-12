@@ -102,6 +102,11 @@ static uint32_t regLogged, regAccesses;
 static bool regLogIntsOff, pipeGuard, regLogAll;
 static bool lbFixOff;    // -crnolbfix, see wrapRegWrite32
 static uint32_t lbFixes;
+// DP colour depth of the link the firmware left running (DP_PIXEL_FORMAT.DP_COMPONENT_DEPTH: 0 = 6, 1 = 8, 2 = 10,
+// 3 = 12 bpc), 0xFF = unknown; see initDisplayRegs. -crnobpccap disables the cap.
+static uint8_t bootDpDepth = 0xFF;
+static bool bpcCapOff;
+static uint32_t bpcCaps;
 static uint32_t pipeLimit = 6, pipeAccesses, pipeLogged;
 struct RegEvent {
 	RegOp op;
@@ -128,7 +133,7 @@ struct AtomCall {
 	uint16_t repeat;
 	uint32_t in[4], out[2];
 };
-static constexpr uint32_t AtomRingSize = 32, AtomAuxTable = 0x4E, AtomTransmitterTable = 0x4C;
+static constexpr uint32_t AtomRingSize = 32, AtomAuxTable = 0x4E, AtomTransmitterTable = 0x4C, AtomEncoderTable = 0x04;
 static bool dpExtClkOff;    // -crnodpextclk, see wrapExecuteBiosCommandTable
 static bool edpPowerOnOff;  // -crnoedppoweron, see wrapExecuteBiosCommandTable
 
@@ -334,6 +339,7 @@ void CRDriver::processPatcher(KernelPatcher &) {
 	regLogIntsOff = checkKernelArgument("-crreglogintsoff");
 	regLogAll = checkKernelArgument("-crreglogall");
 	lbFixOff = checkKernelArgument("-crnolbfix");
+	bpcCapOff = checkKernelArgument("-crnobpccap");
 
 	logPCIInfo();
 	if (checkKernelArgument("-crmacgpu"))
@@ -1315,6 +1321,14 @@ void CRDriver::wrapRegWrite32(void *that, uint32_t offset, uint32_t value) {
 			}
 		}
 	}
+	// DP colour depth: see the DIGxEncoderControl patch in wrapExecuteBiosCommandTable.
+	if (!bpcCapOff && bootDpDepth != 0xFF) {
+		uint32_t dword = offset >> 2;
+		if ((dword == 0x4AA1 || dword == 0x4BA1 || dword == 0x4CA1) && ((value >> 24) & 7) > bootDpDepth) {
+			value = (value & ~0x7000000u) | (static_cast<uint32_t>(bootDpDepth) << 24);
+			__atomic_fetch_add(&bpcCaps, 1, __ATOMIC_RELAXED);
+		}
+	}
 	if (!(regAccess(RegWrite, offset, 0, value) & RegBlocked))
 		FunctionCast(wrapRegWrite32, callback->orgRegWrite32)(that, offset, value);
 }
@@ -1716,6 +1730,21 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			}
 		}
 	}
+	// DP colour depth. The firmware drives this eDP panel at 6 bpc (DP_PIXEL_FORMAT.DP_COMPONENT_DEPTH = 0, FMT truncation
+	// to 6 bits + dither): an 18 bpp panel. Apple's DIGxEncoderControl (table 4) v4 calls pass ucBitPerColor (+6) =
+	// PANEL_8BIT_PER_COLOR for DP mode (ucEncoderMode +4 = 0), and DP_PIXEL_FORMAT ended up at 8 bpc. Spoof boot 31: link
+	// trained, scanout memory uniform grey, panel showing identical coloured rows, as a 6 bpc sink decoding 24 bpp data
+	// would. Cap ucBitPerColor at the firmware's depth (ATOM value = DP_COMPONENT_DEPTH + 1); DP_PIXEL_FORMAT writes are
+	// capped in wrapRegWrite32. -crnobpccap disables.
+	if (table == AtomEncoderTable && params && !bpcCapOff && bootDpDepth != 0xFF) {
+		auto *bytes = static_cast<uint8_t *>(params);
+		uint8_t atomBpc = static_cast<uint8_t>(bootDpDepth + 1);
+		if (bytes[3] != 0x10 && bytes[4] == 0 && bytes[6] > atomBpc) {
+			bytes[6] = atomBpc;
+			patched = 0x80;
+			__atomic_fetch_add(&bpcCaps, 1, __ATOMIC_RELAXED);
+		}
+	}
 	if (params)
 		memcpy(call->in, params, sizeof(call->in));
 	else
@@ -2107,6 +2136,7 @@ void CRDriver::initDisplayRegs() {
 		if (stream & 1) {
 			uint32_t udi = config & 3;
 			bootDpLanes = udi == 0 ? 1 : udi == 1 ? 2 : 4;
+			bootDpDepth = static_cast<uint8_t>((gpuMmio[0x4AA1 + 0x100 * dp] >> 24) & 7);
 			SYSLOG("cr", "boot: DP%u link running, %u lane(s) (DP_CONFIG 0x%x)", dp, bootDpLanes, config);
 			break;
 		}
@@ -2142,8 +2172,9 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		if (n > 0)
 			len += static_cast<size_t>(n) < sizeof(report) - len ? static_cast<size_t>(n) : sizeof(report) - len - 1;
 	};
-	add("boot DP lanes %u (lane cap %s), LB size fixes %u%s\n", bootDpLanes,
-		checkKernelArgument("-crnolanecap") ? "off" : "on", lbFixes, lbFixOff ? " (off)" : "");
+	add("boot DP lanes %u (lane cap %s), LB size fixes %u%s, boot DP depth %u, bpc caps %u%s\n", bootDpLanes,
+		checkKernelArgument("-crnolanecap") ? "off" : "on", lbFixes, lbFixOff ? " (off)" : "", bootDpDepth, bpcCaps,
+		bpcCapOff ? " (off)" : "");
 	add("t=%us regs %u ih %u missing-pipe %u pm %u cfgwr %u\n", t, __atomic_load_n(&regAccesses, __ATOMIC_RELAXED),
 		__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), __atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED),
 		__atomic_load_n(&pmEvents, __ATOMIC_RELAXED), __atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));

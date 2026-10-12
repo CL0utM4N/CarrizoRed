@@ -65,6 +65,7 @@ uploads them (plus a debug `Lilu.kext`) as a workflow artifact.
 | `-crnovramwrite` | Skip `ATIController::TestVRAM` entirely (no test patterns written into the carve-out) |
 | `-crnoints` | Skip `AtiFbInterruptManager::installInterruptsOnPciDevice` (no interrupt registered or enabled) |
 | `-crnofblimit` | Keep Apple's framebuffer count (6) instead of limiting it to the display pipes via `CFG_FB_LIMIT` |
+| `-crnobpccap` | Don't cap the DP colour depth at the firmware's (encoder `ucBitPerColor`, `DP_PIXEL_FORMAT`) |
 | `-crnolbfix` | Keep Apple's line-buffer size instead of DCE 11.0's 0x6B0 in `LB_MEMORY_CTRL` |
 | `-crnoedppoweron` | Don't run the eDP panel POWER_ON transmitter action before Apple enables the eDP transmitter |
 | `-crnodpextclk` | Don't switch the DP PHY clock source to the external reference in `DIG1TransmitterControl` |

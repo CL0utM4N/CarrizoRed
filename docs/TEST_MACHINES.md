@@ -148,6 +148,12 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
 - **Spoof boot 30 (LB size fixed, `LB_MEMORY_CTRL` 0x706B0):** no change. Every watched surface register equals the
   firmware's apart from the surface address (+3 MB) and pitch (1536 px). Next: an exhaustive boot-vs-now diff of
   DCCG, DMIF/DCI, all of pipe 0 (DCP incl. DVMM, LB, SCL, BLND, CRTC, FMT), LVTMA/HPD and DIG0/DP0.
+- **Spoof boot 31 (exhaustive diff, 89 registers changed):** the firmware drives the panel at **6 bpc**
+  (`DP_PIXEL_FORMAT.DP_COMPONENT_DEPTH` 0, `FMT_BIT_DEPTH_CONTROL` truncate to 6 bits + spatial dither); Apple sets
+  8 bpc (`DP_COMPONENT_DEPTH` 1, no FMT reduction, encoder `ucBitPerColor` = `PANEL_8BIT_PER_COLOR`). An 18 bpp
+  panel decoding 24 bpp data gives identical coloured rows. The rest of the diff is Apple's own gamma/regamma LUT,
+  gamut remap, cursor, scaler init, CRTC double-buffer settings and status/counter registers. CarrizoRed now caps the
+  DP colour depth at the firmware's (`-crnobpccap` disables).
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
