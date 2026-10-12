@@ -1,5 +1,7 @@
 # FCHXHCIFix
 
+Full write-up (cause, diagnosis, affected machines): [docs/FCH_XHCI.md](../docs/FCH_XHCI.md).
+
 A small IOKit kext (no Lilu) that makes USB usable on AMD FCH xHCI controllers whose interrupts never reach macOS.
 
 **Symptom:** USB works but crawls. On the ASUS VivoBook 15 D509BA (A9-9425, Stoney Ridge, FCH xHCI `1022:7914`) the

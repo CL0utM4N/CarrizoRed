@@ -96,6 +96,7 @@ docs/
   ROADMAP.md               Phase plan
   PHASE0.md                Hardware / environment / reverse-engineering checklist
   CARRIZO_VS_POLARIS.md    Where Linux amdgpu treats Carrizo differently from Polaris
+  FCH_XHCI.md              Why USB crawls on Carrizo/Bristol Ridge/Stoney under macOS, and FCHXHCIFix
   DCE11_REGISTER_DIFF.md   DCE 11.0 vs 11.2 display register diff (full data in docs/data/)
   APPLE_KEXTS.md           Getting Apple's AMD kexts from a KDK on Windows, and what's inside them
 FCHXHCIFix/                Standalone kext: services the AMD FCH xHCI (1022:7914), whose interrupts never reach macOS
@@ -105,6 +106,12 @@ scripts/
   extract_kdk.py           Extract files from a KDK .dmg/.pkg without a Mac
   dce_regdiff.py           Diff two Linux DCE register header sets
 ```
+
+## USB on these machines
+
+The APUs' built-in USB 3 controller (FCH xHCI `1022:7914`) loses all its interrupts under macOS, so USB crawls. The
+standalone [FCHXHCIFix](FCHXHCIFix/README.md) kext fixes it; the details and the list of affected machines are in
+[docs/FCH_XHCI.md](docs/FCH_XHCI.md).
 
 ## Licensing notes
 
