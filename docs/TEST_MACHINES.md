@@ -216,3 +216,18 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   whole "VRAM" is CPU-visible through BAR0 (Linux maps the carve-out directly at `MC_VM_FB_OFFSET << 22`).
 - For macOS: no Wi-Fi (QCA9377), so use a USB Ethernet/Wi-Fi adapter or iPhone USB tethering if needed. Use a USB mouse
   (the I²C trackpad is unlikely to work on AMD without extra work).
+
+### USB slowness: what's known (2026-10-12)
+- Symptoms: the 2026-10-10 install copied ~130 KB/s from the stick; `dd` from the stick hung; the mouse sometimes
+  disconnects and re-enumerates on XHC0; the full-installer stick sat in `validate_root_image` for minutes. The UEFI
+  firmware itself took 112 s to load `BootKernelExtensions.kc` from that stick (boot.efi log), i.e. it is slow before
+  macOS runs.
+- Linux on this laptop (Ubuntu dump): XHC0 `1022:7914` rev 0x20, xHCI 1.0, **MSI-X** enabled (MSI cap 1/8 unused), no
+  device-specific quirk (`quirks 0x10` = the generic spurious-success one); the AMD PLL fix only covers Hudson-2/Bolton.
+  Linux enables USB 3 LPM (U1/U2) only on hosts it trusts (mostly Intel), so it never uses it here; macOS does. A
+  long-running Red Hat bug (1196943) has the older AMD APU FCHs (Hudson/Bolton) dying or failing enumeration with USB
+  autosuspend on, fine with it off. EHCI (`1022:7908`, the USB 2.0 ports) shares IRQ 18 but has its own MSI-less path.
+- Hypotheses, each with a test: (1) the stick/port itself (firmware is slow too): read speed of the same stick on
+  another machine; (2) xHCI link power management / suspend: compare a USB 2.0 port (EHCI, no U1/U2); (3) lost
+  interrupts (driver falls back to timeouts): `usb-spoof-xhciprobe` (XHCIProbe 0.3 with `-xhciprobe_noact`) prints
+  `XHCIProbe: irq … msi msix … IP x/y EINT x/y events n` every 2 s.
