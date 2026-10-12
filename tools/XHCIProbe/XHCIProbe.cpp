@@ -27,7 +27,11 @@
 //  U2, U3, Recovery or another link state, how often the device dropped off (CCS 1 -> 0), the speed and PORTPMSC
 //  (the U1/U2 timeouts the driver programmed). Read-only, like the rest of the monitor.
 //
-//  Boot-args: -xhciprobe_noact   only record state, change nothing
+//  0.5 switches the AMD FCH xHCI (1022:7914) to MSI-X before AppleUSBXHCIPCI starts (plain MSI never reaches the CPU
+//  there; see the comment in probe()).
+//
+//  Boot-args: -xhciprobe_noact   only record state, don't run the start-up steps
+//             -xhciprobe_nomsix  keep IOPCIFamily's default (MSI) on 1022:7914
 //             -xhciprobe_nomon   no monitor thread
 //             -xhciprobe_off     do nothing at all
 //
@@ -46,6 +50,12 @@
 #include <pexpert/pexpert.h>
 #include <stdarg.h>
 #include <string.h>
+
+// IOPCIDevice::configureInterrupts(type, numRequired, numRequested, options) (IOPCIFamily, reserved slot 4; not in
+// MacKernelSDK's header). Called non-virtually by its exported symbol.
+extern "C" IOReturn XHCIProbeConfigureInterrupts(IOPCIDevice *device, UInt32 type, UInt32 numRequired,
+	UInt32 numRequested, IOOptionBits options) __asm("__ZN11IOPCIDevice19configureInterruptsEjjjj");
+static constexpr UInt32 InterruptTypePCIMessagedX = 0x00020000;  // IOPCIFamilyDefinitions.h
 
 class XHCIProbe : public IOService {
 	OSDeclareDefaultStructors(XHCIProbe)
@@ -460,6 +470,22 @@ IOService *XHCIProbe::probe(IOService *provider, SInt32 *score) {
 		pci->setProperty("XHCIProbe-steps", steps);
 		snapshot(c, "after", buf, sizeof(buf));
 		pci->setProperty("XHCIProbe-after", buf);
+	}
+
+	// MSI-X (0.5). On the D509BA's FCH xHCI (1022:7914) plain MSI never reaches the CPU: with MSI (vector 0x71,
+	// address 0xFEE10000) USBSTS.EINT stayed set in every 1 ms sample and the event ring was serviced once every 2 s,
+	// by AppleUSBXHCI's fallback timer, which made USB storage crawl. Linux drives the same controller with MSI-X.
+	// IOPCIFamily only picks MSI-X by itself for Ethernet controllers (IOPCIBridge::childPrefersMSIX), but a driver
+	// may ask for it before the interrupt vectors are resolved, which happens lazily when AppleUSBXHCIPCI registers
+	// its interrupt (after this probe). MSI-X vectors are also marked kIOInterruptTypePCIMessaged, which is what
+	// AppleUSBXHCIPCI::start looks for. -xhciprobe_nomsix keeps MSI. Independent of -xhciprobe_noact.
+	if (vendor == 0x1022 && device == 0x7914 && c.msix && !PE_parse_boot_argn("-xhciprobe_nomsix", arg, sizeof(arg))) {
+		IOReturn ret = XHCIProbeConfigureInterrupts(pci, InterruptTypePCIMessagedX, 1, 1, 0);
+		char msix[96];
+		snprintf(msix, sizeof(msix), "configureInterrupts(MSI-X, 1, 1) = 0x%x, MSI-X control %04x", ret,
+			pci->configRead16(c.msix + 2));
+		IOLog("XHCIProbe: %s\n", msix);
+		pci->setProperty("XHCIProbe-msix", msix);
 	}
 
 	if (vendor == 0x1022) {
