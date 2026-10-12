@@ -264,3 +264,6 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   never raise an interrupt macOS sees, and the EINT-only forwarder missed most of them. Root cause still open (likely
   the controller not re-asserting after the first event: EHB / IMAN handling on this FCH); the workaround costs a
   work-loop wake-up every ~2.5 ms. To do: move the forwarder out of CarrizoRed into its own Lilu plugin.
+- **Forwarder moved out of CarrizoRed into `FCHXHCIFix/`** (2026-10-13): a plain IOKit kext matching `1022:7914` in its
+  own `IOMatchCategory`, so it works without CarrizoRed and Lilu. Included in every D509BA EFI. Boot-args
+  `-fchxhcioff`, `fchxhcimode=1`; state in the controller's `FCHXHCIFix-state` property (XHCIProbe 0.5.4 prints it).

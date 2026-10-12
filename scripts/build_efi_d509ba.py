@@ -57,6 +57,9 @@ KEXTS = [  # (bundle path inside its release folder, executable, comment)
     ("VoodooI2C-*/VoodooI2C.kext/Contents/PlugIns/VoodooInput.kext", "VoodooInput", "Trackpad input (Magic Trackpad)"),
     ("VoodooI2C-*/VoodooI2C.kext", "VoodooI2C", "I2C controller (AMD0010)"),
     ("VoodooI2C-*/VoodooI2CHID.kext", "VoodooI2CHID", "HID-over-I2C touchpad (ELAN)"),
+    # The FCH xHCI (1022:7914) never delivers its interrupts to macOS; without this USB runs off AppleUSBXHCI's 2 s
+    # fallback timer (FCHXHCIFix/README.md). From the CI artifact (FCHXHCIFix-*.zip), unpacked to unpacked/FCHXHCIFix/.
+    ("FCHXHCIFix/FCHXHCIFix.kext", "FCHXHCIFix", "USB: service the FCH xHCI, whose interrupts are lost"),
 ]
 
 # Optional (--gux): GenericUSBXHCI "RyzenXHCIFix" (github.com/RattletraPM/GUX-RyzenXHCIFix, unpacked to unpacked/GUX/).

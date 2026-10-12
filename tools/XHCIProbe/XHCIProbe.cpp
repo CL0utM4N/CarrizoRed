@@ -291,7 +291,7 @@ namespace {
 					}
 				}
 				char w[200];
-				snprintf(w, sizeof(w), "v0.5.3 t=%llus D%u msi=%d msix=%d to %x/%x%s EINT %u/%u ev %u/%u/%u ie %x hse %u",
+				snprintf(w, sizeof(w), "v0.5.4 t=%llus D%u msi=%d msix=%d to %x/%x%s EINT %u/%u ev %u/%u/%u ie %x hse %u",
 					t / 1000, c.pm ? c.pci->configRead16(c.pm + 4) & 3 : 0xF, msi, msix, target, data,
 					mask ? " MASKED" : "", eintSet, samples, ringMoves[0], ringMoves[1], ringMoves[2], ringIe, hse);
 				IOLog("XHCIProbe: irq %s\n", w);
@@ -315,9 +315,9 @@ namespace {
 					ps.connected = connected;
 				}
 				IOLog("XHCIProbe: ports %s\n", l[0] ? l : "(none connected)");
-				// CarrizoRed's interrupt forwarder (its hooks, caught interrupt sources and counts), if it set any.
-				auto *fwd = OSDynamicCast(OSString, c.pci->getProperty("CarrizoRed-xhcifwd"));
-				IOLog("XHCIProbe: fwd %s\n", fwd ? fwd->getCStringNoCopy() : "(no CarrizoRed-xhcifwd property)");
+				// FCHXHCIFix's state (interrupt sources, forwards, polls), if it is loaded.
+				auto *fwd = OSDynamicCast(OSString, c.pci->getProperty("FCHXHCIFix-state"));
+				IOLog("XHCIProbe: fwd %s\n", fwd ? fwd->getCStringNoCopy() : "(no FCHXHCIFix-state property)");
 				c.pci->setProperty("XHCIProbe-ports", l);
 				samples = eintSet = hse = 0;
 				bzero(ringMoves, sizeof(ringMoves));

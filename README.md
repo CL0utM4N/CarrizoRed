@@ -72,8 +72,6 @@ uploads them (plus a debug `Lilu.kext`) as a workflow artifact.
 | `-crnocapsfix` | Stoney: keep Apple's Polaris 11 shader-engine / CU counts (2 SE, 8 CUs per SH) |
 | `-crnovmfix` | Don't convert local GPU page-table entries to the carve-out's physical address (`MC_VM_FB_OFFSET << 22`) |
 | `-crdisplaydiag` | Keep the display sections (VBIOS calls, DPCD, register diff, pixels) in the black box on accelerated boots |
-| `-crnoxhcifwd` | Don't forward the AMD FCH USB 3 controller's (1022:7914) lost interrupts to AppleUSBXHCI by polling `USBSTS.EINT` every 1 ms |
-| `crxhcimode=N` | USB 3 forwarding: 1 = signal AppleUSBXHCI only when `USBSTS.EINT` is set, 2 (default) = on every poll |
 | `-crnoihfix` | Don't mirror Apple's IH interrupt enable (Tonga `IH_RB_CNTL.ENABLE_INTR`) into Carrizo/Stoney's `IH_CNTL` (`ENABLE_INTR`, `RPTR_REARM`) |
 | `-crnobpccap` | Don't cap the DP colour depth at the firmware's (encoder `ucBitPerColor`, `DP_PIXEL_FORMAT`) |
 | `-crnolbfix` | Keep Apple's line-buffer size instead of DCE 11.0's 0x6B0 in `LB_MEMORY_CTRL` |
@@ -100,6 +98,8 @@ docs/
   CARRIZO_VS_POLARIS.md    Where Linux amdgpu treats Carrizo differently from Polaris
   DCE11_REGISTER_DIFF.md   DCE 11.0 vs 11.2 display register diff (full data in docs/data/)
   APPLE_KEXTS.md           Getting Apple's AMD kexts from a KDK on Windows, and what's inside them
+FCHXHCIFix/                Standalone kext: services the AMD FCH xHCI (1022:7914), whose interrupts never reach macOS
+tools/XHCIProbe/           Diagnostic kext for that controller (state, interrupts, link states)
 scripts/
   bootstrap.sh             Fetch Lilu + MacKernelSDK (macOS / CI)
   extract_kdk.py           Extract files from a KDK .dmg/.pkg without a Mac

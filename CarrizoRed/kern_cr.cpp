@@ -15,8 +15,6 @@
 #include <Headers/kern_util.hpp>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IODeviceTreeSupport.h>
-#include <IOKit/IOFilterInterruptEventSource.h>
-#include <IOKit/IOWorkLoop.h>
 #include <kern/thread.h>
 #include <kern/debug.h>
 #include <stdarg.h>
@@ -300,164 +298,7 @@ void CRDriver::init() {
 		this);
 }
 
-// --- AMD FCH xHCI interrupt forwarding ------------------------------------------------------------------------------
-// The D509BA's USB 3 controller (FCH xHCI 1022:7914) never delivers its interrupts to macOS: XHCIProbe saw USBSTS.EINT
-// set in every 1 ms sample and the event ring serviced once every 2 s (AppleUSBXHCI's fallback timer), with plain MSI
-// and with MSI-X alike, while the controller does send them (IMAN.IP keeps clearing, as MSI does on send) and the
-// GPU's MSIs to the same address arrive. Every USB transfer waited up to 2 s: the installer copied at ~130 KB/s.
-// Forward them in software. A thread waits for AppleUSBXHCIPCI to attach to the controller, finds its interrupt
-// source (the IOFilterInterruptEventSource on the driver's work loop whose provider is the controller), polls
-// USBSTS.EINT every millisecond, and when it is set, clears it (RW1C) and signals the source, which runs
-// AppleUSBXHCI::primaryInterrupt on its work loop exactly as a delivered interrupt would. (Hooking the source's
-// creation missed it: the USB boot device starts before Lilu's patcher.) The state is published as the controller's
-// "CarrizoRed-xhcifwd" property, which XHCIProbe prints. -crnoxhcifwd disables.
-namespace {
-	// The event chain is protected; these read it through the kernel's own layout (MacKernelSDK headers).
-	struct WorkLoopPeek : IOWorkLoop {
-		static IOEventSource *head(IOWorkLoop *loop) { return static_cast<WorkLoopPeek *>(loop)->eventChain; }
-	};
-	struct EventSourcePeek : IOEventSource {
-		static IOEventSource *next(IOEventSource *source) { return static_cast<EventSourcePeek *>(source)->eventChainNext; }
-	};
-
-	IOFilterInterruptEventSource *xhciSources[4];
-	uint32_t xhciSourceCount, xhciForwards, xhciPolls;
-	IOPCIDevice *xhciDevice;
-	uint32_t xhciMode = 2;  // crxhcimode=1: signal only when USBSTS.EINT is set; 2: on every poll
-
-	void xhciPublish(const char *what) {
-		if (!xhciDevice)
-			return;
-		char state[160];
-		snprintf(state, sizeof(state), "%u sources, %u forwards, %u polls; %s", xhciSourceCount,
-			__atomic_load_n(&xhciForwards, __ATOMIC_RELAXED), __atomic_load_n(&xhciPolls, __ATOMIC_RELAXED), what);
-		xhciDevice->setProperty("CarrizoRed-xhcifwd", state);
-	}
-
-	IOPCIDevice *xhciFind() {
-		IOPCIDevice *found = nullptr;
-		if (auto *iterator = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"))) {
-			while (auto *pci = OSDynamicCast(IOPCIDevice, iterator->getNextObject())) {
-				if (WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigVendorID) == 0x1022 &&
-					WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigDeviceID) == 0x7914) {
-					pci->retain();
-					found = pci;
-					break;
-				}
-			}
-			iterator->release();
-		}
-		return found;
-	}
-
-	// Collect the driver's filter interrupt sources on the controller, inside the work loop's gate (the chain can't
-	// change under us there).
-	IOReturn xhciCollect(OSObject *, void *arg0, void *, void *, void *) {
-		auto *loop = static_cast<IOWorkLoop *>(arg0);
-		for (auto *source = WorkLoopPeek::head(loop); source && xhciSourceCount < arrsize(xhciSources);
-			 source = EventSourcePeek::next(source)) {
-			auto *filter = OSDynamicCast(IOFilterInterruptEventSource, source);
-			if (filter && filter->getProvider() == xhciDevice) {
-				filter->retain();
-				xhciSources[xhciSourceCount++] = filter;
-			}
-		}
-		return kIOReturnSuccess;
-	}
-
-	void xhciForwardThread(void *, wait_result_t) {
-		// Up to 5 min for the controller and its driver (the installer's USB stack starts early, but be generous).
-		IOService *driver = nullptr;
-		for (int i = 0; i < 3000 && !driver; i++) {
-			if (!xhciDevice)
-				xhciDevice = xhciFind();
-			if (xhciDevice) {
-				if (auto *clients = xhciDevice->getClientIterator()) {
-					while (auto *client = OSDynamicCast(IOService, clients->getNextObject())) {
-						if (!strcmp(client->getMetaClass()->getClassName(), "AppleUSBXHCIPCI")) {
-							driver = client;
-							driver->retain();
-							break;
-						}
-					}
-					clients->release();
-				}
-				if (!driver)
-					xhciPublish("waiting for AppleUSBXHCIPCI");
-			}
-			if (!driver)
-				IOSleep(100);
-		}
-		if (!driver) {
-			xhciPublish("AppleUSBXHCIPCI never attached");
-			return;
-		}
-		IOWorkLoop *loop = driver->getWorkLoop();
-		if (!loop) {
-			xhciPublish("driver has no work loop");
-			return;
-		}
-		// The source is added during start(); retry briefly if it isn't there yet.
-		for (int i = 0; i < 50 && !xhciSourceCount; i++) {
-			loop->runAction(xhciCollect, driver, loop);
-			if (!xhciSourceCount)
-				IOSleep(100);
-		}
-		if (!xhciSourceCount) {
-			xhciPublish("no interrupt source on the driver's work loop");
-			return;
-		}
-		IOMemoryMap *map = xhciDevice->mapDeviceMemoryWithIndex(0);
-		if (!map) {
-			xhciPublish("BAR0 map FAILED");
-			return;
-		}
-		SYSLOG("cr", "xHCI 1022:7914: forwarding interrupts (%u sources)", xhciSourceCount);
-		auto *base = reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
-		uint64_t length = map->getLength();
-		auto r32 = [&](uint32_t off) { return off + 4 <= length ? *reinterpret_cast<volatile uint32_t *>(base + off) : ~0u; };
-		for (;;) {
-			uint32_t cap = r32(0);
-			if (cap == ~0u) {  // powered down (D3) or gone
-				IOSleep(10);
-				continue;
-			}
-			uint32_t usbsts = (cap & 0xFF) + 4;
-			uint32_t sts = r32(usbsts);
-			uint32_t polls = __atomic_add_fetch(&xhciPolls, 1, __ATOMIC_RELAXED);
-			// Mode 2 (default): signal on every poll. XHCIProbe 0.5.3 with mode 1 (signal only when EINT is set) showed
-			// the IO interrupter completing 1-4 batches per 2 s and EINT set just as rarely, i.e. the controller raises
-			// no new interrupt (and so no EINT) until something it is waiting for happens, which only the 2 s fallback
-			// timer appeared to provide. AppleUSBXHCI::interruptOccurred returns quickly when the rings are empty.
-			bool eint = sts != ~0u && (sts & 8);
-			if (eint)
-				*reinterpret_cast<volatile uint32_t *>(base + usbsts) = 8;
-			if (eint || xhciMode >= 2) {
-				for (uint32_t i = 0; i < xhciSourceCount; i++)
-					xhciSources[i]->signalInterrupt();
-				__atomic_fetch_add(&xhciForwards, 1, __ATOMIC_RELAXED);
-			}
-			if (polls % 1000 == 1)
-				xhciPublish(xhciMode >= 2 ? "running, mode 2 (every poll)" : "running, mode 1 (on EINT)");
-			IOSleep(1);
-		}
-	}
-
-	void xhciStartForwarding() {
-		if (!PE_parse_boot_argn("crxhcimode", &xhciMode, sizeof(xhciMode)) || !xhciMode)
-			xhciMode = 2;
-		thread_t thread;
-		if (kernel_thread_start(xhciForwardThread, nullptr, &thread) == KERN_SUCCESS)
-			thread_deallocate(thread);
-		else
-			SYSLOG("cr", "xHCI forwarding: thread FAILED");
-	}
-}
-
 void CRDriver::processPatcher(KernelPatcher &) {
-	if (!checkKernelArgument("-crnoxhcifwd"))
-		xhciStartForwarding();
-
 	auto *devInfo = DeviceInfo::create();
 	if (!devInfo) {
 		SYSLOG("cr", "failed to create DeviceInfo");
@@ -2793,8 +2634,6 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 	if (restoreOn)
 		add("restore: %u steps done, %u registers written, %u re-written after Apple changed them\n", restoreDone,
 			restoreWrites, restoreHolds);
-	add("xhci fwd: %u sources, %u forwards, %u polls%s\n", xhciSourceCount, xhciForwards, xhciPolls,
-		checkKernelArgument("-crnoxhcifwd") ? " (off)" : "");
 	add("assr: DPCD 0x00D cap 0x%02x, 0x10A before Apple 0x%02x, %u writes%s, readback 0x%02x\n", assrCap, assrBoot,
 		assrWrites, assrOff ? " (off)" : "", assrReadback);
 	if (!checkKernelArgument("-crnoaccel")) {
