@@ -1674,19 +1674,24 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	AtomCall entry {};
 	auto *call = &entry;
 	call->table = static_cast<uint16_t>(table);
-	// DP PHY clock source. DIG1TransmitterControl (table 0x4C) v1.5 parameters: usSymClock, ucPhyId, ucAction,
-	// ucLaneNum, ucConnObjId, ucDigMode (+6), asConfig (+7: [1:0] ucPhyClkSrcId, [2] coherent, [6:4] HPD), ... Apple sets
-	// ucPhyClkSrcId 0 (P1PLL) for DP. The APU VBIOS FirmwareInfo has usUniphyDPModeExtClkFreq = 100 MHz ("otherwise
-	// [non-zero] input clock from external spread clock"), and Linux DC on DCE 11.0 only drives DP from
-	// CLOCK_SOURCE_ID_EXTERNAL (dce110_resource.c), i.e. ucPhyClkSrcId = REFCLK_SRC_EXT >> 2 = 3. Spoof boot 24: with
-	// P1PLL the eDP link failed clock recovery at every voltage swing. Use the external reference for DP modes (0 SST,
-	// 5 MST). -crnodpextclk disables.
+	// DP PHY clock source and coherent mode. DIG1TransmitterControl (table 0x4C) v1.5 parameters: usSymClock, ucPhyId,
+	// ucAction, ucLaneNum, ucConnObjId, ucDigMode (+6), asConfig (+7, ATOM_DIG_TRANSMITTER_CONFIG_V5 little-endian:
+	// [0] reserved, [1] ucCoherentMode, [3:2] ucPhyClkSrcId, [6:4] ucHPDSel), ucDigEncoderSel, ucDPLaneSet. For DP Apple
+	// sends 0x10: HPD1, P1PLL, not coherent. The APU VBIOS FirmwareInfo has usUniphyDPModeExtClkFreq = 100 MHz
+	// ("non-zero: DP-mode Uniphy input clock from the external spread clock"); legacy amdgpu (atombios_encoders.c,
+	// case 5) sends ucPhyClkSrcId = ENCODER_REFCLK_SRC_EXTCLK (3) when dp_extclk is set and ucCoherentMode = 1 ("DP
+	// requires coherent"), i.e. 0x1E for eDP on HPD1. Spoof boots 24-27 failed clock recovery at every swing (boots
+	// 25-27 had this patch writing bits [1:0] by mistake: coherent + reserved, clock still P1PLL). Apply both for DP
+	// modes (0 SST, 5 MST), keep Apple's HPD. -crnodpextclk disables.
 	uint8_t patched = 0;
 	if (table == AtomTransmitterTable && params && !dpExtClkOff) {
 		auto *bytes = static_cast<uint8_t *>(params);
-		if ((bytes[6] == 0 || bytes[6] == 5) && (bytes[7] & 3) != 3) {
-			bytes[7] = static_cast<uint8_t>((bytes[7] & ~3) | 3);
-			patched = 0x80;
+		if (bytes[6] == 0 || bytes[6] == 5) {
+			uint8_t config = static_cast<uint8_t>((bytes[7] & 0xF0) | (3 << 2) | 0x02);
+			if (config != bytes[7]) {
+				bytes[7] = config;
+				patched = 0x80;
+			}
 		}
 	}
 	if (params)

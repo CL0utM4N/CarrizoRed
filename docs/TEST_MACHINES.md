@@ -131,6 +131,11 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   `UNIPHYTransmitterControl` with `ATOM_TRANSMITTER_ACTION_POWER_ON` (12) before `ENABLE`; Apple never does, and its
   clean-up had switched the LVTMA power sequencer off (SYNCEN gates the PHY output). CarrizoRed now injects that
   call (`-crnoedppoweron` disables) and snapshots the eDP registers when training pattern 1 starts.
+- **Spoof boot 27 (eDP POWER_ON injected):** the **backlight comes on** and the sequencer is in the firmware's state
+  at TPS1 (`LVTMA_PWRSEQ_STATE` 0x41F), but the sink still sees no clock recovery. Comparing against amdgpu's
+  `case 5` transmitter setup showed the earlier clock-source patch wrote the wrong bits: the v1.5 config byte is
+  `[1]` coherent, `[3:2]` PHY clock source, `[6:4]` HPD, so boots 25–27 sent 0x13 (coherent + a reserved bit,
+  clock still P1PLL). amdgpu sends 0x1E for eDP on HPD1 (external clock, coherent). Patch corrected.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
