@@ -158,6 +158,12 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   matches. The panel now flashes, still with identical random-colour rows plus a white line. Remaining differences
   are in pipe 0's processing chain (FMT, LB, DCP colour pipeline/cursor, scaler/CRTC update). Next: `-crrestore`
   writes the firmware's values back into one block at a time, 15 s apart, in a single boot.
+- **Spoof boot 33 (`-crrestore`, staged):** all four steps ran (28 registers), but the panel kept switching at random
+  between the coloured rows, a white line and flashing, so no step could be tied to a change. Apple rewrote some
+  restored registers afterwards (`CUR_CONTROL` back on), and regamma, `LB_SYNC_RESET_SEL` and `CRTC_CONTROL` had not
+  been restored. Apple's framebuffer now held the verbose console text (black/white), and the line-buffer data level
+  was 0x10 against the firmware's 0x37, which suggests underflow. Next: restore everything at t=30 and hold it, and
+  count underflows (XDMA counter, DMIF / blender flags, LB level range).
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).

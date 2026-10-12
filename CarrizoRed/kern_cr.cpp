@@ -119,7 +119,9 @@ static uint32_t regRingHead;
 static void printRegEvent(const RegEvent &event, const char *suffix);
 static void restoreTick(uint32_t t);  // -crrestore, defined with the display-path diff
 static bool restoreOn;
-static uint32_t restoreDone, restoreWrites;
+static uint32_t restoreDone, restoreWrites, restoreHolds;
+static void underflowTick();  // pipe 0 underflow sampling, defined with the display-path diff
+static uint32_t underflowSamples, xdmaUnderflowMax, dmifUnderflows, blndUnderflows, lbLevelMin = ~0U, lbLevelMax;
 // Power-management / config-space events on the iGPU (see patchPci).
 static uint32_t pmEvents, pciConfigWrites;
 
@@ -680,6 +682,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				__atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED), __atomic_load_n(&pmEvents, __ATOMIC_RELAXED),
 				__atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));
 
+		if (gpuMmio)
+			underflowTick();
 		if (restoreOn && gpuMmio)
 			restoreTick(t);
 		if (panicAt && t >= panicAt)
@@ -1859,18 +1863,24 @@ static constexpr uint32_t DiffRegCount = 0x60 + 0x80 + 0x200 + 0x100 + 0x100;
 static uint32_t diffBoot[DiffRegCount];
 static bool diffBootValid;
 
-// -crrestore: live single-boot bisect of pipe 0's processing chain. Spoof boot 32: the DP transport (DIG0, DP0, pixel
-// format, M/N, PHY) matched the firmware's working state register for register and the scanout memory was uniform grey,
-// yet the panel showed identical rows of random colour (stale line-buffer data). Write the firmware's boot values back
-// into one block at a time, 15 s apart, so the step at which the picture changes names the block. Control registers
-// only (status / counter registers are left alone).
+// -crrestore: write the firmware's boot values back into pipe 0's processing chain. Spoof boot 32: the DP transport
+// (DIG0, DP0, pixel format, M/N, PHY) matched the firmware's working state register for register and the scanout memory
+// was uniform grey, yet the panel showed identical rows of random colour. Spoof boot 33 restored the blocks one at a
+// time, 15 s apart, but Apple rewrote some of them afterwards (CUR_CONTROL was back on) and the flicker made the timing
+// impossible to read off the panel. So restore every block at t=30 and hold it there: re-write any register Apple
+// changes back on every watcher tick. Control registers only (status / counter registers and the surface address and
+// pitch, which point at Apple's framebuffer, are left alone).
 static const uint32_t restoreFmt[] {0x1BE8, 0x1BE9, 0x1BEA, 0x1BEB, 0x1BEC, 0x1BED, 0x1BEE, 0x1BEF, 0x1BF0, 0x1BF1,
 	0x1BF2, 0x1BF3, 0x1BF4, 0x1BF5, 0x1BF6, 0x1BF7, 0x1BF8, 0x1BF9, 0x1BFA, 0x1BFB, 0x1BFC};
-static const uint32_t restoreLb[] {0x1AC0, 0x1AC1, 0x1AC3, 0x1AC4};
+// LB_DATA_FORMAT, LB_MEMORY_CTRL, LB_DESKTOP_HEIGHT, LB_VLINE_START_END, LB_SYNC_RESET_SEL (LB_SYNC_DURATION).
+static const uint32_t restoreLb[] {0x1AC0, 0x1AC1, 0x1AC3, 0x1AC4, 0x1ACC};
+// Input gamma, CSC, cursor (CUR_CONTROL turns Apple's 128x128 hardware cursor off), regamma: REGAMMA_CONTROL back to
+// the firmware's bypass plus the region setup (0x1AA4..0x1AAD; not the LUT index / data / write-mask ports).
 static const uint32_t restoreColor[] {0x1A10, 0x1A2D, 0x1A50, 0x1A59, 0x1A5A, 0x1A5B, 0x1A5C, 0x1A5D, 0x1A5E, 0x1A5F,
-	0x1A60, 0x1AA0, 0x1A66};
+	0x1A60, 0x1A66, 0x1AA0, 0x1AA4, 0x1AA5, 0x1AA6, 0x1AA7, 0x1AA8, 0x1AA9, 0x1AAA, 0x1AAB, 0x1AAC, 0x1AAD};
+// Scaler, CRTC update / trigger control and CRTC_CONTROL (CRTC_START_POINT_CNTL).
 static const uint32_t restoreScl[] {0x1B40, 0x1B44, 0x1B4A, 0x1B4C, 0x1B4E, 0x1B53, 0x1B86, 0x1B88, 0x1B89, 0x1B8A,
-	0x1BB6, 0x1BBE, 0x1BE7};
+	0x1B9C, 0x1BB6, 0x1BBE, 0x1BE7};
 static const struct {
 	uint32_t at;
 	const char *name;
@@ -1878,9 +1888,9 @@ static const struct {
 	size_t count;
 } restoreSteps[] {
 	{30, "FMT", restoreFmt, sizeof(restoreFmt) / sizeof(restoreFmt[0])},
-	{45, "LB", restoreLb, sizeof(restoreLb) / sizeof(restoreLb[0])},
-	{60, "DCP colour + cursor", restoreColor, sizeof(restoreColor) / sizeof(restoreColor[0])},
-	{75, "SCL + CRTC update", restoreScl, sizeof(restoreScl) / sizeof(restoreScl[0])},
+	{30, "LB", restoreLb, sizeof(restoreLb) / sizeof(restoreLb[0])},
+	{30, "DCP colour + cursor + regamma", restoreColor, sizeof(restoreColor) / sizeof(restoreColor[0])},
+	{30, "SCL + CRTC", restoreScl, sizeof(restoreScl) / sizeof(restoreScl[0])},
 };
 static bool diffBootValue(uint32_t offset, uint32_t &value) {
 	if (!diffBootValid)
@@ -1896,21 +1906,62 @@ static bool diffBootValue(uint32_t offset, uint32_t &value) {
 	return false;
 }
 
-static void restoreTick(uint32_t t) {
-	while (restoreDone < sizeof(restoreSteps) / sizeof(restoreSteps[0]) && t >= restoreSteps[restoreDone].at) {
-		auto &step = restoreSteps[restoreDone++];
-		uint32_t written = 0;
-		for (size_t i = 0; i < step.count; i++) {
-			uint32_t boot;
-			if (diffBootValue(step.regs[i], boot) && gpuMmio[step.regs[i]] != boot) {
-				gpuMmio[step.regs[i]] = boot;
-				written++;
-			}
+static uint32_t restoreStep(size_t index) {
+	auto &step = restoreSteps[index];
+	uint32_t written = 0;
+	for (size_t i = 0; i < step.count; i++) {
+		uint32_t boot;
+		if (diffBootValue(step.regs[i], boot) && gpuMmio[step.regs[i]] != boot) {
+			gpuMmio[step.regs[i]] = boot;
+			written++;
 		}
+	}
+	return written;
+}
+
+static void restoreTick(uint32_t t) {
+	if ((gpuMmio[Reg::PIPE0_PG_STATUS] >> 30) != 0)
+		return;  // pipe 0 power-gated
+	// Hold the steps already done: Apple rewrites some of these (cursor, regamma) on its own.
+	for (size_t i = 0; i < restoreDone; i++)
+		restoreHolds += restoreStep(i);
+	while (restoreDone < sizeof(restoreSteps) / sizeof(restoreSteps[0]) && t >= restoreSteps[restoreDone].at) {
+		uint32_t written = restoreStep(restoreDone++);
 		restoreWrites += written;
 		IOLog("CarrizoRed: t=%us restore step %u (%s): %u registers set to their boot values\n", t, restoreDone,
-			step.name, written);
+			restoreSteps[restoreDone - 1].name, written);
 	}
+}
+
+// Pipe 0 underflow sampling, every watcher tick. Spoof boot 33: with the transport matching the firmware's, the panel
+// flickered between rows of random colour, a white line and flashing, and LB_BUFFER_LEVEL_STATUS.DATA_BUFFER_LEVEL was
+// 0x10 against the firmware's 0x37: the look of a pipe starved of pixel data (underflow), not of a wrong setting. Arm
+// the XDMA cache underflow counter (GRPH_XDMA_CACHE_UNDERFLOW_DET_CNTL.CNT_EN) and record its count, the DMIF and blender
+// underflow flags (acknowledged after each sighting so a new one shows) and the line-buffer level range.
+static void underflowTick() {
+	if ((gpuMmio[Reg::PIPE0_PG_STATUS] >> 30) != 0)
+		return;
+	static bool armed;
+	if (!armed) {
+		gpuMmio[0x1A9F] |= 1;  // GRPH_XDMA_CACHE_UNDERFLOW_CNT_EN
+		armed = true;
+	}
+	underflowSamples++;
+	uint32_t xdma = gpuMmio[0x1ABF] & 0xFFFFF;
+	if (xdma > xdmaUnderflowMax)
+		xdmaUnderflowMax = xdma;
+	if (gpuMmio[0x2F7] & 0x10000000)  // DMIF_STATUS.DMIF_UNDERFLOW
+		dmifUnderflows++;
+	uint32_t blnd = gpuMmio[0x1B71];
+	if (blnd & 1) {  // BLND_UNDERFLOW_INTERRUPT.BLND_UNDERFLOW_INT_OCCURED
+		blndUnderflows++;
+		gpuMmio[0x1B71] = blnd | 0x100;  // ACK
+	}
+	uint32_t level = (gpuMmio[0x1AD7] >> 16) & 0xFFF;  // LB_BUFFER_LEVEL_STATUS.DATA_BUFFER_LEVEL
+	if (level < lbLevelMin)
+		lbLevelMin = level;
+	if (level > lbLevelMax)
+		lbLevelMax = level;
 }
 
 uint8_t CRDriver::wrapMaxLinkLanes(const void *that) {
@@ -2236,7 +2287,11 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		checkKernelArgument("-crnolanecap") ? "off" : "on", lbFixes, lbFixOff ? " (off)" : "", bootDpDepth, bpcCaps,
 		bpcCapOff ? " (off)" : "");
 	if (restoreOn)
-		add("restore: %u steps done, %u registers written\n", restoreDone, restoreWrites);
+		add("restore: %u steps done, %u registers written, %u re-written after Apple changed them\n", restoreDone,
+			restoreWrites, restoreHolds);
+	add("underflow: %u samples, xdma count %u, dmif %u, blnd %u, LB data level %u..%u (firmware 0x37 = 55)\n",
+		underflowSamples, xdmaUnderflowMax, dmifUnderflows, blndUnderflows, lbLevelMin == ~0U ? 0 : lbLevelMin,
+		lbLevelMax);
 	add("t=%us regs %u ih %u missing-pipe %u pm %u cfgwr %u\n", t, __atomic_load_n(&regAccesses, __ATOMIC_RELAXED),
 		__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), __atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED),
 		__atomic_load_n(&pmEvents, __ATOMIC_RELAXED), __atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));
