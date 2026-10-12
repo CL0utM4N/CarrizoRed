@@ -192,7 +192,6 @@ namespace {
 	constexpr int WindowMs = 2000;     // interrupt summary period
 	// Runtime registers (xHCI 5.5): RTSOFF in the capability registers, interrupter 0 at +0x20.
 	constexpr UInt32 RegRtsOff = 0x18, RegIman = 0x20, RegErdp = 0x38;
-	constexpr UInt32 ImanPending = 1 << 0;
 	constexpr UInt32 StsEventInterrupt = 1 << 3;
 	constexpr UInt32 StsNoisy = (1 << 3) | (1 << 4);  // EINT, PCD: change on normal port activity
 	// Port registers (xHCI 5.4.8-5.4.9): PORTSC at operational + 0x400 + 0x10 * (port - 1), PORTPMSC at +4.
@@ -227,7 +226,9 @@ namespace {
 		// Interrupt statistics per window: if MSI/MSI-X is enabled and interrupts are serviced, IMAN.IP and
 		// USBSTS.EINT are cleared within microseconds and are almost never seen set at a 1 ms sample. If they stay
 		// set, interrupts aren't reaching the driver and it only notices events on its own timeouts.
-		UInt32 samples = 0, ipSet = 0, eintSet = 0, erdpMoves = 0, lastErdp = 0, iman = 0, hse = 0;
+		UInt32 samples = 0, eintSet = 0, hse = 0;
+		// 0.5.3: interrupters 0-2 (AppleUSBXHCI: primary, IO, isochronous), event-ring batches and IMAN.IE each.
+		UInt32 ringMoves[3] = {}, ringLast[3] = {}, ringIe = 0;
 		UInt64 windowStart = 0;
 		// Per-port link states (0.4): a USB 3 link that keeps dropping into U1/U2 or Recovery, or a device that drops
 		// off (CCS 1 -> 0), points at link power management or signal problems rather than lost interrupts.
@@ -240,19 +241,21 @@ namespace {
 		for (UInt64 t = 0; t < MonitorMs; t = nowMs() - start) {
 			if (c.r32(RegCapLength) != ~0u) {
 				UInt32 rt = c.r32(RegRtsOff) & ~0x1Fu;
-				iman = c.r32(rt + RegIman);
-				UInt32 erdp = c.r32(rt + RegErdp) & ~0xFu;
 				UInt32 sts = c.r32(c.op(RegUsbSts));
 				samples++;
-				if (iman != ~0u && (iman & ImanPending))
-					ipSet++;
 				if (sts & StsEventInterrupt)
 					eintSet++;
 				if (sts != ~0u && (sts & StsHostError))
 					hse++;
-				if (erdp != lastErdp)
-					erdpMoves++;
-				lastErdp = erdp;
+				ringIe = 0;
+				for (UInt32 n = 0; n < 3; n++) {
+					UInt32 e = c.r32(rt + RegErdp + 32 * n) & ~0xFu;
+					if (e != ringLast[n])
+						ringMoves[n]++;
+					ringLast[n] = e;
+					if (c.r32(rt + RegIman + 32 * n) & 2)
+						ringIe |= 1u << n;
+				}
 				for (UInt32 p = 0; p < numPorts; p++) {
 					UInt32 sc = c.r32(c.op(RegPortSc + PortStride * p));
 					if (sc == ~0u)
@@ -288,9 +291,9 @@ namespace {
 					}
 				}
 				char w[200];
-				snprintf(w, sizeof(w), "v0.5.2 t=%llus D%u msi=%d msix=%d cfgX=%x to %x/%x%s IP %u/%u EINT %u/%u ev %u hse %u",
-					t / 1000, c.pm ? c.pci->configRead16(c.pm + 4) & 3 : 0xF, msi, msix, msixResult, target, data,
-					mask ? " MASKED" : "", ipSet, samples, eintSet, samples, erdpMoves, hse);
+				snprintf(w, sizeof(w), "v0.5.3 t=%llus D%u msi=%d msix=%d to %x/%x%s EINT %u/%u ev %u/%u/%u ie %x hse %u",
+					t / 1000, c.pm ? c.pci->configRead16(c.pm + 4) & 3 : 0xF, msi, msix, target, data,
+					mask ? " MASKED" : "", eintSet, samples, ringMoves[0], ringMoves[1], ringMoves[2], ringIe, hse);
 				IOLog("XHCIProbe: irq %s\n", w);
 				c.pci->setProperty("XHCIProbe-irq", w);
 				// Connected ports: link-state shares in percent, drops, speed and the U1/U2 timeouts.
@@ -316,7 +319,8 @@ namespace {
 				auto *fwd = OSDynamicCast(OSString, c.pci->getProperty("CarrizoRed-xhcifwd"));
 				IOLog("XHCIProbe: fwd %s\n", fwd ? fwd->getCStringNoCopy() : "(no CarrizoRed-xhcifwd property)");
 				c.pci->setProperty("XHCIProbe-ports", l);
-				samples = ipSet = eintSet = erdpMoves = hse = 0;
+				samples = eintSet = hse = 0;
+				bzero(ringMoves, sizeof(ringMoves));
 				windowStart = t;
 			}
 			if (t >= TraceMs) {
