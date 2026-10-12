@@ -16,6 +16,7 @@
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOFilterInterruptEventSource.h>
+#include <IOKit/IOWorkLoop.h>
 #include <kern/thread.h>
 #include <kern/debug.h>
 #include <stdarg.h>
@@ -304,33 +305,113 @@ void CRDriver::init() {
 // set in every 1 ms sample and the event ring serviced once every 2 s (AppleUSBXHCI's fallback timer), with plain MSI
 // and with MSI-X alike, while the controller does send them (IMAN.IP keeps clearing, as MSI does on send) and the
 // GPU's MSIs to the same address arrive. Every USB transfer waited up to 2 s: the installer copied at ~130 KB/s.
-// Forward them in software: catch the IOFilterInterruptEventSource that AppleUSBXHCIPCI creates for the controller,
-// poll USBSTS.EINT every millisecond, and when it is set, clear it (RW1C) and signal the event source, which runs
-// AppleUSBXHCI::primaryInterrupt on its work loop exactly as a delivered interrupt would. -crnoxhcifwd disables.
+// Forward them in software. A thread waits for AppleUSBXHCIPCI to attach to the controller, finds its interrupt
+// source (the IOFilterInterruptEventSource on the driver's work loop whose provider is the controller), polls
+// USBSTS.EINT every millisecond, and when it is set, clears it (RW1C) and signals the source, which runs
+// AppleUSBXHCI::primaryInterrupt on its work loop exactly as a delivered interrupt would. (Hooking the source's
+// creation missed it: the USB boot device starts before Lilu's patcher.) The state is published as the controller's
+// "CarrizoRed-xhcifwd" property, which XHCIProbe prints. -crnoxhcifwd disables.
 namespace {
-	mach_vm_address_t orgFilterSource, orgFilterSourceBlock;
+	// The event chain is protected; these read it through the kernel's own layout (MacKernelSDK headers).
+	struct WorkLoopPeek : IOWorkLoop {
+		static IOEventSource *head(IOWorkLoop *loop) { return static_cast<WorkLoopPeek *>(loop)->eventChain; }
+	};
+	struct EventSourcePeek : IOEventSource {
+		static IOEventSource *next(IOEventSource *source) { return static_cast<EventSourcePeek *>(source)->eventChainNext; }
+	};
+
 	IOFilterInterruptEventSource *xhciSources[4];
 	uint32_t xhciSourceCount, xhciForwards, xhciPolls;
 	IOPCIDevice *xhciDevice;
-	// Which hooks are in place ("fp", "block"), shown with the counts in the controller's "CarrizoRed-xhcifwd" property
-	// (XHCIProbe prints it on the verbose screen).
-	char xhciRouted[32] = "none";
 
 	void xhciPublish(const char *what) {
 		if (!xhciDevice)
 			return;
 		char state[160];
-		snprintf(state, sizeof(state), "hooks %s; %u sources, %u forwards, %u polls; %s", xhciRouted, xhciSourceCount,
+		snprintf(state, sizeof(state), "%u sources, %u forwards, %u polls; %s", xhciSourceCount,
 			__atomic_load_n(&xhciForwards, __ATOMIC_RELAXED), __atomic_load_n(&xhciPolls, __ATOMIC_RELAXED), what);
 		xhciDevice->setProperty("CarrizoRed-xhcifwd", state);
 	}
 
+	IOPCIDevice *xhciFind() {
+		IOPCIDevice *found = nullptr;
+		if (auto *iterator = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"))) {
+			while (auto *pci = OSDynamicCast(IOPCIDevice, iterator->getNextObject())) {
+				if (WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigVendorID) == 0x1022 &&
+					WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigDeviceID) == 0x7914) {
+					pci->retain();
+					found = pci;
+					break;
+				}
+			}
+			iterator->release();
+		}
+		return found;
+	}
+
+	// Collect the driver's filter interrupt sources on the controller, inside the work loop's gate (the chain can't
+	// change under us there).
+	IOReturn xhciCollect(OSObject *, void *arg0, void *, void *, void *) {
+		auto *loop = static_cast<IOWorkLoop *>(arg0);
+		for (auto *source = WorkLoopPeek::head(loop); source && xhciSourceCount < arrsize(xhciSources);
+			 source = EventSourcePeek::next(source)) {
+			auto *filter = OSDynamicCast(IOFilterInterruptEventSource, source);
+			if (filter && filter->getProvider() == xhciDevice) {
+				filter->retain();
+				xhciSources[xhciSourceCount++] = filter;
+			}
+		}
+		return kIOReturnSuccess;
+	}
+
 	void xhciForwardThread(void *, wait_result_t) {
+		// Up to 5 min for the controller and its driver (the installer's USB stack starts early, but be generous).
+		IOService *driver = nullptr;
+		for (int i = 0; i < 3000 && !driver; i++) {
+			if (!xhciDevice)
+				xhciDevice = xhciFind();
+			if (xhciDevice) {
+				if (auto *clients = xhciDevice->getClientIterator()) {
+					while (auto *client = OSDynamicCast(IOService, clients->getNextObject())) {
+						if (!strcmp(client->getMetaClass()->getClassName(), "AppleUSBXHCIPCI")) {
+							driver = client;
+							driver->retain();
+							break;
+						}
+					}
+					clients->release();
+				}
+				if (!driver)
+					xhciPublish("waiting for AppleUSBXHCIPCI");
+			}
+			if (!driver)
+				IOSleep(100);
+		}
+		if (!driver) {
+			xhciPublish("AppleUSBXHCIPCI never attached");
+			return;
+		}
+		IOWorkLoop *loop = driver->getWorkLoop();
+		if (!loop) {
+			xhciPublish("driver has no work loop");
+			return;
+		}
+		// The source is added during start(); retry briefly if it isn't there yet.
+		for (int i = 0; i < 50 && !xhciSourceCount; i++) {
+			loop->runAction(xhciCollect, driver, loop);
+			if (!xhciSourceCount)
+				IOSleep(100);
+		}
+		if (!xhciSourceCount) {
+			xhciPublish("no interrupt source on the driver's work loop");
+			return;
+		}
 		IOMemoryMap *map = xhciDevice->mapDeviceMemoryWithIndex(0);
 		if (!map) {
 			xhciPublish("BAR0 map FAILED");
 			return;
 		}
+		SYSLOG("cr", "xHCI 1022:7914: forwarding interrupts (%u sources)", xhciSourceCount);
 		auto *base = reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
 		uint64_t length = map->getLength();
 		auto r32 = [&](uint32_t off) { return off + 4 <= length ? *reinterpret_cast<volatile uint32_t *>(base + off) : ~0u; };
@@ -342,78 +423,31 @@ namespace {
 			}
 			uint32_t usbsts = (cap & 0xFF) + 4;
 			uint32_t sts = r32(usbsts);
-			__atomic_fetch_add(&xhciPolls, 1, __ATOMIC_RELAXED);
+			uint32_t polls = __atomic_add_fetch(&xhciPolls, 1, __ATOMIC_RELAXED);
 			if (sts != ~0u && (sts & 8)) {  // EINT
 				*reinterpret_cast<volatile uint32_t *>(base + usbsts) = 8;
 				for (uint32_t i = 0; i < xhciSourceCount; i++)
 					xhciSources[i]->signalInterrupt();
 				__atomic_fetch_add(&xhciForwards, 1, __ATOMIC_RELAXED);
 			}
-			if (xhciPolls % 1000 == 1)
+			if (polls % 1000 == 1)
 				xhciPublish("running");
 			IOSleep(1);
 		}
 	}
 
-	void xhciCatch(IOFilterInterruptEventSource *source, OSObject *owner, IOService *provider, int intIndex) {
-		auto *pci = OSDynamicCast(IOPCIDevice, provider);
-		if (!source || !pci || xhciSourceCount >= arrsize(xhciSources) ||
-			WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigVendorID) != 0x1022 ||
-			WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigDeviceID) != 0x7914)
-			return;
-		source->retain();
-		xhciSources[xhciSourceCount++] = source;
-		if (!xhciDevice) {
-			pci->retain();
-			xhciDevice = pci;
-			thread_t thread;
-			if (kernel_thread_start(xhciForwardThread, nullptr, &thread) == KERN_SUCCESS)
-				thread_deallocate(thread);
-			else
-				xhciPublish("thread FAILED");
-		}
-		xhciPublish("caught");
-		SYSLOG("cr", "xHCI 1022:7914: forwarding interrupts for %s (source %d)",
-			owner ? owner->getMetaClass()->getClassName() : "?", intIndex);
-	}
-
-	IOFilterInterruptEventSource *wrapFilterSource(OSObject *owner, IOInterruptEventSource::Action action,
-		IOFilterInterruptEventSource::Filter filter, IOService *provider, int intIndex) {
-		auto *source = FunctionCast(wrapFilterSource, orgFilterSource)(owner, action, filter, provider, intIndex);
-		xhciCatch(source, owner, provider, intIndex);
-		return source;
-	}
-
-	// The block-based variant (owner, provider, index, action block, filter block).
-	IOFilterInterruptEventSource *wrapFilterSourceBlock(OSObject *owner, IOService *provider, int intIndex, void *action,
-		void *filter) {
-		auto *source = FunctionCast(wrapFilterSourceBlock, orgFilterSourceBlock)(owner, provider, intIndex, action, filter);
-		xhciCatch(source, owner, provider, intIndex);
-		return source;
+	void xhciStartForwarding() {
+		thread_t thread;
+		if (kernel_thread_start(xhciForwardThread, nullptr, &thread) == KERN_SUCCESS)
+			thread_deallocate(thread);
+		else
+			SYSLOG("cr", "xHCI forwarding: thread FAILED");
 	}
 }
 
-void CRDriver::processPatcher(KernelPatcher &patcher) {
-	if (!checkKernelArgument("-crnoxhcifwd")) {
-		KernelPatcher::RouteRequest requests[] {
-			{"__ZN28IOFilterInterruptEventSource26filterInterruptEventSourceEP8OSObjectPFvS1_P22IOInterruptEventSourceiEPFbS1_"
-			 "PS_EP9IOServicei",
-				wrapFilterSource, orgFilterSource},
-			{"__ZN28IOFilterInterruptEventSource26filterInterruptEventSourceEP8OSObjectP9IOServiceiU13block_pointerFvP22IOInter"
-			 "ruptEventSourceiEU13block_pointerFbPS_E",
-				wrapFilterSourceBlock, orgFilterSourceBlock},
-		};
-		xhciRouted[0] = '\0';
-		for (size_t i = 0; i < arrsize(requests); i++) {
-			if (routeChecked(patcher, KernelPatcher::KernelID, requests[i], 0, 0)) {
-				strlcat(xhciRouted, i ? "block " : "fp ", sizeof(xhciRouted));
-			} else {
-				SYSLOG("cr", "xHCI forwarding: failed to route %s (error %d)", requests[i].symbol, patcher.getError());
-				strlcat(xhciRouted, i ? "block-FAILED " : "fp-FAILED ", sizeof(xhciRouted));
-				patcher.clearError();
-			}
-		}
-	}
+void CRDriver::processPatcher(KernelPatcher &) {
+	if (!checkKernelArgument("-crnoxhcifwd"))
+		xhciStartForwarding();
 
 	auto *devInfo = DeviceInfo::create();
 	if (!devInfo) {

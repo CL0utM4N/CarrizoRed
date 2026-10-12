@@ -251,3 +251,8 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   `primaryInterrupt` drains the event ring without an EHB check. CarrizoRed now forwards the interrupts in software:
   it hooks `IOFilterInterruptEventSource::filterInterruptEventSource` to catch the source AppleUSBXHCIPCI creates for
   `1022:7914`, polls `USBSTS.EINT` every 1 ms, clears it and calls the source's `signalInterrupt()` (`-crnoxhcifwd`).
+- **Forwarder, first two boots: never ran.** XHCIProbe 0.5.2 printed "(no CarrizoRed-xhcifwd property)": the hooks on
+  `filterInterruptEventSource` (both variants) never saw the controller's source, because the USB boot device's driver
+  starts before Lilu's patcher. The forwarder now finds the source after the fact: a thread waits for
+  `AppleUSBXHCIPCI` on `1022:7914`, walks its work loop's event chain inside the gate and takes the
+  `IOFilterInterruptEventSource` whose provider is the controller.
