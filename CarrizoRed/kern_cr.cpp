@@ -148,6 +148,8 @@ struct DpcdTx {
 	uint8_t data[8];
 };
 static constexpr uint32_t DpcdRingSize = 40;
+// Entries printed in the black box (the newest), sized so the whole report fits AAPL,PanicInfo.
+static constexpr uint32_t AtomPrinted = 20, DpcdPrinted = 20;
 static DpcdTx dpcdRing[DpcdRingSize];
 static uint32_t dpcdHead, dpcdCount;
 
@@ -167,7 +169,7 @@ static void atomReport(Add &add) {
 	add("atom: %u calls (%u aux, %u aux failed); idx:table ok(0x80=patched) in[0..3] -> out[0..1] xN\n", atomCalls,
 		auxCalls, auxFailures);
 	uint32_t head = __atomic_load_n(&atomHead, __ATOMIC_RELAXED);
-	for (uint32_t i = head > AtomRingSize ? head - AtomRingSize : 0; i != head; i++) {
+	for (uint32_t i = head > AtomPrinted ? head - AtomPrinted : 0; i != head; i++) {
 		auto &call = atomRing[i % AtomRingSize];
 		add(" %u:%x %x %x %x %x %x -> %x %x x%u\n", i, call.table, call.ok, call.in[0], call.in[1], call.in[2],
 			call.in[3], call.out[0], call.out[1], call.repeat);
@@ -177,7 +179,7 @@ static void atomReport(Add &add) {
 		add(" %x=%x", trainSnapRegs[i], trainSnap[i]);
 	add("\ndpcd: %u transactions; addr R/W len ret: bytes xN\n", dpcdCount);
 	head = __atomic_load_n(&dpcdHead, __ATOMIC_RELAXED);
-	for (uint32_t i = head > DpcdRingSize ? head - DpcdRingSize : 0; i != head; i++) {
+	for (uint32_t i = head > DpcdPrinted ? head - DpcdPrinted : 0; i != head; i++) {
 		auto &tx = dpcdRing[i % DpcdRingSize];
 		add(" %x %c%u %x:", tx.address, tx.write ? 'W' : 'R', tx.length, tx.ok);
 		for (uint32_t b = 0; b < tx.length && b < sizeof(tx.data); b++)
@@ -1935,6 +1937,8 @@ namespace {
 		{"MCIF_CONTROL", Reg::MCIF_CONTROL},
 		{"DCI_MEM_PWR_STATUS", Reg::DCI_MEM_PWR_STATUS},
 		{"DCI_CLK_CNTL", Reg::DCI_CLK_CNTL},
+		{"DMIF_HW_DEBUG", 0x2F8},
+		{"DMIF_STATUS2", 0x304},
 		{"PIXCLK0_RESYNC_CNTL", Reg::PIXCLK0_RESYNC_CNTL},
 		{"PIXCLK1_RESYNC_CNTL", Reg::PIXCLK1_RESYNC_CNTL},
 		{"PHYPLL_PIXCLK_CNTL", Reg::PHYPLL_PIXCLK_CNTL},
@@ -1997,6 +2001,22 @@ namespace {
 		{"CRTC_V_TOTAL", 0x1B87},
 		{"CRTC_BLANK_CONTROL", 0x1B9D},
 		{"CRTC_STATUS", 0x1BA3},
+		// Surface geometry, line buffer, scaler (spoof boot 28: link up, picture = identical rows / vertical stripes).
+		{"GRPH_SWAP_CNTL", 0x1A03},
+		{"GRPH_PITCH", 0x1A06},
+		{"GRPH_SURFACE_OFFSET_X", 0x1A09},
+		{"GRPH_SURFACE_OFFSET_Y", 0x1A0A},
+		{"GRPH_X_START", 0x1A0B},
+		{"GRPH_Y_START", 0x1A0C},
+		{"GRPH_X_END", 0x1A0D},
+		{"GRPH_Y_END", 0x1A0E},
+		{"LB_DATA_FORMAT", 0x1AC0},
+		{"LB_MEMORY_CTRL", 0x1AC1},
+		{"LB_DESKTOP_HEIGHT", 0x1AC3},
+		{"SCL_MODE", 0x1B42},
+		{"SCL_BYPASS_CONTROL", 0x1B45},
+		{"VIEWPORT_START", 0x1B5C},
+		{"VIEWPORT_SIZE", 0x1B5D},
 	};
 
 	constexpr size_t MaxWatchedPipes = 3;
@@ -2103,6 +2123,48 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		// The unchanged registers were listed in boots 22-25; leave them out to fit the DPCD transcript in NVRAM.
 		add("\n");
 		atomReport(add);
+	}
+	// Pipe 0 surface registers, always (now/boot), and what the scanout memory actually holds: a few pixels on the top,
+	// middle and bottom rows of the surface, read through BAR0 (the carve-out from MC_VM_FB_LOCATION's base). Spoof boot
+	// 28 showed identical rows on the panel (vertical stripes): different rows in memory mean the display fetch
+	// (underflow) is at fault, identical rows mean the content is.
+	if (gpuMmio) {
+		static const uint32_t surfaceRegs[] {0x1A00, 0x1A01, 0x1A03, 0x1A04, 0x1A06, 0x1A07, 0x1A09, 0x1A0A, 0x1A0B, 0x1A0C,
+			0x1A0D, 0x1A0E, 0x1AC0, 0x1AC1, 0x1AC3, 0x1B42, 0x1B45, 0x1B5C, 0x1B5D, 0x2F7, 0x2F8, 0x304, 0x140};
+		add("surface now/boot:");
+		for (auto offset : surfaceRegs) {
+			uint32_t now = gpuMmio[offset];
+			const WatchedReg *found = nullptr;
+			for (size_t i = 0; i < watchedRegCount; i++)
+				if (watchedRegs[i].offset == offset)
+					found = &watchedRegs[i];
+			if (found && found->bootValid)
+				add(" %x=%x/%x", offset, now, found->bootValue);
+			else
+				add(" %x=%x", offset, now);
+		}
+		add("\n");
+		uint64_t fbBase = static_cast<uint64_t>(gpuMmio[Reg::MC_VM_FB_LOCATION] & 0xFFFF) << 24;
+		uint64_t surface = (static_cast<uint64_t>(gpuMmio[0x1A07] & 0xFF) << 32) | (gpuMmio[0x1A04] & ~0xFFu);
+		uint32_t pitchBytes = (gpuMmio[0x1A06] & 0x7FFF) * 4, height = gpuMmio[0x1A0E];
+		if (surface >= fbBase && pitchBytes && height && height < 0x4000) {
+			if (auto *map = iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0)) {
+				auto *fb = reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+				uint64_t length = map->getLength(), offset = surface - fbBase;
+				add("pixels (surface +0x%llx, pitch %u bytes, %u rows):", offset, pitchBytes, height);
+				const uint32_t rows[] {0, height / 2, height - 1}, columns[] {0, 1, 2, 100, 400, 683, 1000, 1365};
+				for (auto row : rows) {
+					add(" row %u:", row);
+					for (auto column : columns) {
+						uint64_t at = offset + static_cast<uint64_t>(row) * pitchBytes + column * 4ull;
+						if (at + 4 <= length)
+							add(" %x", *reinterpret_cast<volatile uint32_t *>(fb + at));
+					}
+				}
+				add("\n");
+				map->release();
+			}
+		}
 	}
 	// Is CRTC 0 running? Position and frame count, 20 ms (more than one frame) apart.
 	if (gpuMmio && pipePowered(0)) {

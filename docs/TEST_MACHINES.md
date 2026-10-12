@@ -136,6 +136,11 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   `case 5` transmitter setup showed the earlier clock-source patch wrote the wrong bits: the v1.5 config byte is
   `[1]` coherent, `[3:2]` PHY clock source, `[6:4]` HPD, so boots 25–27 sent 0x13 (coherent + a reserved bit,
   clock still P1PLL). amdgpu sends 0x1E for eDP on HPD1 (external clock, coherent). Patch corrected.
+- **Spoof boot 28 (config 0x1E): the eDP link trains and the panel shows Apple's output for the first time** —
+  full-screen vertical stripes (every row identical). Fixes that got here: `CFG_FB_LIMIT`, lane cap, eDP
+  `POWER_ON` before `ENABLE`, transmitter external clock + coherent. Next: surface geometry and a sample of the
+  scanout memory in the black box, to tell a display-fetch underflow (DISPOUT_FIFO_ERROR has been set every boot)
+  from bad framebuffer content.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
