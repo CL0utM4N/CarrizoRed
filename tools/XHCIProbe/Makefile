@@ -6,7 +6,7 @@
 
 PRODUCT_NAME   := XHCIProbe
 MODULE_NAME    := com.carrizored.XHCIProbe
-MODULE_VERSION := 0.3.0
+MODULE_VERSION := 0.4.0
 MIN_MACOS      := 11.0
 
 ROOT     := ../..

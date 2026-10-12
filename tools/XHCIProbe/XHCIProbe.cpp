@@ -22,6 +22,10 @@
 //  For 10 minutes it also prints an interrupt summary every 2 s ("XHCIProbe: irq ..." on the verbose screen,
 //  "XHCIProbe-irq" property): MSI/MSI-X enable, how often IMAN.IP and USBSTS.EINT were seen set at 1 ms samples,
 //  and how often the event ring dequeue pointer moved. IP/EINT seen set most of the time = interrupts not serviced.
+//  0.4 adds the interrupt target (MSI address/data or MSI-X entry 0), IMOD and host-system-error counts, and a
+//  "XHCIProbe: ports ..." line per window: for each connected root port, the share of 1 ms samples spent in U0, U1,
+//  U2, U3, Recovery or another link state, how often the device dropped off (CCS 1 -> 0), the speed and PORTPMSC
+//  (the U1/U2 timeouts the driver programmed). Read-only, like the rest of the monitor.
 //
 //  Boot-args: -xhciprobe_noact   only record state, change nothing
 //             -xhciprobe_nomon   no monitor thread
@@ -176,10 +180,26 @@ namespace {
 	constexpr int TraceMs = 60000;     // state-change trace only for the first minute
 	constexpr int WindowMs = 2000;     // interrupt summary period
 	// Runtime registers (xHCI 5.5): RTSOFF in the capability registers, interrupter 0 at +0x20.
-	constexpr UInt32 RegRtsOff = 0x18, RegIman = 0x20, RegErdp = 0x38;
+	constexpr UInt32 RegRtsOff = 0x18, RegIman = 0x20, RegImod = 0x24, RegErdp = 0x38;
 	constexpr UInt32 ImanPending = 1 << 0;
 	constexpr UInt32 StsEventInterrupt = 1 << 3;
 	constexpr UInt32 StsNoisy = (1 << 3) | (1 << 4);  // EINT, PCD: change on normal port activity
+	// Port registers (xHCI 5.4.8-5.4.9): PORTSC at operational + 0x400 + 0x10 * (port - 1), PORTPMSC at +4.
+	// PORTSC: CCS bit 0, PED bit 1, PLS bits 8:5 (0 U0, 1 U1, 2 U2, 3 U3, 5 RxDetect, 7 Polling, 8 Recovery, ...),
+	// speed bits 13:10. PORTPMSC on a USB 3 port: U1 timeout bits 7:0, U2 timeout bits 15:8 (0 = disabled).
+	constexpr UInt32 RegPortSc = 0x400, PortStride = 0x10;
+	constexpr UInt32 MaxPorts = 16;
+	// Link-state buckets per port: U0, U1, U2, U3, Recovery, other.
+	enum { LsU0, LsU1, LsU2, LsU3, LsRecovery, LsOther, LsCount };
+
+	struct PortStats {
+		UInt32 states[LsCount];
+		UInt32 drops;      // CCS seen going 1 -> 0
+		UInt32 pmsc;       // last PORTPMSC
+		UInt32 speed;      // last PORTSC speed
+		bool connected;    // CCS at the last sample
+		bool seen;         // connected at any sample in the window
+	};
 
 	UInt64 nowMs() {
 		UInt64 ns;
@@ -196,32 +216,94 @@ namespace {
 		// Interrupt statistics per window: if MSI/MSI-X is enabled and interrupts are serviced, IMAN.IP and
 		// USBSTS.EINT are cleared within microseconds and are almost never seen set at a 1 ms sample. If they stay
 		// set, interrupts aren't reaching the driver and it only notices events on its own timeouts.
-		UInt32 samples = 0, ipSet = 0, eintSet = 0, erdpMoves = 0, lastErdp = 0, iman = 0;
+		UInt32 samples = 0, ipSet = 0, eintSet = 0, erdpMoves = 0, lastErdp = 0, iman = 0, imod = 0, hse = 0;
 		UInt64 windowStart = 0;
+		// Per-port link states (0.4): a USB 3 link that keeps dropping into U1/U2 or Recovery, or a device that drops
+		// off (CCS 1 -> 0), points at link power management or signal problems rather than lost interrupts.
+		static PortStats ports[MaxPorts];
+		bzero(ports, sizeof(ports));
+		UInt32 hcs = c.r32(RegHcsParams1);
+		UInt32 numPorts = hcs == ~0u ? 0 : hcs >> 24;
+		if (numPorts > MaxPorts)
+			numPorts = MaxPorts;
 		for (UInt64 t = 0; t < MonitorMs; t = nowMs() - start) {
 			if (c.r32(RegCapLength) != ~0u) {
 				UInt32 rt = c.r32(RegRtsOff) & ~0x1Fu;
 				iman = c.r32(rt + RegIman);
+				imod = c.r32(rt + RegImod);
 				UInt32 erdp = c.r32(rt + RegErdp) & ~0xFu;
+				UInt32 sts = c.r32(c.op(RegUsbSts));
 				samples++;
 				if (iman != ~0u && (iman & ImanPending))
 					ipSet++;
-				if (c.r32(c.op(RegUsbSts)) & StsEventInterrupt)
+				if (sts & StsEventInterrupt)
 					eintSet++;
+				if (sts != ~0u && (sts & StsHostError))
+					hse++;
 				if (erdp != lastErdp)
 					erdpMoves++;
 				lastErdp = erdp;
+				for (UInt32 p = 0; p < numPorts; p++) {
+					UInt32 sc = c.r32(c.op(RegPortSc + PortStride * p));
+					if (sc == ~0u)
+						break;
+					auto &ps = ports[p];
+					bool connected = sc & 1;
+					if (ps.connected && !connected)
+						ps.drops++;
+					ps.connected = connected;
+					if (!connected)
+						continue;
+					ps.seen = true;
+					UInt32 pls = (sc >> 5) & 0xF;
+					ps.states[pls <= 3 ? pls : pls == 8 ? LsRecovery : LsOther]++;
+					ps.speed = (sc >> 10) & 0xF;
+					ps.pmsc = c.r32(c.op(RegPortSc + PortStride * p + 4));
+				}
 			}
 			if (t - windowStart >= WindowMs) {
 				bool msi = c.msi && (c.pci->configRead16(c.msi + 2) & 1);
 				bool msix = c.msix && (c.pci->configRead16(c.msix + 2) & 0x8000);
-				char w[160];
-				snprintf(w, sizeof(w), "t=%llus D%u cmd=%04x msi=%d msix=%d iman=%x IP %u/%u EINT %u/%u events %u",
-					t / 1000, c.pm ? c.pci->configRead16(c.pm + 4) & 3 : 0xF, c.pci->configRead16(kIOPCIConfigCommand),
-					msi, msix, iman, ipSet, samples, eintSet, samples, erdpMoves);
+				// Where the interrupt goes: MSI address / data, or MSI-X table entry 0 (address, data, vector mask).
+				UInt32 target = 0, data = 0, mask = 0;
+				if (msi) {
+					target = c.pci->configRead32(c.msi + 4);
+					data = c.pci->configRead16(c.msi + ((c.pci->configRead16(c.msi + 2) & 0x80) ? 12 : 8));
+				} else if (msix) {
+					UInt32 table = c.pci->configRead32(c.msix + 4);
+					if ((table & 7) == 0) {
+						target = c.r32(table & ~7u);
+						data = c.r32((table & ~7u) + 8);
+						mask = c.r32((table & ~7u) + 12) & 1;
+					}
+				}
+				char w[200];
+				snprintf(w, sizeof(w), "t=%llus D%u msi=%d msix=%d to %x/%x%s iman=%x IP %u/%u EINT %u/%u ev %u imod=%x hse %u",
+					t / 1000, c.pm ? c.pci->configRead16(c.pm + 4) & 3 : 0xF, msi, msix, target, data,
+					mask ? " MASKED" : "", iman, ipSet, samples, eintSet, samples, erdpMoves, imod, hse);
 				IOLog("XHCIProbe: irq %s\n", w);
 				c.pci->setProperty("XHCIProbe-irq", w);
-				samples = ipSet = eintSet = erdpMoves = 0;
+				// Connected ports: link-state shares in percent, drops, speed and the U1/U2 timeouts.
+				char l[220];
+				l[0] = '\0';
+				for (UInt32 p = 0; p < numPorts; p++) {
+					auto &ps = ports[p];
+					if (!ps.seen && !ps.drops)
+						continue;
+					UInt32 n = 0;
+					for (auto v : ps.states)
+						n += v;
+					auto pct = [&](UInt32 v) { return n ? v * 100 / n : 0; };
+					appendf(l, sizeof(l), "p%u s%u U0 %u U1 %u U2 %u U3 %u Rec %u oth %u drop %u pmsc %x; ", p + 1, ps.speed,
+						pct(ps.states[LsU0]), pct(ps.states[LsU1]), pct(ps.states[LsU2]), pct(ps.states[LsU3]),
+						pct(ps.states[LsRecovery]), pct(ps.states[LsOther]), ps.drops, ps.pmsc);
+					bool connected = ps.connected;
+					bzero(&ps, sizeof(ps));
+					ps.connected = connected;
+				}
+				IOLog("XHCIProbe: ports %s\n", l[0] ? l : "(none connected)");
+				c.pci->setProperty("XHCIProbe-ports", l);
+				samples = ipSet = eintSet = erdpMoves = hse = 0;
 				windowStart = t;
 			}
 			if (t >= TraceMs) {
