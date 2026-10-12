@@ -189,6 +189,12 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   115 interrupts handled, ring drained (RPTR = WPTR = 0x730), IH idle, `IH_CNTL` = 0x01080011. Apple masks CRTC0
   V_UPDATE again when idle (`CRTC_INTERRUPT_CONTROL` 0x8000020). The scanout memory holds the setup screen's dark
   gradient. The stop at 120 s was the deliberate panic.
+- **XOSI back to Windows 10, with the xHCI kept out of D3cold (2026-10-12, untested):** the only USB-relevant
+  difference between `OSVR` 0x0E and 0x0F is `FINI` (from `\_SB.PCI0._INI`) clearing `XHCD`/`EHCD`/`ST_D`/`SD_D`/`S03D`
+  below 0x0F. `SSDT-XOSI` now claims Windows 2012/2013/2015 and adds `\_SB.PCI0.XHCF`, whose `_INI` (run after
+  `PCI0._INI`) clears only `XHCD` under Darwin, so XHC0's `_S0W`/`_PS0`/`_PS3` act as under Windows 7. Windows 8+ also
+  makes the AMD I2C (touchpad bus), GPIO and UART devices present and routes the brightness Fn keys as ACPI
+  `Notify (VGA.LCD, 0x86/0x87)`. Previous (Windows 7) EFI kept as `efi-d509ba/usb-spoof-win7`.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).

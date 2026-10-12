@@ -62,7 +62,7 @@ DRIVERS = ["OpenRuntime.efi", "OpenHfsPlus.efi", "ResetNvramEntry.efi"]
 
 SSDTS = {  # compiled from docs/opencore/<name>.dsl into <work dir>/acpi/
     "SSDT-EC-USBX-LAPTOP.aml": "Fake EC + USBX (laptop, real EC0 under SBRG)",
-    "SSDT-XOSI.aml": "XOSI: firmware sees Windows 7 under macOS (HPET on, FCH D3cold off)",
+    "SSDT-XOSI.aml": "XOSI: firmware sees Windows 10 under macOS; XHCF clears XHCD (no xHCI D3cold)",
 }
 
 
