@@ -308,15 +308,29 @@ void CRDriver::init() {
 // poll USBSTS.EINT every millisecond, and when it is set, clear it (RW1C) and signal the event source, which runs
 // AppleUSBXHCI::primaryInterrupt on its work loop exactly as a delivered interrupt would. -crnoxhcifwd disables.
 namespace {
-	mach_vm_address_t orgFilterSource;
+	mach_vm_address_t orgFilterSource, orgFilterSourceBlock;
 	IOFilterInterruptEventSource *xhciSources[4];
 	uint32_t xhciSourceCount, xhciForwards, xhciPolls;
 	IOPCIDevice *xhciDevice;
+	// Which hooks are in place ("fp", "block"), shown with the counts in the controller's "CarrizoRed-xhcifwd" property
+	// (XHCIProbe prints it on the verbose screen).
+	char xhciRouted[32] = "none";
+
+	void xhciPublish(const char *what) {
+		if (!xhciDevice)
+			return;
+		char state[160];
+		snprintf(state, sizeof(state), "hooks %s; %u sources, %u forwards, %u polls; %s", xhciRouted, xhciSourceCount,
+			__atomic_load_n(&xhciForwards, __ATOMIC_RELAXED), __atomic_load_n(&xhciPolls, __ATOMIC_RELAXED), what);
+		xhciDevice->setProperty("CarrizoRed-xhcifwd", state);
+	}
 
 	void xhciForwardThread(void *, wait_result_t) {
 		IOMemoryMap *map = xhciDevice->mapDeviceMemoryWithIndex(0);
-		if (!map)
+		if (!map) {
+			xhciPublish("BAR0 map FAILED");
 			return;
+		}
 		auto *base = reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
 		uint64_t length = map->getLength();
 		auto r32 = [&](uint32_t off) { return off + 4 <= length ? *reinterpret_cast<volatile uint32_t *>(base + off) : ~0u; };
@@ -335,41 +349,69 @@ namespace {
 					xhciSources[i]->signalInterrupt();
 				__atomic_fetch_add(&xhciForwards, 1, __ATOMIC_RELAXED);
 			}
+			if (xhciPolls % 1000 == 1)
+				xhciPublish("running");
 			IOSleep(1);
 		}
+	}
+
+	void xhciCatch(IOFilterInterruptEventSource *source, OSObject *owner, IOService *provider, int intIndex) {
+		auto *pci = OSDynamicCast(IOPCIDevice, provider);
+		if (!source || !pci || xhciSourceCount >= arrsize(xhciSources) ||
+			WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigVendorID) != 0x1022 ||
+			WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigDeviceID) != 0x7914)
+			return;
+		source->retain();
+		xhciSources[xhciSourceCount++] = source;
+		if (!xhciDevice) {
+			pci->retain();
+			xhciDevice = pci;
+			thread_t thread;
+			if (kernel_thread_start(xhciForwardThread, nullptr, &thread) == KERN_SUCCESS)
+				thread_deallocate(thread);
+			else
+				xhciPublish("thread FAILED");
+		}
+		xhciPublish("caught");
+		SYSLOG("cr", "xHCI 1022:7914: forwarding interrupts for %s (source %d)",
+			owner ? owner->getMetaClass()->getClassName() : "?", intIndex);
 	}
 
 	IOFilterInterruptEventSource *wrapFilterSource(OSObject *owner, IOInterruptEventSource::Action action,
 		IOFilterInterruptEventSource::Filter filter, IOService *provider, int intIndex) {
 		auto *source = FunctionCast(wrapFilterSource, orgFilterSource)(owner, action, filter, provider, intIndex);
-		auto *pci = OSDynamicCast(IOPCIDevice, provider);
-		if (source && pci && xhciSourceCount < arrsize(xhciSources) &&
-			WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigVendorID) == 0x1022 &&
-			WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigDeviceID) == 0x7914) {
-			source->retain();
-			xhciSources[xhciSourceCount++] = source;
-			if (!xhciDevice) {
-				pci->retain();
-				xhciDevice = pci;
-				thread_t thread;
-				if (kernel_thread_start(xhciForwardThread, nullptr, &thread) == KERN_SUCCESS)
-					thread_deallocate(thread);
-			}
-			SYSLOG("cr", "xHCI 1022:7914: forwarding interrupts for %s (source %d)",
-				owner ? owner->getMetaClass()->getClassName() : "?", intIndex);
-		}
+		xhciCatch(source, owner, provider, intIndex);
+		return source;
+	}
+
+	// The block-based variant (owner, provider, index, action block, filter block).
+	IOFilterInterruptEventSource *wrapFilterSourceBlock(OSObject *owner, IOService *provider, int intIndex, void *action,
+		void *filter) {
+		auto *source = FunctionCast(wrapFilterSourceBlock, orgFilterSourceBlock)(owner, provider, intIndex, action, filter);
+		xhciCatch(source, owner, provider, intIndex);
 		return source;
 	}
 }
 
 void CRDriver::processPatcher(KernelPatcher &patcher) {
 	if (!checkKernelArgument("-crnoxhcifwd")) {
-		KernelPatcher::RouteRequest request {"__ZN28IOFilterInterruptEventSource26filterInterruptEventSourceEP8OSObjectPFvS1_"
-											 "P22IOInterruptEventSourceiEPFbS1_PS_EP9IOServicei",
-			wrapFilterSource, orgFilterSource};
-		if (!routeChecked(patcher, KernelPatcher::KernelID, request, 0, 0)) {
-			SYSLOG("cr", "xHCI forwarding: failed to route filterInterruptEventSource (error %d)", patcher.getError());
-			patcher.clearError();
+		KernelPatcher::RouteRequest requests[] {
+			{"__ZN28IOFilterInterruptEventSource26filterInterruptEventSourceEP8OSObjectPFvS1_P22IOInterruptEventSourceiEPFbS1_"
+			 "PS_EP9IOServicei",
+				wrapFilterSource, orgFilterSource},
+			{"__ZN28IOFilterInterruptEventSource26filterInterruptEventSourceEP8OSObjectP9IOServiceiU13block_pointerFvP22IOInter"
+			 "ruptEventSourceiEU13block_pointerFbPS_E",
+				wrapFilterSourceBlock, orgFilterSourceBlock},
+		};
+		xhciRouted[0] = '\0';
+		for (size_t i = 0; i < arrsize(requests); i++) {
+			if (routeChecked(patcher, KernelPatcher::KernelID, requests[i], 0, 0)) {
+				strlcat(xhciRouted, i ? "block " : "fp ", sizeof(xhciRouted));
+			} else {
+				SYSLOG("cr", "xHCI forwarding: failed to route %s (error %d)", requests[i].symbol, patcher.getError());
+				strlcat(xhciRouted, i ? "block-FAILED " : "fp-FAILED ", sizeof(xhciRouted));
+				patcher.clearError();
+			}
 		}
 	}
 

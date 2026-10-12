@@ -288,7 +288,7 @@ namespace {
 					}
 				}
 				char w[200];
-				snprintf(w, sizeof(w), "v0.5.1 t=%llus D%u msi=%d msix=%d cfgX=%x to %x/%x%s IP %u/%u EINT %u/%u ev %u hse %u",
+				snprintf(w, sizeof(w), "v0.5.2 t=%llus D%u msi=%d msix=%d cfgX=%x to %x/%x%s IP %u/%u EINT %u/%u ev %u hse %u",
 					t / 1000, c.pm ? c.pci->configRead16(c.pm + 4) & 3 : 0xF, msi, msix, msixResult, target, data,
 					mask ? " MASKED" : "", ipSet, samples, eintSet, samples, erdpMoves, hse);
 				IOLog("XHCIProbe: irq %s\n", w);
@@ -312,6 +312,9 @@ namespace {
 					ps.connected = connected;
 				}
 				IOLog("XHCIProbe: ports %s\n", l[0] ? l : "(none connected)");
+				// CarrizoRed's interrupt forwarder (its hooks, caught interrupt sources and counts), if it set any.
+				auto *fwd = OSDynamicCast(OSString, c.pci->getProperty("CarrizoRed-xhcifwd"));
+				IOLog("XHCIProbe: fwd %s\n", fwd ? fwd->getCStringNoCopy() : "(no CarrizoRed-xhcifwd property)");
 				c.pci->setProperty("XHCIProbe-ports", l);
 				samples = ipSet = eintSet = erdpMoves = hse = 0;
 				windowStart = t;
