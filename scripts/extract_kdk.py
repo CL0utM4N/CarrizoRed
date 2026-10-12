@@ -8,6 +8,7 @@ Usage:
 
     -m/--match  extract only paths containing this text (case-insensitive, repeatable). Default: everything.
     --list      print matching paths instead of extracting.
+    --exact     -m is a whole path (e.g. System/Library/Kernels/kernel), not a substring.
 
 A .dmg or .pkg is unpacked with 7-Zip (7z must be installed; it is found on PATH or in Program Files) to get the
 KDK.pkg Payload. The Payload is a pbzx stream (xz-compressed chunks) wrapping a cpio archive, both handled here with
@@ -175,10 +176,14 @@ def main():
     ap.add_argument("-o", "--out", type=Path, required=True)
     ap.add_argument("-m", "--match", action="append", default=[])
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--exact", action="store_true", help="-m must equal the whole path (after ./), not a substring")
     args = ap.parse_args()
 
     needles = [m.lower() for m in args.match]
-    wanted = (lambda n: any(x in n.lower() for x in needles)) if needles else (lambda n: True)
+    if args.exact:
+        wanted = lambda n: n.lower().lstrip("./") in [x.lstrip("./") for x in needles]
+    else:
+        wanted = (lambda n: any(x in n.lower() for x in needles)) if needles else (lambda n: True)
 
     args.out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=args.out) as work:

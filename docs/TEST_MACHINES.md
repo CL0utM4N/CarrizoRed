@@ -245,3 +245,9 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   D0, no host errors. The GPU's MSI to the same address (vector 0x72) works, so this controller's plain MSI never
   reaches the CPU. Linux uses MSI-X on it. XHCIProbe 0.5 switches it to MSI-X with
   `IOPCIDevice::configureInterrupts(kIOInterruptTypePCIMessagedX)` before AppleUSBXHCIPCI starts.
+- **XHCIProbe 0.5.1 with MSI-X (`cfgX=0`, `msix=1`, `fee10000/4070`, unmasked): no change** (`ev 1`, `EINT` always
+  set). So neither MSI nor MSI-X from this controller reaches the CPU. AppleUSBXHCI's handling would work if it did:
+  `primaryFilterInterrupt` just calls the interrupter's `clearInterruptPending` (a no-op for MSI) and returns true, and
+  `primaryInterrupt` drains the event ring without an EHB check. CarrizoRed now forwards the interrupts in software:
+  it hooks `IOFilterInterruptEventSource::filterInterruptEventSource` to catch the source AppleUSBXHCIPCI creates for
+  `1022:7914`, polls `USBSTS.EINT` every 1 ms, clears it and calls the source's `signalInterrupt()` (`-crnoxhcifwd`).

@@ -15,6 +15,7 @@
 #include <Headers/kern_util.hpp>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IOFilterInterruptEventSource.h>
 #include <kern/thread.h>
 #include <kern/debug.h>
 #include <stdarg.h>
@@ -298,7 +299,80 @@ void CRDriver::init() {
 		this);
 }
 
-void CRDriver::processPatcher(KernelPatcher &) {
+// --- AMD FCH xHCI interrupt forwarding ------------------------------------------------------------------------------
+// The D509BA's USB 3 controller (FCH xHCI 1022:7914) never delivers its interrupts to macOS: XHCIProbe saw USBSTS.EINT
+// set in every 1 ms sample and the event ring serviced once every 2 s (AppleUSBXHCI's fallback timer), with plain MSI
+// and with MSI-X alike, while the controller does send them (IMAN.IP keeps clearing, as MSI does on send) and the
+// GPU's MSIs to the same address arrive. Every USB transfer waited up to 2 s: the installer copied at ~130 KB/s.
+// Forward them in software: catch the IOFilterInterruptEventSource that AppleUSBXHCIPCI creates for the controller,
+// poll USBSTS.EINT every millisecond, and when it is set, clear it (RW1C) and signal the event source, which runs
+// AppleUSBXHCI::primaryInterrupt on its work loop exactly as a delivered interrupt would. -crnoxhcifwd disables.
+namespace {
+	mach_vm_address_t orgFilterSource;
+	IOFilterInterruptEventSource *xhciSources[4];
+	uint32_t xhciSourceCount, xhciForwards, xhciPolls;
+	IOPCIDevice *xhciDevice;
+
+	void xhciForwardThread(void *, wait_result_t) {
+		IOMemoryMap *map = xhciDevice->mapDeviceMemoryWithIndex(0);
+		if (!map)
+			return;
+		auto *base = reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+		uint64_t length = map->getLength();
+		auto r32 = [&](uint32_t off) { return off + 4 <= length ? *reinterpret_cast<volatile uint32_t *>(base + off) : ~0u; };
+		for (;;) {
+			uint32_t cap = r32(0);
+			if (cap == ~0u) {  // powered down (D3) or gone
+				IOSleep(10);
+				continue;
+			}
+			uint32_t usbsts = (cap & 0xFF) + 4;
+			uint32_t sts = r32(usbsts);
+			__atomic_fetch_add(&xhciPolls, 1, __ATOMIC_RELAXED);
+			if (sts != ~0u && (sts & 8)) {  // EINT
+				*reinterpret_cast<volatile uint32_t *>(base + usbsts) = 8;
+				for (uint32_t i = 0; i < xhciSourceCount; i++)
+					xhciSources[i]->signalInterrupt();
+				__atomic_fetch_add(&xhciForwards, 1, __ATOMIC_RELAXED);
+			}
+			IOSleep(1);
+		}
+	}
+
+	IOFilterInterruptEventSource *wrapFilterSource(OSObject *owner, IOInterruptEventSource::Action action,
+		IOFilterInterruptEventSource::Filter filter, IOService *provider, int intIndex) {
+		auto *source = FunctionCast(wrapFilterSource, orgFilterSource)(owner, action, filter, provider, intIndex);
+		auto *pci = OSDynamicCast(IOPCIDevice, provider);
+		if (source && pci && xhciSourceCount < arrsize(xhciSources) &&
+			WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigVendorID) == 0x1022 &&
+			WIOKit::readPCIConfigValue(pci, WIOKit::kIOPCIConfigDeviceID) == 0x7914) {
+			source->retain();
+			xhciSources[xhciSourceCount++] = source;
+			if (!xhciDevice) {
+				pci->retain();
+				xhciDevice = pci;
+				thread_t thread;
+				if (kernel_thread_start(xhciForwardThread, nullptr, &thread) == KERN_SUCCESS)
+					thread_deallocate(thread);
+			}
+			SYSLOG("cr", "xHCI 1022:7914: forwarding interrupts for %s (source %d)",
+				owner ? owner->getMetaClass()->getClassName() : "?", intIndex);
+		}
+		return source;
+	}
+}
+
+void CRDriver::processPatcher(KernelPatcher &patcher) {
+	if (!checkKernelArgument("-crnoxhcifwd")) {
+		KernelPatcher::RouteRequest request {"__ZN28IOFilterInterruptEventSource26filterInterruptEventSourceEP8OSObjectPFvS1_"
+											 "P22IOInterruptEventSourceiEPFbS1_PS_EP9IOServicei",
+			wrapFilterSource, orgFilterSource};
+		if (!routeChecked(patcher, KernelPatcher::KernelID, request, 0, 0)) {
+			SYSLOG("cr", "xHCI forwarding: failed to route filterInterruptEventSource (error %d)", patcher.getError());
+			patcher.clearError();
+		}
+	}
+
 	auto *devInfo = DeviceInfo::create();
 	if (!devInfo) {
 		SYSLOG("cr", "failed to create DeviceInfo");
@@ -2634,6 +2708,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 	if (restoreOn)
 		add("restore: %u steps done, %u registers written, %u re-written after Apple changed them\n", restoreDone,
 			restoreWrites, restoreHolds);
+	add("xhci fwd: %u sources, %u forwards, %u polls%s\n", xhciSourceCount, xhciForwards, xhciPolls,
+		checkKernelArgument("-crnoxhcifwd") ? " (off)" : "");
 	add("assr: DPCD 0x00D cap 0x%02x, 0x10A before Apple 0x%02x, %u writes%s, readback 0x%02x\n", assrCap, assrBoot,
 		assrWrites, assrOff ? " (off)" : "", assrReadback);
 	if (!checkKernelArgument("-crnoaccel")) {
