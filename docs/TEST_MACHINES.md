@@ -154,6 +154,10 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   panel decoding 24 bpp data gives identical coloured rows. The rest of the diff is Apple's own gamma/regamma LUT,
   gamut remap, cursor, scaler init, CRTC double-buffer settings and status/counter registers. CarrizoRed now caps the
   DP colour depth at the firmware's (`-crnobpccap` disables).
+- **Spoof boot 32 (6 bpc cap applied):** DP pixel format and M/N now equal the firmware's; the whole DIG0/DP0 block
+  matches. The panel now flashes, still with identical random-colour rows plus a white line. Remaining differences
+  are in pipe 0's processing chain (FMT, LB, DCP colour pipeline/cursor, scaler/CRTC update). Next: `-crrestore`
+  writes the firmware's values back into one block at a time, 15 s apart, in a single boot.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).

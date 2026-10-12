@@ -117,6 +117,9 @@ static constexpr size_t RegRingSize = 64;
 static RegEvent regRing[RegRingSize];
 static uint32_t regRingHead;
 static void printRegEvent(const RegEvent &event, const char *suffix);
+static void restoreTick(uint32_t t);  // -crrestore, defined with the display-path diff
+static bool restoreOn;
+static uint32_t restoreDone, restoreWrites;
 // Power-management / config-space events on the iGPU (see patchPci).
 static uint32_t pmEvents, pciConfigWrites;
 
@@ -340,6 +343,7 @@ void CRDriver::processPatcher(KernelPatcher &) {
 	regLogAll = checkKernelArgument("-crreglogall");
 	lbFixOff = checkKernelArgument("-crnolbfix");
 	bpcCapOff = checkKernelArgument("-crnobpccap");
+	restoreOn = checkKernelArgument("-crrestore");
 
 	logPCIInfo();
 	if (checkKernelArgument("-crmacgpu"))
@@ -676,6 +680,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				__atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED), __atomic_load_n(&pmEvents, __ATOMIC_RELAXED),
 				__atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));
 
+		if (restoreOn && gpuMmio)
+			restoreTick(t);
 		if (panicAt && t >= panicAt)
 			self->panicReport(t, now);
 
@@ -1853,6 +1859,60 @@ static constexpr uint32_t DiffRegCount = 0x60 + 0x80 + 0x200 + 0x100 + 0x100;
 static uint32_t diffBoot[DiffRegCount];
 static bool diffBootValid;
 
+// -crrestore: live single-boot bisect of pipe 0's processing chain. Spoof boot 32: the DP transport (DIG0, DP0, pixel
+// format, M/N, PHY) matched the firmware's working state register for register and the scanout memory was uniform grey,
+// yet the panel showed identical rows of random colour (stale line-buffer data). Write the firmware's boot values back
+// into one block at a time, 15 s apart, so the step at which the picture changes names the block. Control registers
+// only (status / counter registers are left alone).
+static const uint32_t restoreFmt[] {0x1BE8, 0x1BE9, 0x1BEA, 0x1BEB, 0x1BEC, 0x1BED, 0x1BEE, 0x1BEF, 0x1BF0, 0x1BF1,
+	0x1BF2, 0x1BF3, 0x1BF4, 0x1BF5, 0x1BF6, 0x1BF7, 0x1BF8, 0x1BF9, 0x1BFA, 0x1BFB, 0x1BFC};
+static const uint32_t restoreLb[] {0x1AC0, 0x1AC1, 0x1AC3, 0x1AC4};
+static const uint32_t restoreColor[] {0x1A10, 0x1A2D, 0x1A50, 0x1A59, 0x1A5A, 0x1A5B, 0x1A5C, 0x1A5D, 0x1A5E, 0x1A5F,
+	0x1A60, 0x1AA0, 0x1A66};
+static const uint32_t restoreScl[] {0x1B40, 0x1B44, 0x1B4A, 0x1B4C, 0x1B4E, 0x1B53, 0x1B86, 0x1B88, 0x1B89, 0x1B8A,
+	0x1BB6, 0x1BBE, 0x1BE7};
+static const struct {
+	uint32_t at;
+	const char *name;
+	const uint32_t *regs;
+	size_t count;
+} restoreSteps[] {
+	{30, "FMT", restoreFmt, sizeof(restoreFmt) / sizeof(restoreFmt[0])},
+	{45, "LB", restoreLb, sizeof(restoreLb) / sizeof(restoreLb[0])},
+	{60, "DCP colour + cursor", restoreColor, sizeof(restoreColor) / sizeof(restoreColor[0])},
+	{75, "SCL + CRTC update", restoreScl, sizeof(restoreScl) / sizeof(restoreScl[0])},
+};
+static bool diffBootValue(uint32_t offset, uint32_t &value) {
+	if (!diffBootValid)
+		return false;
+	uint32_t n = 0;
+	for (auto &block : diffBlocks) {
+		if (offset >= block.start && offset < block.start + block.count) {
+			value = diffBoot[n + offset - block.start];
+			return true;
+		}
+		n += block.count;
+	}
+	return false;
+}
+
+static void restoreTick(uint32_t t) {
+	while (restoreDone < sizeof(restoreSteps) / sizeof(restoreSteps[0]) && t >= restoreSteps[restoreDone].at) {
+		auto &step = restoreSteps[restoreDone++];
+		uint32_t written = 0;
+		for (size_t i = 0; i < step.count; i++) {
+			uint32_t boot;
+			if (diffBootValue(step.regs[i], boot) && gpuMmio[step.regs[i]] != boot) {
+				gpuMmio[step.regs[i]] = boot;
+				written++;
+			}
+		}
+		restoreWrites += written;
+		IOLog("CarrizoRed: t=%us restore step %u (%s): %u registers set to their boot values\n", t, restoreDone,
+			step.name, written);
+	}
+}
+
 uint8_t CRDriver::wrapMaxLinkLanes(const void *that) {
 	uint8_t lanes = FunctionCast(wrapMaxLinkLanes, callback->orgMaxLinkLanes)(that);
 	uint8_t capped = bootDpLanes && lanes > bootDpLanes ? bootDpLanes : lanes;
@@ -2175,6 +2235,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 	add("boot DP lanes %u (lane cap %s), LB size fixes %u%s, boot DP depth %u, bpc caps %u%s\n", bootDpLanes,
 		checkKernelArgument("-crnolanecap") ? "off" : "on", lbFixes, lbFixOff ? " (off)" : "", bootDpDepth, bpcCaps,
 		bpcCapOff ? " (off)" : "");
+	if (restoreOn)
+		add("restore: %u steps done, %u registers written\n", restoreDone, restoreWrites);
 	add("t=%us regs %u ih %u missing-pipe %u pm %u cfgwr %u\n", t, __atomic_load_n(&regAccesses, __ATOMIC_RELAXED),
 		__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), __atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED),
 		__atomic_load_n(&pmEvents, __ATOMIC_RELAXED), __atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));
