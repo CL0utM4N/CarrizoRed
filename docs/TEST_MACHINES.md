@@ -124,6 +124,13 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   link rate, lane count, pattern, lane set; what the sink reports at 0x202..).
 - One unrelated-looking panic at 1.47 s uptime (Probabilistic GZAlloc: read 49 bytes past a 128-byte data.kalloc
   element); too early to reach NVRAM, top of the log not captured, did not recur on the next boot.
+- **Spoof boot 26 (DPCD transcript):** sink caps `12 0a 01 41` (DPCD 1.2, 2.7 Gbps, **1 lane**, downspread). Apple
+  writes 0x600=1, 0x100=0x0A, 0x101=1, 0x107=0x10, 0x108=1, then TPS1 (0x102=0x21); the sink reports lane 0 with no
+  clock recovery (0x202 = 00) and asks for more swing up to max, never locking. Everything Apple tells the sink is
+  consistent, so the PHY output isn't reaching the panel. Legacy amdgpu's eDP enable runs
+  `UNIPHYTransmitterControl` with `ATOM_TRANSMITTER_ACTION_POWER_ON` (12) before `ENABLE`; Apple never does, and its
+  clean-up had switched the LVTMA power sequencer off (SYNCEN gates the PHY output). CarrizoRed now injects that
+  call (`-crnoedppoweron` disables) and snapshots the eDP registers when training pattern 1 starts.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).

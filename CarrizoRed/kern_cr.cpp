@@ -127,7 +127,13 @@ struct AtomCall {
 	uint32_t in[4], out[2];
 };
 static constexpr uint32_t AtomRingSize = 32, AtomAuxTable = 0x4E, AtomTransmitterTable = 0x4C;
-static bool dpExtClkOff;  // -crnodpextclk, see wrapExecuteBiosCommandTable
+static bool dpExtClkOff;    // -crnodpextclk, see wrapExecuteBiosCommandTable
+static bool edpPowerOnOff;  // -crnoedppoweron, see wrapExecuteBiosCommandTable
+
+// eDP block state at the moment Apple starts training pattern 1 (DPCD 0x102 written with TPS1): panel power
+// sequencer, DIG0, DP0, pixel rate, backlight. The black box otherwise only sees the state after Apple gave up.
+static const uint32_t trainSnapRegs[] {0x481B, 0x481C, 0x4A00, 0x4A47, 0x4AA0, 0x4AA3, 0x4AA4, 0x4AAF, 0x140, 0x4820};
+static uint32_t trainSnap[sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0])], trainSnaps;
 static AtomCall atomRing[AtomRingSize];
 static uint32_t atomHead, atomCalls, auxCalls, auxFailures;
 
@@ -166,7 +172,10 @@ static void atomReport(Add &add) {
 		add(" %u:%x %x %x %x %x %x -> %x %x x%u\n", i, call.table, call.ok, call.in[0], call.in[1], call.in[2],
 			call.in[3], call.out[0], call.out[1], call.repeat);
 	}
-	add("dpcd: %u transactions; addr R/W len ret: bytes xN\n", dpcdCount);
+	add("at TPS1 (%u times):", trainSnaps);
+	for (size_t i = 0; i < sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0]); i++)
+		add(" %x=%x", trainSnapRegs[i], trainSnap[i]);
+	add("\ndpcd: %u transactions; addr R/W len ret: bytes xN\n", dpcdCount);
 	head = __atomic_load_n(&dpcdHead, __ATOMIC_RELAXED);
 	for (uint32_t i = head > DpcdRingSize ? head - DpcdRingSize : 0; i != head; i++) {
 		auto &tx = dpcdRing[i % DpcdRingSize];
@@ -1540,7 +1549,8 @@ void CRDriver::patchPolicy(KernelPatcher &patcher, size_t index, mach_vm_address
 	// The command-table hook records VBIOS calls and carries the DP PHY clock-source fix; it stays installed unless
 	// both are switched off.
 	dpExtClkOff = checkKernelArgument("-crnodpextclk");
-	if (!checkKernelArgument("-crnoatomlog") || !dpExtClkOff) {
+	edpPowerOnOff = checkKernelArgument("-crnoedppoweron");
+	if (!checkKernelArgument("-crnoatomlog") || !dpExtClkOff || !edpPowerOnOff) {
 		// Legacy atombios VBIOSes (GCN 1-4, Stoney included) run through AtiAtomBiosParserService (→ _ParseTable);
 		// AtiAtomFirmwareInterface is the atomfirmware (Vega+) path and saw no calls on boot 23.
 		KernelPatcher::RouteRequest request {"__ZN24AtiAtomBiosParserService23executeBiosCommandTableEjPvj",
@@ -1683,6 +1693,35 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 		memcpy(call->in, params, sizeof(call->in));
 	else
 		memset(call->in, 0, sizeof(call->in));
+	// eDP panel power. Legacy amdgpu (atombios_encoders.c, enable_dig) runs the transmitter table with
+	// ATOM_TRANSMITTER_ACTION_POWER_ON (12) for an eDP connector before ATOM_TRANSMITTER_ACTION_ENABLE and waits for the
+	// panel; Apple never does. Spoof boot 26: AUX worked, but the sink never saw clock recovery on lane 0 at any swing,
+	// and the LVTMA power sequencer (DIGON/SYNCEN/BLON on at boot) had been switched off by Apple's clean-up; SYNCEN
+	// gates the PHY data output. Before Apple's transmitter ENABLE (action 1) for connector 0x14 (eDP), run the table
+	// the way amdgpu_atombios_encoder_set_edp_panel_power() does (all parameters zero, ucAction = POWER_ON) and allow
+	// the 300 ms it gives the panel to raise HPD. -crnoedppoweron disables.
+	if (table == AtomTransmitterTable && params && !edpPowerOnOff) {
+		auto *bytes = static_cast<uint8_t *>(params);
+		if (bytes[3] == 1 && bytes[5] == 0x14) {
+			uint8_t power[32] {};
+			power[3] = 12;  // ATOM_TRANSMITTER_ACTION_POWER_ON
+			uint8_t powered = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
+				table, power, flag);
+			AtomCall injected {};
+			injected.table = static_cast<uint16_t>(table);
+			injected.ok = static_cast<uint8_t>((powered & 1) | 0x40);  // 0x40 = injected by CarrizoRed
+			injected.repeat = 1;
+			memcpy(injected.in, power, sizeof(injected.in));
+			memcpy(injected.out, power, sizeof(injected.out));
+			ringPushMerged(atomRing, AtomRingSize, atomHead, injected, +[](const AtomCall &, const AtomCall &) {
+				return false;
+			});
+			if (ml_get_interrupts_enabled() && !ml_at_interrupt_context())
+				IOSleep(300);
+			else
+				IODelay(300000);
+		}
+	}
 	uint8_t ok = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that, table, params,
 		flag);
 	call->ok = static_cast<uint8_t>((ok & 1) | patched);
@@ -1703,6 +1742,11 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 
 static void dpcdRecord(uint32_t address, uint32_t length, bool write, const uint8_t *data, IOReturn ret) {
 	__atomic_fetch_add(&dpcdCount, 1, __ATOMIC_RELAXED);
+	if (write && address == 0x102 && length >= 1 && data && (data[0] & 3) == 1 && gpuMmio) {
+		for (size_t i = 0; i < sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0]); i++)
+			trainSnap[i] = gpuMmio[trainSnapRegs[i]];
+		trainSnaps++;
+	}
 	DpcdTx tx {};
 	tx.address = address;
 	tx.length = static_cast<uint8_t>(length > 0xFF ? 0xFF : length);
