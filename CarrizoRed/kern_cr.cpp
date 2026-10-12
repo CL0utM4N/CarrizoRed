@@ -100,6 +100,8 @@ static uint8_t regSeen[RegOpCount][0x10000 / 8];
 static uint64_t regLogFromMs;  // 0 = not yet (controller not started)
 static uint32_t regLogged, regAccesses;
 static bool regLogIntsOff, pipeGuard, regLogAll;
+static bool lbFixOff;    // -crnolbfix, see wrapRegWrite32
+static uint32_t lbFixes;
 static uint32_t pipeLimit = 6, pipeAccesses, pipeLogged;
 struct RegEvent {
 	RegOp op;
@@ -331,6 +333,7 @@ void CRDriver::processPatcher(KernelPatcher &) {
 	pipeGuard = checkKernelArgument("-crpipeguard");
 	regLogIntsOff = checkKernelArgument("-crreglogintsoff");
 	regLogAll = checkKernelArgument("-crreglogall");
+	lbFixOff = checkKernelArgument("-crnolbfix");
 
 	logPCIInfo();
 	if (checkKernelArgument("-crmacgpu"))
@@ -1294,7 +1297,24 @@ uint32_t CRDriver::wrapRegRead32(void *that, uint32_t offset) {
 	return regReadDone(flags, FunctionCast(wrapRegRead32, callback->orgRegRead32)(that, offset));
 }
 
+// Line buffer size. LB_MEMORY_CTRL (pipe 0 at dword 0x1AC1, +0x200 per pipe on DCE 11.0): Apple writes
+// LB_MEMORY_SIZE 0x404, sized for Polaris's DCE 11.2 line buffer (13-bit field, shared by 6 pipes). DCE 11.0's field
+// is 12 bits and Linux (dce_transform_set_scaler, LB_TOTAL_NUMBER_OF_ENTRIES) and the firmware both use 0x6B0 (1712).
+// Spoof boot 29: the link trained and the scanout memory was a uniform grey, yet the panel showed identical
+// coloured rows (vertical stripes), i.e. line-buffer contents rather than the surface. Force the size to 0x6B0 and
+// keep Apple's other fields. -crnolbfix disables.
+
 void CRDriver::wrapRegWrite32(void *that, uint32_t offset, uint32_t value) {
+	if (!lbFixOff) {
+		uint32_t dword = offset >> 2;
+		if (dword == 0x1AC1 || dword == 0x1CC1 || dword == 0x1EC1) {
+			uint32_t fixed = (value & ~0xFFFu) | 0x6B0;
+			if (fixed != value) {
+				value = fixed;
+				__atomic_fetch_add(&lbFixes, 1, __ATOMIC_RELAXED);
+			}
+		}
+	}
 	if (!(regAccess(RegWrite, offset, 0, value) & RegBlocked))
 		FunctionCast(wrapRegWrite32, callback->orgRegWrite32)(that, offset, value);
 }
@@ -2098,7 +2118,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		if (n > 0)
 			len += static_cast<size_t>(n) < sizeof(report) - len ? static_cast<size_t>(n) : sizeof(report) - len - 1;
 	};
-	add("boot DP lanes %u (lane cap %s)\n", bootDpLanes, checkKernelArgument("-crnolanecap") ? "off" : "on");
+	add("boot DP lanes %u (lane cap %s), LB size fixes %u%s\n", bootDpLanes,
+		checkKernelArgument("-crnolanecap") ? "off" : "on", lbFixes, lbFixOff ? " (off)" : "");
 	add("t=%us regs %u ih %u missing-pipe %u pm %u cfgwr %u\n", t, __atomic_load_n(&regAccesses, __ATOMIC_RELAXED),
 		__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), __atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED),
 		__atomic_load_n(&pmEvents, __ATOMIC_RELAXED), __atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));

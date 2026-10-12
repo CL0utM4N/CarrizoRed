@@ -141,6 +141,10 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   `POWER_ON` before `ENABLE`, transmitter external clock + coherent. Next: surface geometry and a sample of the
   scanout memory in the black box, to tell a display-fetch underflow (DISPOUT_FIFO_ERROR has been set every boot)
   from bad framebuffer content.
+- **Spoof boot 29:** training succeeds (DPCD 0x202 = 07, aligned), video on, no DISPOUT FIFO error, and the scanout
+  memory is a uniform grey (0xFFBFBFBF on the top, middle and bottom rows), yet the panel shows identical coloured
+  rows. Apple writes `LB_MEMORY_CTRL.LB_MEMORY_SIZE` = 0x404 (sized for Polaris's 13-bit DCE 11.2 field); the firmware
+  and Linux (`LB_TOTAL_NUMBER_OF_ENTRIES`) use 0x6B0. CarrizoRed now forces 0x6B0 (`-crnolbfix` disables).
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
