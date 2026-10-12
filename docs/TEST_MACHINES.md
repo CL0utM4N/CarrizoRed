@@ -118,6 +118,12 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   100 MHz ("non-zero: DP-mode Uniphy input clock from the external spread clock"), and Linux DC on DCE 11.0 only
   drives DP from `CLOCK_SOURCE_ID_EXTERNAL` (`ucPhyClkSrcId` 3). CarrizoRed now patches the transmitter parameters in
   DP modes to the external reference.
+- **Spoof boot 25 (DP PHY on the external clock, 0x81 = patched in the black box):** training still fails the same
+  way. Apple's encoder/transmitter parameters now match what legacy amdgpu passes for Carrizo (rate, symbol clock,
+  PHY, encoder, connector, lanes, HPD, clock source). Next: the DPCD transcript (what Apple writes to the sink:
+  link rate, lane count, pattern, lane set; what the sink reports at 0x202..).
+- One unrelated-looking panic at 1.47 s uptime (Probabilistic GZAlloc: read 49 bytes past a 128-byte data.kalloc
+  element); too early to reach NVRAM, top of the log not captured, did not recur on the next boot.
 
 ### Consequences
 - The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).

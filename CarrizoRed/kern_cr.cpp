@@ -118,33 +118,63 @@ static uint32_t pmEvents, pciConfigWrites;
 // clock recovery although the firmware trained the same panel at boot, so what Apple passes the encoder / transmitter
 // tables (DIGxEncoderControl 1.4, DIG1TransmitterControl 1.5 on Stoney) is the next thing to see. AUX transactions
 // (ProcessAuxChannelTransaction, table 0x4E) are counted and kept in their own small ring; they would flood the main one.
+// Consecutive identical calls are merged into one entry with a repeat count, so the ring covers whole sequences
+// (training retries repeat each call several times).
 struct AtomCall {
 	uint16_t table;
-	uint8_t ok, done;
+	uint8_t ok;
+	uint16_t repeat;
 	uint32_t in[4], out[2];
 };
-static constexpr uint32_t AtomRingSize = 24, AuxRingSize = 6, AtomAuxTable = 0x4E, AtomTransmitterTable = 0x4C;
+static constexpr uint32_t AtomRingSize = 32, AtomAuxTable = 0x4E, AtomTransmitterTable = 0x4C;
 static bool dpExtClkOff;  // -crnodpextclk, see wrapExecuteBiosCommandTable
-static AtomCall atomRing[AtomRingSize], auxRing[AuxRingSize];
-static uint32_t atomHead, auxHead, atomCalls, auxCalls, auxFailures;
+static AtomCall atomRing[AtomRingSize];
+static uint32_t atomHead, atomCalls, auxCalls, auxFailures;
+
+// DPCD transcript: every native AUX read/write Apple's DisplayPort code makes (AuxChannelProxy::readBytes/writeBytes),
+// with address, length, direction, the first 8 bytes (written, or read back) and the result; identical consecutive
+// transactions merged. Link training is visible here: link rate 0x100, lane count 0x101, pattern 0x102, lane settings
+// 0x103.., sink status 0x202.. (lane CR/EQ/lock bits, adjust requests).
+struct DpcdTx {
+	uint32_t address;
+	uint8_t length, write, ok;
+	uint16_t repeat;
+	uint8_t data[8];
+};
+static constexpr uint32_t DpcdRingSize = 40;
+static DpcdTx dpcdRing[DpcdRingSize];
+static uint32_t dpcdHead, dpcdCount;
+
+template <typename Ring, typename Entry>
+static void ringPushMerged(Ring *ring, uint32_t size, uint32_t &head, const Entry &entry, bool (*same)(const Ring &,
+	const Entry &)) {
+	uint32_t h = __atomic_load_n(&head, __ATOMIC_RELAXED);
+	if (h && same(ring[(h - 1) % size], entry) && ring[(h - 1) % size].repeat < 0xFFFF) {
+		ring[(h - 1) % size].repeat++;
+		return;
+	}
+	ring[__atomic_fetch_add(&head, 1, __ATOMIC_RELAXED) % size] = entry;
+}
 
 template <typename Add>
 static void atomReport(Add &add) {
-	add("atom: %u calls (%u aux, %u aux failed); idx:table ok in[0..3] -> out[0..1]\n", atomCalls, auxCalls,
-		auxFailures);
+	add("atom: %u calls (%u aux, %u aux failed); idx:table ok(0x80=patched) in[0..3] -> out[0..1] xN\n", atomCalls,
+		auxCalls, auxFailures);
 	uint32_t head = __atomic_load_n(&atomHead, __ATOMIC_RELAXED);
 	for (uint32_t i = head > AtomRingSize ? head - AtomRingSize : 0; i != head; i++) {
 		auto &call = atomRing[i % AtomRingSize];
-		add(" %u:%x %u %x %x %x %x -> %x %x\n", i, call.table, call.ok, call.in[0], call.in[1], call.in[2], call.in[3],
-			call.out[0], call.out[1]);
+		add(" %u:%x %x %x %x %x %x -> %x %x x%u\n", i, call.table, call.ok, call.in[0], call.in[1], call.in[2],
+			call.in[3], call.out[0], call.out[1], call.repeat);
 	}
-	add("aux (last %u):", AuxRingSize);
-	head = __atomic_load_n(&auxHead, __ATOMIC_RELAXED);
-	for (uint32_t i = head > AuxRingSize ? head - AuxRingSize : 0; i != head; i++) {
-		auto &call = auxRing[i % AuxRingSize];
-		add(" [%u %x %x -> %x %x]", call.ok, call.in[0], call.in[1], call.out[0], call.out[1]);
+	add("dpcd: %u transactions; addr R/W len ret: bytes xN\n", dpcdCount);
+	head = __atomic_load_n(&dpcdHead, __ATOMIC_RELAXED);
+	for (uint32_t i = head > DpcdRingSize ? head - DpcdRingSize : 0; i != head; i++) {
+		auto &tx = dpcdRing[i % DpcdRingSize];
+		add(" %x %c%u %x:", tx.address, tx.write ? 'W' : 'R', tx.length, tx.ok);
+		for (uint32_t b = 0; b < tx.length && b < sizeof(tx.data); b++)
+			add(" %02x", tx.data[b]);
+		add(" x%u\n", tx.repeat);
 	}
-	add("\n");
 }
 
 // IH storm breaker. IH registers are dword offsets in BAR5, the same on Tonga (oss_3_0) and CZ (oss_3_0_1).
@@ -1520,6 +1550,18 @@ void CRDriver::patchPolicy(KernelPatcher &patcher, size_t index, mach_vm_address
 			patcher.clearError();
 		}
 	}
+	if (!checkKernelArgument("-crnoatomlog")) {
+		KernelPatcher::RouteRequest requests[] {
+			{"__ZN15AuxChannelProxy9readBytesEjjPhh", wrapAuxReadBytes, orgAuxReadBytes},
+			{"__ZN15AuxChannelProxy10writeBytesEjjPhh", wrapAuxWriteBytes, orgAuxWriteBytes},
+		};
+		for (auto &request : requests) {
+			if (!routeChecked(patcher, index, request, slide, size)) {
+				SYSLOG("cr", "failed to route %s (error %d)", request.symbol, patcher.getError());
+				patcher.clearError();
+			}
+		}
+	}
 	if (!checkKernelArgument("-crnolanecap")) {
 		KernelPatcher::RouteRequest request {"__ZNK28DPTrainingSettingsCalculator12maxLinkLanesEv", wrapMaxLinkLanes,
 			orgMaxLinkLanes};
@@ -1617,15 +1659,11 @@ IOReturn CRDriver::wrapInstallInterrupts(void *that) {
 uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *params, uint32_t flag) {
 	__atomic_fetch_add(&atomCalls, 1, __ATOMIC_RELAXED);
 	bool aux = table == AtomAuxTable;
-	AtomCall *call;
-	if (aux) {
+	if (aux)
 		__atomic_fetch_add(&auxCalls, 1, __ATOMIC_RELAXED);
-		call = &auxRing[__atomic_fetch_add(&auxHead, 1, __ATOMIC_RELAXED) % AuxRingSize];
-	} else {
-		call = &atomRing[__atomic_fetch_add(&atomHead, 1, __ATOMIC_RELAXED) % AtomRingSize];
-	}
+	AtomCall entry {};
+	auto *call = &entry;
 	call->table = static_cast<uint16_t>(table);
-	call->done = 0;
 	// DP PHY clock source. DIG1TransmitterControl (table 0x4C) v1.5 parameters: usSymClock, ucPhyId, ucAction,
 	// ucLaneNum, ucConnObjId, ucDigMode (+6), asConfig (+7: [1:0] ucPhyClkSrcId, [2] coherent, [6:4] HPD), ... Apple sets
 	// ucPhyClkSrcId 0 (P1PLL) for DP. The APU VBIOS FirmwareInfo has usUniphyDPModeExtClkFreq = 100 MHz ("otherwise
@@ -1650,10 +1688,45 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	call->ok = static_cast<uint8_t>((ok & 1) | patched);
 	if (params)
 		memcpy(call->out, params, sizeof(call->out));
-	call->done = 1;
-	if (aux && !(ok & 1))
-		__atomic_fetch_add(&auxFailures, 1, __ATOMIC_RELAXED);
+	call->repeat = 1;
+	if (aux) {
+		if (!(ok & 1))
+			__atomic_fetch_add(&auxFailures, 1, __ATOMIC_RELAXED);
+	} else {
+		ringPushMerged(atomRing, AtomRingSize, atomHead, entry, +[](const AtomCall &a, const AtomCall &b) {
+			return a.table == b.table && a.ok == b.ok && !memcmp(a.in, b.in, sizeof(a.in)) &&
+			       !memcmp(a.out, b.out, sizeof(a.out));
+		});
+	}
 	return ok;
+}
+
+static void dpcdRecord(uint32_t address, uint32_t length, bool write, const uint8_t *data, IOReturn ret) {
+	__atomic_fetch_add(&dpcdCount, 1, __ATOMIC_RELAXED);
+	DpcdTx tx {};
+	tx.address = address;
+	tx.length = static_cast<uint8_t>(length > 0xFF ? 0xFF : length);
+	tx.write = write;
+	tx.ok = ret == kIOReturnSuccess ? 0 : static_cast<uint8_t>(ret & 0xFF);
+	tx.repeat = 1;
+	if (data)
+		memcpy(tx.data, data, length < sizeof(tx.data) ? length : sizeof(tx.data));
+	ringPushMerged(dpcdRing, DpcdRingSize, dpcdHead, tx, +[](const DpcdTx &a, const DpcdTx &b) {
+		return a.address == b.address && a.length == b.length && a.write == b.write && a.ok == b.ok &&
+		       !memcmp(a.data, b.data, sizeof(a.data));
+	});
+}
+
+IOReturn CRDriver::wrapAuxReadBytes(void *that, uint32_t address, uint32_t length, uint8_t *data, uint8_t flags) {
+	IOReturn ret = FunctionCast(wrapAuxReadBytes, callback->orgAuxReadBytes)(that, address, length, data, flags);
+	dpcdRecord(address, length, false, data, ret);
+	return ret;
+}
+
+IOReturn CRDriver::wrapAuxWriteBytes(void *that, uint32_t address, uint32_t length, uint8_t *data, uint8_t flags) {
+	IOReturn ret = FunctionCast(wrapAuxWriteBytes, callback->orgAuxWriteBytes)(that, address, length, data, flags);
+	dpcdRecord(address, length, true, data, ret);
+	return ret;
 }
 
 // DP lane count. DPTrainingSettingsCalculator::maxLinkLanes() = min(LinkCaps lanes, sink DPCD MAX_LANE_COUNT), with no
@@ -1978,12 +2051,7 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 			else if (now != reg.bootValue)
 				add(" %x=%x/%x", reg.offset, now, reg.bootValue);
 		}
-		add("\nunchanged:");
-		for (size_t i = 0; i < watchedRegCount; i++) {
-			auto &reg = watchedRegs[i];
-			if ((reg.pipe < 0 || powered[reg.pipe]) && reg.bootValid && gpuMmio[reg.offset] == reg.bootValue)
-				add(" %x=%x", reg.offset, reg.bootValue);
-		}
+		// The unchanged registers were listed in boots 22-25; leave them out to fit the DPCD transcript in NVRAM.
 		add("\n");
 		atomReport(add);
 	}
@@ -1995,10 +2063,10 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		add("crtc0 position %x -> %x, frame %x -> %x\n", pos1, pos2, frame1, frame2);
 	}
 	add("trace: %s\nlast events:", traceSummary);
-	// Newest 24 events, oldest first, without the repetitive attribute and vblank-wait calls.
+	// Newest 16 events, oldest first, without the repetitive attribute and vblank-wait calls.
 	uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
-	uint32_t picked[24], count = 0;
-	for (uint32_t i = head; i != 0 && head - i < TraceRingSize && count < 24;) {
+	uint32_t picked[16], count = 0;
+	for (uint32_t i = head; i != 0 && head - i < TraceRingSize && count < 16;) {
 		i--;
 		auto &event = traceRing[i % TraceRingSize];
 		if (!event.name || !strncmp(event.name, "fb.setAttribute", 15) || !strncmp(event.name, "tg.wait", 7))

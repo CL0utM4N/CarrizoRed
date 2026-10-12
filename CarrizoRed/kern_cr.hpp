@@ -104,6 +104,9 @@ private:
 	static uint8_t wrapMaxLinkLanes(const void *that);
 	static uint8_t wrapMaxLinkRate(const void *that);
 	mach_vm_address_t orgMaxLinkLanes {0}, orgMaxLinkRate {0};
+	static IOReturn wrapAuxReadBytes(void *that, uint32_t address, uint32_t length, uint8_t *data, uint8_t flags);
+	static IOReturn wrapAuxWriteBytes(void *that, uint32_t address, uint32_t length, uint8_t *data, uint8_t flags);
+	mach_vm_address_t orgAuxReadBytes {0}, orgAuxWriteBytes {0};
 	mach_vm_address_t orgInstallInterrupts {0};
 	static void wrapWritePCIReg8(void *that, uint32_t offset, uint8_t value);
 	static void wrapWritePCIReg16(void *that, uint32_t offset, uint16_t value);
