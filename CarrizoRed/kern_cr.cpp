@@ -1458,6 +1458,25 @@ static uint32_t wrapPeciGetRegistrySize(void *peci, const char *name, uint32_t *
 	return ret;
 }
 
+// Microcode loading. CAIL's flags word (+0x6F0, from CailReadinOverrideRegistrySetting) has DisableCailLoadUcode
+// (0x200000), default 1: CAIL leaves the RLC, CP and SDMA microcode to the SMU firmware and waits for it
+// (Stoney_LoadRlcUcode -> Cail_MCILWaitForFwLoadFinished, asking PowerPlay). The Dummy PowerPlay back end never asks
+// the SMU to load anything, so pm4.powerUp waited forever (nvram43: Stoney_LoadRlcUcode open). Clear the flag so CAIL
+// writes the microcode embedded in HWLibs (Stoney_RLC_UCODE, _ME_, _PFP_, _CE_, _MEC1_, _SDMA0_) itself, as Linux
+// amdgpu does with fw_load_type=0 (direct loading, supported on Carrizo/Stoney). -crnodirectucode disables this.
+static mach_vm_address_t orgCailReadinOverrideRegistrySetting;
+static uint32_t cailFlagsBefore, cailFlagsAfter;
+
+static uint64_t wrapCailReadinOverrideRegistrySetting(void *cail) {
+	auto ret = FunctionCast(wrapCailReadinOverrideRegistrySetting, orgCailReadinOverrideRegistrySetting)(cail);
+	auto &flags = *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(cail) + 0x6F0);
+	cailFlagsBefore = flags;
+	flags &= ~0x200000U;
+	cailFlagsAfter = flags;
+	traceNote("cailflags=%x->%x ", cailFlagsBefore, cailFlagsAfter);
+	return ret;
+}
+
 void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, size_t kext) {
 	if (!checkKernelArgument("-crnotrace"))
 		routeStages(patcher, index, slide, size,
@@ -1471,6 +1490,20 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		};
 		for (auto &request : requests) {
 			if (!routeChecked(patcher, index, request, slide, size)) {
+				traceNote("noroute:%s(%d) ", request.symbol, patcher.getError());
+				patcher.clearError();
+			}
+		}
+		if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crnodirectucode")) {
+			// The flags word store, and the RLC loader's test of the flag (test byte [rbx+0x6F2], 0x20).
+			auto fn = patcher.solveSymbol(index, "_CailReadinOverrideRegistrySetting", slide, size);
+			auto rlc = patcher.solveSymbol(index, "_Stoney_LoadRlcUcode", slide, size);
+			patcher.clearError();
+			KernelPatcher::RouteRequest request {"_CailReadinOverrideRegistrySetting",
+				wrapCailReadinOverrideRegistrySetting, orgCailReadinOverrideRegistrySetting};
+			if (!codeHas(fn, 0x100, "8983f0060000") || !codeHas(rlc, 0x60, "f683f206000020")) {
+				traceNote("directucode=nomatch ");
+			} else if (!routeChecked(patcher, index, request, slide, size)) {
 				traceNote("noroute:%s(%d) ", request.symbol, patcher.getError());
 				patcher.clearError();
 			}
