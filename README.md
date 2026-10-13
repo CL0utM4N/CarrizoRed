@@ -213,7 +213,6 @@ scripts/
 - NootedRed and LegacyRed are under the "Thou Shalt Not Profit" licence: use them to understand
   approaches, **do not copy code from them**.
 - Apple's kexts are never committed; they are read from a Kernel Debug Kit locally.
-- A licence for this project has not been chosen yet.
 
 ## Credits
 
