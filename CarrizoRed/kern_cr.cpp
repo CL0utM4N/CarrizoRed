@@ -1425,10 +1425,20 @@ static bool ppRegInteresting(const char *name) {
 	return name && (strstr(name, "Dummy") || strstr(name, "Soft") || strstr(name, "DisableThermal"));
 }
 
+// nvram41: the soft table's size read back right (0x1EF) but PP_PhmUseDummyBackEnd read as 0 although the iGPU has it
+// as 01 00 00 00, so PHM_Initialize took the VI path (the Tonga table parser and Polaris back end). Answer that key
+// here; the note still shows what the registry gave. -crnoppdummy disables both.
+static bool ppDummyForced;
+
 static uint32_t wrapPeciReadRegistry(void *peci, const char *name, uint32_t *value, uint32_t fallback) {
 	auto ret = FunctionCast(wrapPeciReadRegistry, orgPeciReadRegistry)(peci, name, value, fallback);
 	if (ppRegInteresting(name) && ppRegNotes++ < 12)
 		traceNote("reg:%s=%x(r%x) ", name, value ? *value : 0xFFFFFFFF, ret);
+	if (ppDummyForced && name && value && !strcmp(name, "PP_PhmUseDummyBackEnd") && *value != 1) {
+		*value = 1;
+		ret = 1;
+		traceNote("->1 ");
+	}
 	return ret;
 }
 
@@ -1440,11 +1450,12 @@ static uint32_t wrapPeciGetRegistrySize(void *peci, const char *name, uint32_t *
 }
 
 void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, size_t kext) {
-	if (checkKernelArgument("-crnotrace"))
-		return;
-	routeStages(patcher, index, slide, size,
-		kext == KextRadeonX4000 ? InAccel : kext == KextRadeonX4000HWServices ? InHWServices : InHWLibs);
+	if (!checkKernelArgument("-crnotrace"))
+		routeStages(patcher, index, slide, size,
+			kext == KextRadeonX4000 ? InAccel : kext == KextRadeonX4000HWServices ? InHWServices : InHWLibs);
 	if (kext == KextRadeonX4000HWLibs) {
+		ppDummyForced = (family == ChipFamily::Stoney || family == ChipFamily::Carrizo) &&
+			!checkKernelArgument("-crnoppdummy");
 		KernelPatcher::RouteRequest requests[] {
 			{"_PECI_ReadRegistry", wrapPeciReadRegistry, orgPeciReadRegistry},
 			{"_PECI_GetRegistrySize", wrapPeciGetRegistrySize, orgPeciGetRegistrySize},
@@ -2564,10 +2575,12 @@ void CRDriver::logPCIInfo() {
 	iGPU->setProperty("CarrizoRed,revision", revision, 8);
 
 	// PowerPlay (HWLibs PHM_Initialize) has back ends for VI dGPUs, Vega, Navi and Raven/Renoir, but none for family
-	// 0x87 (Carrizo/Stoney): AMD9500Controller::initializePowerPlay fails with kIOReturnUnsupported (nvram33) and the
-	// accelerator is never powered up. PP_* registry keys are read from the GPU's PCI device properties
+	// 0x87 (Carrizo/Stoney), and the APU spoofed as Polaris 11 gets the VI path: the Tonga table parser and the Polaris
+	// SMU7 back end, which fail (PHM_Initialize = 2, nvram36-41) and would drive an SMU the APU doesn't have. Without
+	// PowerPlay the accelerator never powers up. PP_* registry keys are read from the GPU's PCI device properties
 	// (ATIController::getRegistryKey); PP_PhmUseDummyBackEnd selects the Dummy back end, which leaves clocks and power
-	// to the SMU firmware, as Linux amdgpu does with dpm=0. -crnoppdummy disables this.
+	// to the SMU firmware, as Linux amdgpu does with dpm=0. That key read back as 0 all the same (nvram41), so
+	// wrapPeciReadRegistry answers it too. -crnoppdummy disables both.
 	if (!checkKernelArgument("-crnoppdummy")) {
 		uint32_t one = 1;
 		iGPU->setProperty("PP_PhmUseDummyBackEnd", &one, sizeof(one));
