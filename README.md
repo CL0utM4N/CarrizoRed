@@ -6,16 +6,33 @@ the same idea NootedRed applies to Vega iGPUs on top of `AMDRadeonX5000`, for ch
 
 ## Status
 
-**Phase 2 (display) works on the test laptop; Phase 3 (acceleration) has started.** The test laptop is an ASUS
-VivoBook 15 D509BA (A9-9425, Stoney Ridge) on macOS Sequoia 15.4 (Recovery and installer):
+> **Experimental, in active development.** There are no releases yet. Expect kernel panics and black screens, and
+> don't run it on a machine you depend on. Everything below is from one test laptop.
 
-| | |
+**What it does today:** on a Stoney Ridge laptop, macOS Sequoia boots to the desktop and drives the built-in panel
+through Apple's own Polaris display driver, instead of the firmware's fixed framebuffer. **Graphics acceleration
+(Metal) doesn't work yet;** it's the current work.
+
+| | Status |
 |---|---|
-| Built-in eDP panel | **Working:** 1366×768 through Apple's `AMD9500Controller` / `AMDFramebuffer`; boots to the Recovery and installer GUI |
-| Display interrupts (vblank) | **Working** |
-| Acceleration (Metal, `AMDRadeonX4000`) | **In progress.** CAIL (Apple's AMD init library) supports Stoney natively; first patches for Stoney's 1 sDMA engine, 1 shader engine and APU page tables are in. The accelerator hasn't attached in a test boot yet |
-| Brightness, HDMI, sleep/wake, audio | Not done or untested |
+| Built-in eDP panel | **Works** (1366×768) through Apple's `AMD9500Controller` / `AMDFramebuffer`: Recovery, the installer and an installed Sequoia 15.8.1 |
+| Display interrupts (vblank) | **Works** |
+| Acceleration / Metal (`AMDRadeonX4000`) | **In progress, not usable.** Apple's accelerator attaches; PowerPlay starts (Dummy back end); the GPU's microcode loads and its command processor starts, but stalls on its first commands. Boot with `-crnoaccel` for a working display without it |
+| Brightness, external displays (HDMI), sleep/wake, HDMI audio | Not done or untested |
+| Video decode/encode (UVD/VCE) | Not supported (needs the APU's SMU, which isn't driven yet) |
 | Carrizo / Bristol Ridge | Same display engine and code paths, **untested** (no hardware) |
+
+**Tested on:**
+
+| Machine | APU | macOS | Result |
+|---|---|---|---|
+| ASUS VivoBook 15 D509BA | A9-9425 (Stoney Ridge, Radeon R5) | Sequoia 15.4 (Recovery, installer), 15.8.1 (installed) | Display works; acceleration in progress |
+
+Reports from other Carrizo, Bristol Ridge or Stoney machines are welcome once it's further along; open an issue with
+the model and the black-box report (see *Installing*).
+
+**USB on these machines:** USB 3 is unusably slow under macOS on all of these APUs, independent of graphics. Use
+[FCHXHCIFix](https://github.com/CL0utM4N/FCHXHCIFix), released separately.
 
 The display needed fixes for the differences between DCE 11.0 (these APUs) and DCE 11.2 (Polaris):
 - 2–3 display pipes instead of 6;
@@ -24,15 +41,23 @@ The display needed fixes for the differences between DCE 11.0 (these APUs) and D
 - the eDP link (one lane, 6 bpc, panel power-on, external reference clock, and re-enabling ASSR in the panel);
 - the interrupt handler's enable bit, which sits in a different register on Carrizo/Stoney than on Polaris.
 
-Each one is documented in the code and in [docs/TEST_MACHINES.md](docs/TEST_MACHINES.md).
+The accelerator so far needed:
+- one sDMA engine instead of two;
+- one shader engine;
+- PowerPlay's Dummy back end, with the VBIOS PowerPlay table;
+- direct microcode loading;
+- the APU's VRAM window moved to GPU address 0;
+- APU page-table addresses;
+- the video engines left off.
 
-Expect panics and black screens. This is a development project, not something to run on a machine you depend on.
+Each fix is documented in the code, in [docs/TEST_MACHINES.md](docs/TEST_MACHINES.md) and in
+[docs/APPLE_KEXTS.md](docs/APPLE_KEXTS.md).
 
 ## Targets
 
 | APU family | Examples | PCI ID | GFX | Display | Status |
 |---|---|---|---|---|---|
-| Stoney Ridge | A9-9420/9425, A6-9220/9225, A4-9120, E2-9000 | 1002:98E4 | gfx810 | DCE 11.0, 2 pipes | Display working (D509BA) |
+| Stoney Ridge | A9-9420/9425, A6-9220/9225, A4-9120, E2-9000 | 1002:98E4 | gfx810 | DCE 11.0, 2 pipes | Display working, acceleration in progress (D509BA) |
 | Carrizo / Bristol Ridge | A12-9800, A10-9700, FX-9800P, A10-8700P, FX-8800P | 1002:9870, 9874–9877 | gfx801 | DCE 11.0, 3 pipes | Untested |
 
 Older GCN 2 APUs (Kaveri, Kabini, Beema/Mullins) may follow later. Sequoia still contains AMD's init code and
@@ -196,3 +221,9 @@ scripts/
 - The Linux `amdgpu` developers: the primary hardware reference
 - ChefKiss / NootInc for proving the approach with NootedRed and exploring it with LegacyRed
 - The VoodooI2C team (AMD I²C/GPIO support) and the Dortania guides
+
+## License
+
+BSD-3-Clause, see [LICENSE](LICENSE). CarrizoRed builds on [Lilu](https://github.com/acidanthera/Lilu) (BSD-3-Clause)
+and uses register definitions and behaviour documented in Linux `amdgpu` (MIT). No code from NootedRed, LegacyRed or
+other projects under restrictive licences is used, and no Apple binaries are included.
