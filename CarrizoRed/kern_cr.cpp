@@ -209,6 +209,9 @@ namespace IhReg {
 	                          RB_WPTR_ADDR_LO = 0xE35, CNTL = 0xE36, STATUS = 0xE38;
 }
 static volatile uint32_t *gpuMmio;  // BAR5, mapped by probeMMIO
+// crsmustep=N: stop the SMU load (smuLoadFirmware) after step N and have the watcher panic with the report. nvram74:
+// the full load froze the whole machine (no crpanicat panic); a boot that freezes without a report points at the step.
+static uint32_t smuStepLimit = 0xFF, smuStoppedAt;
 static OSData *vbiosImage;            // our reference to the iGPU's "ATY,bin_image", see wrapCailEarlyInitialize
 static IORegistryEntry *vbiosOwner;
 
@@ -797,6 +800,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			writeBreadcrumb(t);
 		if (panicAt && t >= panicAt)
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
+		if (__atomic_load_n(&smuStoppedAt, __ATOMIC_RELAXED))
+			self->panicReport(t, now, "CarrizoRed: SMU load stopped by crsmustep.");
 
 		// Watchdog: a traced call that never returns (a hard hang with this CPU still alive) becomes a panic that
 		// names it and stays on screen (debug=0x100). -crnowatchdog disables this.
@@ -1747,6 +1752,17 @@ static uint32_t smuReadSram(uint32_t address) {
 	return gpuMmio[Smu8::MP0PUB_IND_DATA];
 }
 
+// Steps: 1 region written, 2 DriverDramAddrHi/Lo + InitJobs, 3 ARAM save job, 4 power-profiling job, 5 boot-up job
+// and the wait, 6 MEC base set.
+static void smuStep(uint32_t step) {
+	if (step < smuStepLimit)
+		return;
+	smuLoad.result = "stopped by crsmustep";
+	__atomic_store_n(&smuStoppedAt, step, __ATOMIC_RELAXED);
+	for (;;)
+		IOSleep(1000);
+}
+
 static void smuLoadFirmware(void *cail) {
 	using namespace Smu8;
 	auto *mmio = gpuMmio;
@@ -1766,6 +1782,12 @@ static void smuLoadFirmware(void *cail) {
 	uint64_t fbBase = static_cast<uint64_t>(mmio[Reg::MC_VM_FB_LOCATION] & 0xFFFF) << 24;
 	smuLoad.mc = fbBase + regionFb;
 	smuLoad.phys = (static_cast<uint64_t>(mmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22) + regionFb;
+	// Never write outside the carve-out (an FB offset past its end would be some other system RAM).
+	uint64_t fbSize = ((static_cast<uint64_t>(mmio[Reg::MC_VM_FB_LOCATION] >> 16) + 1) << 24) - fbBase;
+	if (regionFb + RegionSize > fbSize) {
+		smuLoad.result = "region outside the carve-out";
+		return;
+	}
 
 	// The images: RLC, SDMA0, CE, PFP, ME, MEC1 (Stoney_UcodeInfo slots 0, 1, 3, 4, 5, 6).
 	static const uint8_t slots[] {0, 1, 3, 4, 5, 6};
@@ -1876,13 +1898,17 @@ static void smuLoadFirmware(void *cail) {
 	// smu8_request_smu_load_fw.
 	uint64_t start = uptimeMs();
 	smuLoad.before = smuReadSram(UcodeLoadStatus);
+	smuStep(1);
 	mmio[MP0PUB_IND_INDEX] = SramBase + UcodeLoadStatus;
 	mmio[MP0PUB_IND_DATA] = 0;
 	smuLoad.resp[0] = smuSendMessage(DriverDramAddrHi, static_cast<uint32_t>(smuLoad.mc >> 32));
 	smuLoad.resp[1] = smuSendMessage(DriverDramAddrLo, static_cast<uint32_t>(smuLoad.mc));
 	smuLoad.resp[2] = smuSendMessage(InitJobs, 0);
+	smuStep(2);
 	smuLoad.resp[3] = smuSendMessage(ExecuteJob, aramJob);
+	smuStep(3);
 	smuLoad.resp[4] = smuSendMessage(ExecuteJob, powerProfilingJob);
+	smuStep(4);
 	smuLoad.resp[5] = smuSendMessage(ExecuteJob, bootupJob);
 	uint32_t status = 0;
 	for (uint32_t i = 0; i < 100000; i++) {  // 1 s
@@ -1893,6 +1919,7 @@ static void smuLoadFirmware(void *cail) {
 	}
 	smuLoad.after = status;
 	smuLoad.ms = static_cast<uint32_t>(uptimeMs() - start);
+	smuStep(5);
 
 	// smu8_load_mec_firmware: halt both MEC pipes, then CP_CPC_IC_BASE_CNTL (VMID 0, ATC 0, CACHE_POLICY 0, MTYPE 1)
 	// and CP_CPC_IC_BASE_LO/HI = the MEC image.
@@ -1906,6 +1933,7 @@ static void smuLoadFirmware(void *cail) {
 	smuLoad.mecBase[0] = mmio[CP_CPC_IC_BASE_LO];
 	smuLoad.mecBase[1] = mmio[CP_CPC_IC_BASE_HI];
 	smuLoad.mecBase[2] = mmio[CP_CPC_IC_BASE_CNTL];
+	smuStep(6);
 
 	OSSafeReleaseNULL(map);
 	OSSafeReleaseNULL(desc);
@@ -2010,6 +2038,7 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 					traceNote("smuload=nomatch ");
 				} else {
 					stoneyUcodeInfo = reinterpret_cast<Smu8::CailUcode **>(info);
+					PE_parse_boot_argn("crsmustep", &smuStepLimit, sizeof(smuStepLimit));
 					KernelPatcher::RouteRequest smu[] {
 						{"_Stoney_FormatSmuDramDataBuffer", wrapStoneyFormatSmuDram, orgStoneyFormatSmuDram},
 						{"_Stoney_LoadRlcUcode", wrapStoneyLoadRlcUcode, orgStoneyLoadRlcUcode},
@@ -3831,8 +3860,9 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		}
 		// Our SMU load (smuLoadFirmware): CAIL's block and our region, the SMU's answers to DriverDramAddrHi/Lo,
 		// InitJobs and the three ExecuteJobs (1 = OK; Bxxxx busy, Cxxxx no answer), UcodeLoadStatus before/after.
-		add("smuload: %s; format calls %u cail size %x region +%x block fb+%llx mc %llx phys %llx tasks %u; resp %x %x %x "
+		add("smuload: %s (step limit %u, stopped at %u); format calls %u cail size %x region +%x block fb+%llx mc %llx phys %llx tasks %u; resp %x %x %x "
 			"%x %x %x; status %x -> %x in %u ms; mec ic %x %x cntl %x\n", smuLoad.result ? smuLoad.result : "not run",
+			smuStepLimit, smuStoppedAt,
 			smuFormatCalls, smuCailSize, smuRegionStart, smuLoad.blockOffset, smuLoad.mc, smuLoad.phys, smuLoad.tasks,
 			smuLoad.resp[0], smuLoad.resp[1], smuLoad.resp[2], smuLoad.resp[3], smuLoad.resp[4], smuLoad.resp[5],
 			smuLoad.before, smuLoad.after, smuLoad.ms, smuLoad.mecBase[0], smuLoad.mecBase[1], smuLoad.mecBase[2]);
