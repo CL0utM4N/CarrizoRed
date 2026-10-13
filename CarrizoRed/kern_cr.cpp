@@ -784,16 +784,25 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (breadcrumb)
 			writeBreadcrumb(t);
 		if (panicAt && t >= panicAt)
-			self->panicReport(t, now);
+			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
 
 		// Watchdog: a traced call that never returns (a hard hang with this CPU still alive) becomes a panic that
 		// names it and stays on screen (debug=0x100). -crnowatchdog disables this.
+		// nvram42: fb.open waited on the accelerator's power-up; name every open stage and add the full black-box
+		// report.
 		if (watchdog) {
 			uint64_t ms = uptimeMs();
-			for (size_t i = 0; i < MaxTraceStages; i++) {
-				if (__atomic_load_n(&stageOpen[i], __ATOMIC_RELAXED) && ms - stageEnterMs[i] > 10000)
-					panic("CarrizoRed watchdog: %s entered %llu ms ago and never returned (trace: %s)", stageNames[i],
-						ms - stageEnterMs[i], traceSummary);
+			bool stuck = false;
+			for (size_t i = 0; i < MaxTraceStages && !stuck; i++)
+				stuck = __atomic_load_n(&stageOpen[i], __ATOMIC_RELAXED) && ms - stageEnterMs[i] > 10000;
+			if (stuck) {
+				static char reason[512];
+				size_t len = static_cast<size_t>(snprintf(reason, sizeof(reason), "CarrizoRed watchdog: open stages:"));
+				for (size_t i = 0; i < MaxTraceStages && len < sizeof(reason); i++)
+					if (__atomic_load_n(&stageOpen[i], __ATOMIC_RELAXED))
+						len += static_cast<size_t>(snprintf(reason + len, sizeof(reason) - len, " %s(%llu ms)",
+							stageNames[i], ms - stageEnterMs[i]));
+				self->panicReport(t, now, reason);
 			}
 		}
 
@@ -2809,7 +2818,7 @@ void CRDriver::initDisplayRegs() {
 // NVRAM (AAPL,PanicInfo, read with OpenShell dmpstore) is the only way out: counters, the iGPU tree (framebuffers,
 // connectors, mode), the current display/clock registers, the trace summary and the last trace events (setPixelClock,
 // setCrtcToPixelClock, framebuffer calls). Register values are read fresh (pipes only when powered).
-void CRDriver::panicReport(uint32_t t, const char *tree) {
+void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	static char report[8192];
 	size_t len = 0;
 	auto add = [&](const char *fmt, ...) {
@@ -2995,7 +3004,7 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		auto &event = traceRing[picked[--count] % TraceRingSize];
 		add(" %s%s=%x", event.exit ? "" : ">", event.name, event.value);
 	}
-	panic("CarrizoRed: deliberate panic (crpanicat), the kernel was still running.\n%s", report);
+	panic("%s\n%s", reason, report);
 }
 
 void CRDriver::checkDisplayRegs(uint32_t t) {
