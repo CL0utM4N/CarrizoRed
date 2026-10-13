@@ -55,7 +55,7 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 }
 
 // Short summary of the bring-up trace, repeated by the watcher so it survives the console scrolling.
-static char traceSummary[1024];
+static char traceSummary[2560];
 
 static void traceNote(const char *fmt, ...) {
 	size_t len = strlen(traceSummary);
@@ -77,7 +77,7 @@ struct TraceEvent {
 	bool exit;
 };
 
-static constexpr size_t TraceRingSize = 512, MaxTraceStages = 96;
+static constexpr size_t TraceRingSize = 512, MaxTraceStages = 128;
 static TraceEvent traceRing[TraceRingSize];
 static uint32_t traceHead;
 static uint32_t stageOpen[MaxTraceStages];
@@ -1061,6 +1061,18 @@ namespace {
 		{"__ZN30AMDRadeonX4000_AMDVIsDMAEngine5startEv", "sdma.start", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware28initializeExternalInterfacesEv", "hw.initializeExternalInterfaces", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware16enableInterruptsEv", "hw.enableInterrupts", InAccel, true, false, 0},
+		// PowerPlay: AMD9500Controller::initializePowerPlay -> BaffinPowerPlayManager::initialize, which asks the
+		// accelerator for its state (ATIController::sendRequestToAccelerator -> AMDGraphicsAccelerator::
+		// callPlatformFunction), creates the HWLibs PowerPlay interface (AtiPowerPlayServices::ppInitialize ->
+		// PP_InitializeEX -> PHM_Initialize, whose per-family back ends leave out Carrizo/Stoney), then updatePowerPlay.
+		{"__ZN22BaffinPowerPlayManager10initializeEv", "ppm.initialize", InController, true, true, 0},
+		{"__ZN22BaffinPowerPlayManager24createPowerPlayInterfaceEv", "ppm.createInterface", InController, true, false, 0},
+		{"__ZN22BaffinPowerPlayManager15updatePowerPlayEv", "ppm.update", InController, true, false, 0},
+		{"__ZN13ATIController24sendRequestToAcceleratorE25_eAMDAccelIOFBRequestTypePvS1_S1_", "toAccel", InSupport, true, false, 0, 1},
+		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator20callPlatformFunctionEPK8OSSymbolbPvS3_S3_S3_", "accel.cpf", InAccel, false, false, 0},
+		{"__ZN20AtiPowerPlayServices12ppInitializeEP22PPDisplayConfiguration", "pp.ppInitialize", InHWLibs, true, true, 0},
+		{"_PP_InitializeEX", "PP_InitializeEX", InHWLibs, true, false, 0},
+		{"_PHM_Initialize", "PHM_Initialize", InHWLibs, true, false, 0},
 	};
 
 	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
@@ -1099,7 +1111,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 90, "one wrapper per stage");
+		static_assert(arrsize(stages) == 98, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -1112,7 +1124,8 @@ namespace {
 			CR_WRAP(64), CR_WRAP(65), CR_WRAP(66), CR_WRAP(67), CR_WRAP(68), CR_WRAP(69), CR_WRAP(70), CR_WRAP(71),
 			CR_WRAP(72), CR_WRAP(73), CR_WRAP(74), CR_WRAP(75), CR_WRAP(76), CR_WRAP(77), CR_WRAP(78), CR_WRAP(79),
 			CR_WRAP(80), CR_WRAP(81), CR_WRAP(82), CR_WRAP(83), CR_WRAP(84), CR_WRAP(85), CR_WRAP(86), CR_WRAP(87),
-			CR_WRAP(88), CR_WRAP(89),
+			CR_WRAP(88), CR_WRAP(89), CR_WRAP(90), CR_WRAP(91), CR_WRAP(92), CR_WRAP(93), CR_WRAP(94), CR_WRAP(95),
+			CR_WRAP(96), CR_WRAP(97),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -2694,7 +2707,7 @@ void CRDriver::initDisplayRegs() {
 // connectors, mode), the current display/clock registers, the trace summary and the last trace events (setPixelClock,
 // setCrtcToPixelClock, framebuffer calls). Register values are read fresh (pipes only when powered).
 void CRDriver::panicReport(uint32_t t, const char *tree) {
-	static char report[6144];
+	static char report[8192];
 	size_t len = 0;
 	auto add = [&](const char *fmt, ...) {
 		if (len + 1 >= sizeof(report))
