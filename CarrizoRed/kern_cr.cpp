@@ -1315,6 +1315,9 @@ static uint64_t vmToPhysical(uint64_t address, uint8_t kind) {
 	return result;
 }
 
+static mach_vm_address_t orgPowerUpHWEngines;
+static bool wrapPowerUpHWEngines(void *that);
+
 void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	auto route = [&](const char *symbol, mach_vm_address_t wrapper, mach_vm_address_t &org, const char *const *checks,
 					 size_t checkLen, const char *what) {
@@ -1423,8 +1426,6 @@ bool CRDriver::wrapAllocateHWEngines(void *that) {
 // programming a gated block can hang the bus. Releasing the engines made AMDGraphicsAccelerator::start fail (nvram68,
 // then a NULL dereference in its clean-up path), so they stay; only their power-up is skipped: the slots are emptied
 // for the duration of AMDHardware::powerUpHWEngines, whose loop skips empty slots. -crmm powers them up too.
-static mach_vm_address_t orgPowerUpHWEngines;
-
 static bool wrapPowerUpHWEngines(void *that) {
 	static const uint32_t multimedia[] {0x3D8, 0x3E8, 0x400};
 	void *saved[arrsize(multimedia)] {};
