@@ -1505,6 +1505,35 @@ static uint64_t wrapCailReadinOverrideRegistrySetting(void *cail) {
 	return ret;
 }
 
+// RLC start-up for direct loading. Linux gfx_v8_0_rlc_resume (direct load): stop the RLC, disable coarse-grain clock
+// gating and light sleep (RLC_CGCG_CGLS_CTRL bits 0-1), disable power gating (RLC_PG_CNTL), soft-reset the RLC
+// (GRBM_SOFT_RESET.SOFT_RESET_RLC), load the microcode, start it. CAIL's Stoney_LoadRlcUcode only halts it
+// (stoney_halt_rlc), loads and starts: the SMU normally does the rest. nvram50-52: RLC enabled but idle, safe mode never
+// acknowledged, CGCG and CGLS on (0x21003F), and the CP busy at ring dword 0x88 with nothing stalled, as a CP whose
+// clock the dead RLC never ungates would be. Do the missing steps after CAIL halts the RLC. -crnorlcreset disables it.
+static mach_vm_address_t orgStoneyHaltRlc;
+static uint32_t rlcResets, rlcCgcgBefore, rlcPgBefore;
+
+static uint64_t wrapStoneyHaltRlc(void *cail) {
+	auto ret = FunctionCast(wrapStoneyHaltRlc, orgStoneyHaltRlc)(cail);
+	if (auto *mmio = gpuMmio) {
+		constexpr uint32_t GRBM_SOFT_RESET = 0x2008, RLC_PG_CNTL = 0xEC43, RLC_CGCG_CGLS_CTRL = 0xEC49;
+		rlcCgcgBefore = mmio[RLC_CGCG_CGLS_CTRL];
+		rlcPgBefore = mmio[RLC_PG_CNTL];
+		mmio[RLC_CGCG_CGLS_CTRL] = rlcCgcgBefore & ~3U;
+		mmio[RLC_PG_CNTL] = 0;
+		uint32_t reset = mmio[GRBM_SOFT_RESET];
+		mmio[GRBM_SOFT_RESET] = reset | 4;
+		(void)mmio[GRBM_SOFT_RESET];
+		IODelay(50);
+		mmio[GRBM_SOFT_RESET] = reset & ~4U;
+		(void)mmio[GRBM_SOFT_RESET];
+		IODelay(50);
+		rlcResets++;
+	}
+	return ret;
+}
+
 void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, size_t kext) {
 	if (!checkKernelArgument("-crnotrace"))
 		routeStages(patcher, index, slide, size,
@@ -1530,6 +1559,18 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			patcher.clearError();
 			KernelPatcher::RouteRequest request {"_CailReadinOverrideRegistrySetting",
 				wrapCailReadinOverrideRegistrySetting, orgCailReadinOverrideRegistrySetting};
+			if (!checkKernelArgument("-crnorlcreset")) {
+				KernelPatcher::RouteRequest halt {"_stoney_halt_rlc", wrapStoneyHaltRlc, orgStoneyHaltRlc};
+				auto haltFn = patcher.solveSymbol(index, "_stoney_halt_rlc", slide, size);
+				patcher.clearError();
+				// RLC_CNTL = 0 (mov esi, 0xEC00), then the serdes idle wait.
+				if (!codeHas(haltFn, 0x20, "be00ec0000"))
+					traceNote("rlcreset=nomatch ");
+				else if (!routeChecked(patcher, index, halt, slide, size)) {
+					traceNote("noroute:%s(%d) ", halt.symbol, patcher.getError());
+					patcher.clearError();
+				}
+			}
 			if (!codeHas(fn, 0x100, "8983f0060000") || !codeHas(rlc, 0x60, "f683f206000020")) {
 				traceNote("directucode=nomatch ");
 			} else if (!routeChecked(patcher, index, request, slide, size)) {
@@ -3103,6 +3144,7 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		uint32_t pos2 = gpuMmio[0x1BA4], frame2 = gpuMmio[0x1BA6];
 		add("crtc0 position %x -> %x, frame %x -> %x\n", pos1, pos2, frame1, frame2);
 	}
+	add("rlc resets %u (CGCG_CGLS was %x, PG_CNTL was %x); ", rlcResets, rlcCgcgBefore, rlcPgBefore);
 	add("cail waits: %u, %u failed:", cailWaits, cailWaitFailures);
 	for (uint32_t i = 0; i < cailWaitFailures && i < arrsize(cailWaitFails); i++)
 		add(" [%x]&%x!=%x(%x r%x @%llu)", cailWaitFails[i].reg, cailWaitFails[i].mask, cailWaitFails[i].value,
