@@ -79,6 +79,7 @@ struct TraceEvent {
 };
 
 static constexpr size_t TraceRingSize = 512, MaxTraceStages = 128;
+static constexpr uint64_t WatchdogMs = 60000;
 static TraceEvent traceRing[TraceRingSize];
 static uint32_t traceHead;
 static uint32_t stageOpen[MaxTraceStages];
@@ -789,12 +790,13 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		// Watchdog: a traced call that never returns (a hard hang with this CPU still alive) becomes a panic that
 		// names it and stays on screen (debug=0x100). -crnowatchdog disables this.
 		// nvram42: fb.open waited on the accelerator's power-up; name every open stage and add the full black-box
-		// report.
+		// report. 60 s: CAIL's register waits time out after 3 s each (AtiAppleMcilServices::waitFor counts in ms), and
+		// the RLC start-up alone has several (nvram48), so a slow but progressing power-up must not trip it.
 		if (watchdog) {
 			uint64_t ms = uptimeMs();
 			bool stuck = false;
 			for (size_t i = 0; i < MaxTraceStages && !stuck; i++)
-				stuck = __atomic_load_n(&stageOpen[i], __ATOMIC_RELAXED) && ms - stageEnterMs[i] > 10000;
+				stuck = __atomic_load_n(&stageOpen[i], __ATOMIC_RELAXED) && ms - stageEnterMs[i] > WatchdogMs;
 			if (stuck) {
 				static char reason[512];
 				size_t len = static_cast<size_t>(snprintf(reason, sizeof(reason), "CarrizoRed watchdog: open stages:"));
@@ -1465,6 +1467,32 @@ static uint32_t wrapPeciGetRegistrySize(void *peci, const char *name, uint32_t *
 // writes the microcode embedded in HWLibs (Stoney_RLC_UCODE, _ME_, _PFP_, _CE_, _MEC1_, _SDMA0_) itself, as Linux
 // amdgpu does with fw_load_type=0 (direct loading, supported on Carrizo/Stoney). -crnodirectucode disables this.
 static mach_vm_address_t orgCailReadinOverrideRegistrySetting;
+
+// CAIL register waits (Cail_MCILWaitFor: an array of {register, mask, value} conditions, timeout in ms, 3 s by default)
+// that fail. nvram48: the RLC start-up (Stoney_LoadRlcUcode) sat in them; record which register never reached its
+// value and what it read instead.
+static mach_vm_address_t orgCailWaitFor;
+static uint32_t cailWaits, cailWaitFailures;
+static struct {
+	uint32_t reg, mask, value, read, ret;
+	uint64_t ms;
+} cailWaitFails[12];
+
+static uint64_t wrapCailWaitFor(void *cail, void *conditions, uint64_t count, uint64_t c, uint64_t flags, uint64_t timeout,
+	uint64_t g) {
+	auto ret = FunctionCast(wrapCailWaitFor, orgCailWaitFor)(cail, conditions, count, c, flags, timeout, g);
+	__atomic_fetch_add(&cailWaits, 1, __ATOMIC_RELAXED);
+	if (static_cast<uint32_t>(ret) && conditions) {
+		uint32_t n = __atomic_fetch_add(&cailWaitFailures, 1, __ATOMIC_RELAXED);
+		if (n < arrsize(cailWaitFails)) {
+			auto *condition = static_cast<uint32_t *>(conditions);
+			uint32_t reg = condition[0];
+			cailWaitFails[n] = {reg, condition[2], condition[3], gpuMmio && reg < 0x10000 ? gpuMmio[reg] : 0xFFFFFFFF,
+				static_cast<uint32_t>(ret), uptimeMs()};
+		}
+	}
+	return ret;
+}
 static uint32_t cailFlagsBefore, cailFlagsAfter;
 
 static uint64_t wrapCailReadinOverrideRegistrySetting(void *cail) {
@@ -1487,6 +1515,7 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		KernelPatcher::RouteRequest requests[] {
 			{"_PECI_ReadRegistry", wrapPeciReadRegistry, orgPeciReadRegistry},
 			{"_PECI_GetRegistrySize", wrapPeciGetRegistrySize, orgPeciGetRegistrySize},
+			{"_Cail_MCILWaitFor", wrapCailWaitFor, orgCailWaitFor},
 		};
 		for (auto &request : requests) {
 			if (!routeChecked(patcher, index, request, slide, size)) {
@@ -3019,6 +3048,11 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		uint32_t pos2 = gpuMmio[0x1BA4], frame2 = gpuMmio[0x1BA6];
 		add("crtc0 position %x -> %x, frame %x -> %x\n", pos1, pos2, frame1, frame2);
 	}
+	add("cail waits: %u, %u failed:", cailWaits, cailWaitFailures);
+	for (uint32_t i = 0; i < cailWaitFailures && i < arrsize(cailWaitFails); i++)
+		add(" [%x]&%x!=%x(%x r%x @%llu)", cailWaitFails[i].reg, cailWaitFails[i].mask, cailWaitFails[i].value,
+			cailWaitFails[i].read, cailWaitFails[i].ret, cailWaitFails[i].ms);
+	add("\n");
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
 		breadcrumbNoOptions ? ", no /options" : "");
