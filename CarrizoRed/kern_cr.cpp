@@ -3488,7 +3488,31 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			uint32_t w0 = gpuMmio[ram.data], w1 = gpuMmio[ram.data], w2 = gpuMmio[ram.data];
 			add(" %s %x %x %x", ram.name, w0, w1, w2);
 		}
+		// nvram71: none of them read back as the Stoney images. Write-then-read test on word 0 of the RLC and PFP RAMs
+		// (both dead by now): a RAM that keeps 0x5A5A1234 accepts direct loading; anything else means the driver can't
+		// write it and only the SMU can load these APUs' microcode, as current Linux does.
+		static const struct {
+			const char *name;
+			uint16_t addr, data;
+		} tests[] {{"rlc", 0xF83C, 0xF83D}, {"pfp", 0xF814, 0xF815}};
+		for (auto &ram : tests) {
+			gpuMmio[ram.addr] = 0;
+			gpuMmio[ram.data] = 0x5A5A1234;
+			gpuMmio[ram.addr] = 0;
+			add(" %s-wr %x", ram.name, gpuMmio[ram.data]);
+		}
 		add("\n");
+		// The SMU's own view (Linux smu8_smumgr: SMU8_Firmware_Header at SMU SRAM 0x1FF80, read through
+		// MP0PUB_IND_INDEX/DATA at SMN 0x10000000 + address): firmware version, UcodeLoadStatus (bitmap of the engines it
+		// has loaded), signature; and the message mailbox (SMU_MP1_SRBM2P_MSG_0/RESP_0/ARG_0).
+		{
+			auto smuSram = [](uint32_t offset) {
+				gpuMmio[0x180] = 0x10000000 + 0x1FF80 + offset;
+				return gpuMmio[0x181];
+			};
+			add("smu: version %x load-status %x signature %x; msg %x resp %x arg %x\n", smuSram(0), smuSram(0x18),
+				smuSram(0x7C), gpuMmio[0x1C0], gpuMmio[0x1D0], gpuMmio[0x1E0]);
+		}
 	}
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
