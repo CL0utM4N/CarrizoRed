@@ -1520,7 +1520,7 @@ uint64_t CRDriver::wrapGetPDEValue(void *that, uint32_t level, uint64_t addr) {
 // properties). nvram40: with PP_PhmUseDummyBackEnd and PP_PhmSoftPowerPlayTable set, PHM_Initialize still took the
 // non-Dummy path and never called PP_Tables_Initialize. Note what the PowerPlay keys that matter read back as.
 static mach_vm_address_t orgPeciReadRegistry, orgPeciGetRegistrySize;
-static uint32_t ppRegNotes;
+static uint32_t ppRegNotes, peciReads;
 
 static bool ppRegInteresting(const char *name) {
 	return name && (strstr(name, "Dummy") || strstr(name, "Soft") || strstr(name, "DisableThermal"));
@@ -1533,6 +1533,7 @@ static bool ppDummyForced;
 
 static uint32_t wrapPeciReadRegistry(void *peci, const char *name, uint32_t *value, uint32_t fallback) {
 	auto ret = FunctionCast(wrapPeciReadRegistry, orgPeciReadRegistry)(peci, name, value, fallback);
+	peciReads++;
 	if (ppRegInteresting(name) && ppRegNotes++ < 12)
 		traceNote("reg:%s=%x(r%x) ", name, value ? *value : 0xFFFFFFFF, ret);
 	if (ppDummyForced && name && value && !strcmp(name, "PP_PhmUseDummyBackEnd") && *value != 1) {
@@ -1654,6 +1655,275 @@ static uint64_t wrapCailEnableAts(void *) {
 	return 0;
 }
 
+// SMU microcode loading (port of Linux smu8_smumgr.c, MIT). nvram71/72: the GPU's microcode RAMs ignore direct writes
+// (RLC and PFP word 0 read back random values after a write) and the SMU firmware header's UcodeLoadStatus is 0. On
+// Carrizo and Stoney only the SMU can load the RLC, CP (CE, PFP, ME, MEC jump table) and SDMA microcode. Windows does
+// it in PowerPlay's SMU8 manager, which Apple's HWLibs doesn't have (SMUM_RequestSMULoadFW knows Tonga, Fiji, Iceland
+// and Polaris only), but CAIL still carries the images (Stoney_UcodeInfo, what Stoney_GetFirmwareInfoTable hands to
+// PowerPlay). So do what Linux does: in VRAM, a table of contents of SMU tasks plus the RLC save areas and copies of
+// the images; then DriverDramAddrHi/Lo, InitJobs, ExecuteJob (ARAM save, power profiling, boot-up: loads every
+// engine), wait for UcodeLoadStatus, and point the MEC at its image.
+// The VRAM extends CAIL's own micro-engine block: in direct-loading mode reserve_fb_for_micro_engine reserves
+// Stoney_FormatSmuDramDataBuffer's return value at the top of the FB ([cail+0xCE8] = its FB offset; CAIL itself only
+// uses the first [cail+0xCD8] bytes, for the MEC). The load runs when CAIL starts loading the RLC
+// (Stoney_LoadRlcUcode, in pm4.powerUp), before its own direct writes, which change nothing. -crnosmuload disables it.
+namespace Smu8 {
+	static constexpr uint32_t MP0PUB_IND_INDEX = 0x180, MP0PUB_IND_DATA = 0x181, MSG = 0x1C0, RESP = 0x1D0, ARG = 0x1E0;
+	static constexpr uint32_t SramBase = 0x10000000, UcodeLoadStatus = 0x1FF80 + 0x18;  // SMU8_Firmware_Header
+	static constexpr uint16_t DriverDramAddrHi = 0x33, DriverDramAddrLo = 0x34, InitJobs = 0x252, ExecuteJob = 0x254;
+	// UCODE_ID_* (smu_ucode_xfer_cz.h); Stoney has no SDMA1 or MEC2, Linux maps them to SDMA0 and MEC_JT1.
+	static constexpr uint8_t SDMA0 = 0, CE = 2, PFP = 3, ME = 4, MEC_JT1 = 5, RLC_G = 8, RLC_SCRATCH = 9,
+	                         RLC_SRM_ARAM = 10, RLC_SRM_DRAM = 11;
+	static constexpr uint32_t StoneyLoadMask = 1U << SDMA0 | 1U << CE | 1U << PFP | 1U << ME | 1U << MEC_JT1 | 1U << RLC_G;
+	static constexpr uint8_t TaskUcodeLoad = 1, TaskUcodeSave = 2, TaskInitialize = 5;  // TASK_TYPE_*
+	static constexpr uint8_t ArgInitMmPwrLog = 0, ArgInitClkTable = 1;                 // TASK_ARG_INIT_*
+	static constexpr uint32_t JobListEntries = 32;                                     // NUM_JOBLIST_ENTRIES
+	static constexpr uint16_t EndOfTaskList = 0xFFFF;
+	// Region layout: TOC, the scratch buffers (Linux smu_buffer), then the images, 4 KB aligned.
+	static constexpr uint32_t TocOffset = 0, ScratchOffset = 0x1000, UcodeOffset = 0x5000, RegionSize = 0x60000;
+	struct Task {  // SMU_Task
+		uint8_t type, arg;
+		uint16_t next;
+		uint32_t addrHi, addrLo, size;
+	};
+	static_assert(sizeof(Task) == 16, "SMU_Task layout");
+	struct CailUcode {  // HWLibs' microcode descriptors (Stoney_RLC_UCODE, ...)
+		uint32_t dwords, reserved;
+		const char *version;
+		uint64_t flags;
+		const uint32_t *data;
+		uint32_t jtOffset, jtSize;  // dwords
+	};
+}
+
+static mach_vm_address_t orgStoneyFormatSmuDram, orgStoneyLoadRlcUcode;
+static Smu8::CailUcode **stoneyUcodeInfo;  // RLC, SDMA0, SDMA1 (skipped), CE, PFP, ME, MEC1, MEC2 (skipped)
+static uint32_t smuFormatCalls, smuCailSize, smuRegionStart;
+static struct {
+	const char *result;
+	uint64_t blockOffset, mc, phys;
+	uint32_t before, after, ms, resp[6], mecBase[3], tasks;
+} smuLoad;
+
+static uint64_t wrapStoneyFormatSmuDram(void *cail) {
+	auto size = static_cast<uint32_t>(FunctionCast(wrapStoneyFormatSmuDram, orgStoneyFormatSmuDram)(cail));
+	smuFormatCalls++;
+	smuCailSize = size;
+	smuRegionStart = (size + 0xFFF) & ~0xFFFU;
+	return smuRegionStart + Smu8::RegionSize;
+}
+
+static uint32_t smuSendMessage(uint16_t msg, uint32_t arg) {
+	auto *mmio = gpuMmio;
+	// SMU_MP1_SRBM2P_RESP_0 != 0: the previous message is done (Linux waits up to its usec_timeout; allow 1 s).
+	auto wait = [mmio]() {
+		uint32_t resp = 0;
+		for (uint32_t i = 0; i < 100000 && !(resp = mmio[Smu8::RESP] & 0xFFFF); i++)
+			IODelay(10);
+		return resp;
+	};
+	if (!wait())
+		return 0xB0000 | msg;  // still busy with the last message
+	mmio[Smu8::ARG] = arg;
+	mmio[Smu8::RESP] = 0;
+	mmio[Smu8::MSG] = msg;
+	uint32_t resp = wait();
+	return resp ? resp : 0xC0000 | msg;  // never answered
+}
+
+static uint32_t smuReadSram(uint32_t address) {
+	gpuMmio[Smu8::MP0PUB_IND_INDEX] = Smu8::SramBase + address;
+	return gpuMmio[Smu8::MP0PUB_IND_DATA];
+}
+
+static void smuLoadFirmware(void *cail) {
+	using namespace Smu8;
+	auto *mmio = gpuMmio;
+	if (smuLoad.result || !mmio)
+		return;
+	auto *base = static_cast<uint8_t *>(cail);
+	smuLoad.blockOffset = *reinterpret_cast<uint64_t *>(base + 0xCE8);
+	if (!stoneyUcodeInfo) {
+		smuLoad.result = "no Stoney_UcodeInfo";
+		return;
+	}
+	if (!smuRegionStart || !smuLoad.blockOffset || *reinterpret_cast<uint32_t *>(base + 0xCD8) != smuCailSize) {
+		smuLoad.result = "CAIL's micro-engine block isn't reserved";
+		return;
+	}
+	uint64_t regionFb = smuLoad.blockOffset + smuRegionStart;
+	uint64_t fbBase = static_cast<uint64_t>(mmio[Reg::MC_VM_FB_LOCATION] & 0xFFFF) << 24;
+	smuLoad.mc = fbBase + regionFb;
+	smuLoad.phys = (static_cast<uint64_t>(mmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22) + regionFb;
+
+	// The images: RLC, SDMA0, CE, PFP, ME, MEC1 (Stoney_UcodeInfo slots 0, 1, 3, 4, 5, 6).
+	static const uint8_t slots[] {0, 1, 3, 4, 5, 6};
+	const CailUcode *ucode[arrsize(slots)];
+	for (size_t i = 0; i < arrsize(slots); i++) {
+		ucode[i] = stoneyUcodeInfo[slots[i]];
+		if (!ucode[i] || !ucode[i]->data || !ucode[i]->dwords || ucode[i]->dwords > 0x20000) {
+			smuLoad.result = "bad microcode descriptor";
+			return;
+		}
+	}
+	auto *desc = IOMemoryDescriptor::withPhysicalAddress(smuLoad.phys, RegionSize, kIODirectionInOut);
+	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+	if (!map) {
+		OSSafeReleaseNULL(desc);
+		smuLoad.result = "can't map the region";
+		return;
+	}
+	auto *region = reinterpret_cast<uint8_t *>(map->getVirtualAddress());
+	memset(region, 0, UcodeOffset);
+
+	// Images, as amdgpu_ucode_init_bo lays them out: each 4 KB aligned; the MEC's jump table also copied to the next
+	// 4 KB boundary after the MEC image (amdgpu_ucode_patch_jt), where the SMU's MEC_JT1 task loads it from.
+	uint32_t offset = UcodeOffset, ucodeAt[arrsize(slots)], ucodeSize[arrsize(slots)], jtAt = 0, jtSize = 0;
+	bool fits = true;
+	for (size_t i = 0; i < arrsize(slots) && fits; i++) {
+		ucodeAt[i] = offset;
+		ucodeSize[i] = ucode[i]->dwords * 4;
+		offset = (offset + ucodeSize[i] + 0xFFF) & ~0xFFFU;
+		fits = offset <= RegionSize;
+		if (fits)
+			memcpy(region + ucodeAt[i], ucode[i]->data, ucodeSize[i]);
+	}
+	auto *mec = ucode[5];
+	if (fits && mec->jtSize && mec->jtOffset + mec->jtSize <= mec->dwords) {
+		jtAt = offset;
+		jtSize = mec->jtSize * 4;
+		fits = jtAt + jtSize <= RegionSize;
+		if (fits)
+			memcpy(region + jtAt, mec->data + mec->jtOffset, jtSize);
+	}
+	if (!fits || !jtSize) {
+		OSSafeReleaseNULL(map);
+		OSSafeReleaseNULL(desc);
+		smuLoad.result = fits ? "MEC has no jump table" : "images don't fit";
+		return;
+	}
+	enum { Rlc, Sdma0, Ce, Pfp, Me, Mec };
+
+	// Scratch buffers (smu8_smu_init): RLC scratch, SRM ARAM and DRAM save areas, the multimedia power log
+	// (SMU8_MultimediaPowerLogData) and the clock table (SMU8_Fusion_ClkTable), 32-byte aligned.
+	enum { Scratch, Aram, Dram, PowerLog, ClkTable };
+	static const uint32_t scratchSize[] {132, 8192, 4096, 48, 744};
+	uint32_t scratchAt[arrsize(scratchSize)];
+	for (uint32_t i = 0, at = ScratchOffset; i < arrsize(scratchSize); i++) {
+		scratchAt[i] = at;
+		at += (scratchSize[i] + 31) & ~31U;
+	}
+
+	// The table of contents (smu8_smu_construct_toc).
+	auto *jobList = region + TocOffset;
+	auto *tasks = reinterpret_cast<Task *>(region + TocOffset + JobListEntries);
+	memset(jobList, 0xFF, JobListEntries);  // IGNORE_JOB
+	uint16_t used = 0;
+	auto task = [&](uint8_t type, uint8_t arg, uint32_t at, uint32_t size, bool last) {
+		uint64_t mc = smuLoad.mc + at;
+		auto &t = tasks[used++];
+		t = {type, arg, last ? EndOfTaskList : used, static_cast<uint32_t>(mc >> 32), static_cast<uint32_t>(mc), size};
+	};
+	auto load = [&](uint8_t arg, int image, bool last) {
+		if (arg == MEC_JT1)
+			task(TaskUcodeLoad, arg, jtAt, jtSize, last);
+		else
+			task(TaskUcodeLoad, arg, ucodeAt[image], ucodeSize[image], last);
+	};
+	auto scratch = [&](uint8_t type, uint8_t arg, int entry, bool last) {
+		task(type, arg, scratchAt[entry], scratchSize[entry], last);
+	};
+	uint16_t aramJob = used;
+	scratch(TaskUcodeSave, RLC_SRM_ARAM, Aram, true);
+	jobList[0] = static_cast<uint8_t>(used);  // JOB_GFX_SAVE
+	scratch(TaskUcodeSave, RLC_SCRATCH, Scratch, false);
+	scratch(TaskUcodeSave, RLC_SRM_DRAM, Dram, true);
+	jobList[1] = static_cast<uint8_t>(used);  // JOB_GFX_RESTORE
+	load(CE, Ce, false);
+	load(PFP, Pfp, false);
+	load(ME, Me, false);
+	load(MEC_JT1, Mec, false);
+	load(MEC_JT1, Mec, false);  // MEC_JT2 on Carrizo
+	load(RLC_G, Rlc, false);
+	scratch(TaskUcodeLoad, RLC_SCRATCH, Scratch, false);
+	scratch(TaskUcodeLoad, RLC_SRM_ARAM, Aram, false);
+	scratch(TaskUcodeLoad, RLC_SRM_DRAM, Dram, true);
+	uint16_t powerProfilingJob = used;
+	scratch(TaskInitialize, ArgInitMmPwrLog, PowerLog, true);
+	uint16_t bootupJob = used;
+	load(SDMA0, Sdma0, false);
+	load(CE, Ce, false);
+	load(PFP, Pfp, false);
+	load(ME, Me, false);
+	load(MEC_JT1, Mec, false);
+	load(RLC_G, Rlc, true);
+	scratch(TaskInitialize, ArgInitClkTable, ClkTable, true);
+	smuLoad.tasks = used;
+	__sync_synchronize();
+	(void)*reinterpret_cast<volatile uint32_t *>(region + TocOffset);
+
+	// smu8_request_smu_load_fw.
+	uint64_t start = uptimeMs();
+	smuLoad.before = smuReadSram(UcodeLoadStatus);
+	mmio[MP0PUB_IND_INDEX] = SramBase + UcodeLoadStatus;
+	mmio[MP0PUB_IND_DATA] = 0;
+	smuLoad.resp[0] = smuSendMessage(DriverDramAddrHi, static_cast<uint32_t>(smuLoad.mc >> 32));
+	smuLoad.resp[1] = smuSendMessage(DriverDramAddrLo, static_cast<uint32_t>(smuLoad.mc));
+	smuLoad.resp[2] = smuSendMessage(InitJobs, 0);
+	smuLoad.resp[3] = smuSendMessage(ExecuteJob, aramJob);
+	smuLoad.resp[4] = smuSendMessage(ExecuteJob, powerProfilingJob);
+	smuLoad.resp[5] = smuSendMessage(ExecuteJob, bootupJob);
+	uint32_t status = 0;
+	for (uint32_t i = 0; i < 100000; i++) {  // 1 s
+		status = smuReadSram(UcodeLoadStatus);
+		if ((status & StoneyLoadMask) == StoneyLoadMask)
+			break;
+		IODelay(10);
+	}
+	smuLoad.after = status;
+	smuLoad.ms = static_cast<uint32_t>(uptimeMs() - start);
+
+	// smu8_load_mec_firmware: halt both MEC pipes, then CP_CPC_IC_BASE_CNTL (VMID 0, ATC 0, CACHE_POLICY 0, MTYPE 1)
+	// and CP_CPC_IC_BASE_LO/HI = the MEC image.
+	constexpr uint32_t CP_MEC_CNTL = 0x208D, CP_CPC_IC_BASE_LO = 0x30B9, CP_CPC_IC_BASE_HI = 0x30BA,
+	                   CP_CPC_IC_BASE_CNTL = 0x30BB;
+	uint64_t mecMc = smuLoad.mc + ucodeAt[Mec];
+	mmio[CP_MEC_CNTL] = mmio[CP_MEC_CNTL] | 0x50000000;
+	mmio[CP_CPC_IC_BASE_CNTL] = (mmio[CP_CPC_IC_BASE_CNTL] & ~0x1980000FU) | 1U << 27;
+	mmio[CP_CPC_IC_BASE_LO] = static_cast<uint32_t>(mecMc) & 0xFFFFF000;
+	mmio[CP_CPC_IC_BASE_HI] = static_cast<uint32_t>(mecMc >> 32) & 0xFFFF;
+	smuLoad.mecBase[0] = mmio[CP_CPC_IC_BASE_LO];
+	smuLoad.mecBase[1] = mmio[CP_CPC_IC_BASE_HI];
+	smuLoad.mecBase[2] = mmio[CP_CPC_IC_BASE_CNTL];
+
+	OSSafeReleaseNULL(map);
+	OSSafeReleaseNULL(desc);
+	smuLoad.result = (status & StoneyLoadMask) == StoneyLoadMask ? "loaded" : "timed out";
+	traceNote("smuload=%x->%x ", smuLoad.before, smuLoad.after);
+}
+
+static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
+	smuLoadFirmware(cail);
+	return FunctionCast(wrapStoneyLoadRlcUcode, orgStoneyLoadRlcUcode)(cail);
+}
+
+// Which of the HWLibs hooks below were installed (bit per hook, in HwlibsHook order) and which failed. nvram72 showed
+// none of them taking effect (no PowerPlay key notes, flags untouched, ATS not skipped) with no "noroute" note.
+enum HwlibsHook { HookPeciRead, HookPeciSize, HookWaitFor, HookAts, HookHaltRlc, HookFlags, HookSmuFormat, HookSmuLoad };
+static uint32_t hwlibsHooks, hwlibsHookFails;
+
+static bool routeHwlibs(KernelPatcher &patcher, size_t index, KernelPatcher::RouteRequest &request,
+	mach_vm_address_t slide, size_t size, HwlibsHook hook) {
+	if (routeChecked(patcher, index, request, slide, size)) {
+		hwlibsHooks |= 1U << hook;
+		return true;
+	}
+	hwlibsHookFails |= 1U << hook;
+	traceNote("noroute:%s(%d) ", request.symbol, patcher.getError());
+	patcher.clearError();
+	return false;
+}
+
 void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, size_t kext) {
 	if (!checkKernelArgument("-crnotrace"))
 		routeStages(patcher, index, slide, size,
@@ -1666,18 +1936,12 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			{"_PECI_GetRegistrySize", wrapPeciGetRegistrySize, orgPeciGetRegistrySize},
 			{"_Cail_MCILWaitFor", wrapCailWaitFor, orgCailWaitFor},
 		};
-		for (auto &request : requests) {
-			if (!routeChecked(patcher, index, request, slide, size)) {
-				traceNote("noroute:%s(%d) ", request.symbol, patcher.getError());
-				patcher.clearError();
-			}
-		}
+		static const HwlibsHook hooks[] {HookPeciRead, HookPeciSize, HookWaitFor};
+		for (size_t i = 0; i < arrsize(requests); i++)
+			routeHwlibs(patcher, index, requests[i], slide, size, hooks[i]);
 		if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crats")) {
 			KernelPatcher::RouteRequest ats {"_Cail_Spectre_EnableAts", wrapCailEnableAts, orgCailEnableAts};
-			if (!routeChecked(patcher, index, ats, slide, size)) {
-				traceNote("noroute:%s(%d) ", ats.symbol, patcher.getError());
-				patcher.clearError();
-			}
+			routeHwlibs(patcher, index, ats, slide, size, HookAts);
 		}
 		if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crnodirectucode")) {
 			// The flags word store, and the RLC loader's test of the flag (test byte [rbx+0x6F2], 0x20).
@@ -1693,16 +1957,29 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				// RLC_CNTL = 0 (mov esi, 0xEC00), then the serdes idle wait.
 				if (!codeHas(haltFn, 0x20, "be00ec0000"))
 					traceNote("rlcreset=nomatch ");
-				else if (!routeChecked(patcher, index, halt, slide, size)) {
-					traceNote("noroute:%s(%d) ", halt.symbol, patcher.getError());
-					patcher.clearError();
-				}
+				else
+					routeHwlibs(patcher, index, halt, slide, size, HookHaltRlc);
 			}
 			if (!codeHas(fn, 0x100, "8983f0060000") || !codeHas(rlc, 0x60, "f683f206000020")) {
 				traceNote("directucode=nomatch ");
-			} else if (!routeChecked(patcher, index, request, slide, size)) {
-				traceNote("noroute:%s(%d) ", request.symbol, patcher.getError());
+			} else if (routeHwlibs(patcher, index, request, slide, size, HookFlags) && family == ChipFamily::Stoney &&
+				!checkKernelArgument("-crnosmuload")) {
+				// See smuLoadFirmware. The size function must end by storing its total at [cail+0xCD8]
+				// (mov [rbx+0xCD8], eax), which the wrapper relies on.
+				auto info = patcher.solveSymbol(index, "_Stoney_UcodeInfo", slide, size);
+				auto format = patcher.solveSymbol(index, "_Stoney_FormatSmuDramDataBuffer", slide, size);
 				patcher.clearError();
+				if (!info || !codeHas(format, 0x120, "8983d80c0000")) {
+					traceNote("smuload=nomatch ");
+				} else {
+					stoneyUcodeInfo = reinterpret_cast<Smu8::CailUcode **>(info);
+					KernelPatcher::RouteRequest smu[] {
+						{"_Stoney_FormatSmuDramDataBuffer", wrapStoneyFormatSmuDram, orgStoneyFormatSmuDram},
+						{"_Stoney_LoadRlcUcode", wrapStoneyLoadRlcUcode, orgStoneyLoadRlcUcode},
+					};
+					if (routeHwlibs(patcher, index, smu[0], slide, size, HookSmuFormat))
+						routeHwlibs(patcher, index, smu[1], slide, size, HookSmuLoad);
+				}
 			}
 		}
 	}
@@ -3513,6 +3790,14 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			add("smu: version %x load-status %x signature %x; msg %x resp %x arg %x\n", smuSram(0), smuSram(0x18),
 				smuSram(0x7C), gpuMmio[0x1C0], gpuMmio[0x1D0], gpuMmio[0x1E0]);
 		}
+		// Our SMU load (smuLoadFirmware): CAIL's block and our region, the SMU's answers to DriverDramAddrHi/Lo,
+		// InitJobs and the three ExecuteJobs (1 = OK; Bxxxx busy, Cxxxx no answer), UcodeLoadStatus before/after.
+		add("smuload: %s; format calls %u cail size %x region +%x block fb+%llx mc %llx phys %llx tasks %u; resp %x %x %x "
+			"%x %x %x; status %x -> %x in %u ms; mec ic %x %x cntl %x\n", smuLoad.result ? smuLoad.result : "not run",
+			smuFormatCalls, smuCailSize, smuRegionStart, smuLoad.blockOffset, smuLoad.mc, smuLoad.phys, smuLoad.tasks,
+			smuLoad.resp[0], smuLoad.resp[1], smuLoad.resp[2], smuLoad.resp[3], smuLoad.resp[4], smuLoad.resp[5],
+			smuLoad.before, smuLoad.after, smuLoad.ms, smuLoad.mecBase[0], smuLoad.mecBase[1], smuLoad.mecBase[2]);
+		add("hooks: hwlibs routed %x failed %x; peci reads %u\n", hwlibsHooks, hwlibsHookFails, peciReads);
 	}
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
