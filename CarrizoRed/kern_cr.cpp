@@ -1530,12 +1530,12 @@ static uint64_t wrapCailReadinOverrideRegistrySetting(void *cail) {
 	return ret;
 }
 
-// RLC start-up for direct loading. Linux gfx_v8_0_rlc_resume (direct load): stop the RLC, disable coarse-grain clock
-// gating and light sleep (RLC_CGCG_CGLS_CTRL bits 0-1), disable power gating (RLC_PG_CNTL), soft-reset the RLC
-// (GRBM_SOFT_RESET.SOFT_RESET_RLC), load the microcode, start it. CAIL's Stoney_LoadRlcUcode only halts it
-// (stoney_halt_rlc), loads and starts: the SMU normally does the rest. nvram50-52: RLC enabled but idle, safe mode never
-// acknowledged, CGCG and CGLS on (0x21003F), and the CP busy at ring dword 0x88 with nothing stalled, as a CP whose
-// clock the dead RLC never ungates would be. Do the missing steps after CAIL halts the RLC. -crnorlcreset disables it.
+// RLC start-up for direct loading. CAIL's Stoney set-up runs Linux's sequence (halt, soft reset, init_pg) early, and
+// Stoney_LoadRlcUcode later halts the RLC, loads its microcode and starts it. The RLC still never answers a safe-mode
+// request (nvram49-66), so nothing it would manage may stay enabled: when CAIL halts the RLC for loading, turn off
+// coarse-grain clock gating and light sleep (RLC_CGCG_CGLS_CTRL bits 0-1), the MGCG paths and memory light sleep, and
+// CP power gating (RLC_PG_CNTL.CP_PG_DISABLE; it was 0, so an idle CP could be gated with no RLC to wake it, matching a
+// CPF stuck in POST_WPTR_GFX_BUSY after the first fetch). -crnorlcreset disables this.
 static mach_vm_address_t orgStoneyHaltRlc;
 static uint32_t rlcResets, rlcCgcgBefore, rlcPgBefore, rlcMgcgBefore;
 
@@ -1558,14 +1558,19 @@ static uint64_t wrapStoneyHaltRlc(void *cail) {
 			mmio[CP_MEM_SLP_CNTL] = mmio[CP_MEM_SLP_CNTL] & ~1U;
 			mmio[RLC_PG_CNTL] = 0x8000;
 		}
-		uint32_t reset = mmio[GRBM_SOFT_RESET];
-		mmio[GRBM_SOFT_RESET] = reset | 4;
-		(void)mmio[GRBM_SOFT_RESET];
-		IODelay(50);
-		mmio[GRBM_SOFT_RESET] = reset & ~4U;
-		(void)mmio[GRBM_SOFT_RESET];
-		IODelay(50);
-		rlcResets++;
+		// CAIL's own Stoney set-up (StoneyAsicSetupTable: halt_rlc, reset_rlc = this same soft reset, then
+		// init_power_gating = CSIB, save/restore list, jump-table restore, AO CU mask) already ran; a second reset
+		// here, after init_power_gating, could only undo it. Opt-in with -crrlcreset.
+		if (checkKernelArgument("-crrlcreset")) {
+			uint32_t reset = mmio[GRBM_SOFT_RESET];
+			mmio[GRBM_SOFT_RESET] = reset | 4;
+			(void)mmio[GRBM_SOFT_RESET];
+			IODelay(50);
+			mmio[GRBM_SOFT_RESET] = reset & ~4U;
+			(void)mmio[GRBM_SOFT_RESET];
+			IODelay(50);
+			rlcResets++;
+		}
 	}
 	return ret;
 }
@@ -3372,6 +3377,11 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		fbRelocOld, fbRelocNew, fbRelocReadback, gpuMmio ? gpuMmio[Reg::MC_VM_FB_LOCATION] : 0, fbRelocHdp,
 		gpuMmio ? gpuMmio[Reg::HDP_NONSURFACE_BASE] : 0, gpuMmio ? gpuMmio[Reg::MC_VM_SYSTEM_APERTURE_LOW_ADDR] : 0,
 		gpuMmio ? gpuMmio[Reg::MC_VM_SYSTEM_APERTURE_HIGH_ADDR] : 0);
+	// CAIL's Stoney set-up ends with stoney_init_enable_ats -> Cail_Spectre_EnableAts, which (if its caps allow) writes
+	// the iGPU's own PCIe capabilities: ATS control (0x2B6 = 0x8000), PRI control/allocation (0x2C4, 0x2CC) and PASID
+	// control (0x2D6). Those are IOMMUv2 features macOS doesn't set up for AMD.
+	add("ats: 2b6=%x 2c4=%x 2cc=%x 2d6=%x\n", iGPU->extendedConfigRead16(0x2B6), iGPU->extendedConfigRead16(0x2C4),
+		iGPU->extendedConfigRead32(0x2CC), iGPU->extendedConfigRead16(0x2D6));
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
 		breadcrumbNoOptions ? ", no /options" : "");
