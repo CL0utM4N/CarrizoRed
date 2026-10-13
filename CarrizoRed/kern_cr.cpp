@@ -3053,6 +3053,21 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		add(" [%x]&%x!=%x(%x r%x @%llu)", cailWaitFails[i].reg, cailWaitFails[i].mask, cailWaitFails[i].value,
 			cailWaitFails[i].read, cailWaitFails[i].ret, cailWaitFails[i].ms);
 	add("\n");
+	// GFX state (nvram49: the CP was started but never went idle, and the RLC never acknowledged safe mode). VI
+	// offsets (gfx_8_0_d.h / oss_3_0_d.h); each value is printed with its offset.
+	if (gpuMmio && !checkKernelArgument("-crnogfxregs")) {
+		static const uint16_t gfxRegs[] {
+			0x2004, 0x2002, 0x0394, 0x0393,                  // GRBM_STATUS, GRBM_STATUS2, SRBM_STATUS, SRBM_STATUS2
+			0xEC00, 0xEC04, 0xEC05, 0xEC40, 0xEC43, 0xEC49,  // RLC_CNTL, _STAT, _SAFE_MODE, _GPM_STAT, _PG_CNTL, _CGCG_CGLS_CTRL
+			0xEC61, 0xEC62,                                  // RLC_SERDES_CU/NONCU_MASTER_BUSY
+			0x21A0, 0x21B6, 0x208D,                          // CP_STAT, CP_ME_CNTL, CP_MEC_CNTL
+			0x3040, 0x3041, 0x21C0, 0x3045,                  // CP_RB0_BASE, _CNTL, _RPTR, _WPTR
+		};
+		add("gfx:");
+		for (auto reg : gfxRegs)
+			add(" %x=%x", reg, gpuMmio[reg]);
+		add("\n");
+	}
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
 		breadcrumbNoOptions ? ", no /options" : "");
