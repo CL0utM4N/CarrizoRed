@@ -131,6 +131,7 @@ The APUs' built-in USB 3 controller (FCH xHCI `1022:7914`) never delivers its in
 | `-crdisplaydiag` | Keep the display sections (VBIOS calls, DPCD, register diff, pixels) in the black box on accelerated boots |
 | `-crnotrace` | No bring-up stage tracing |
 | `-crnowatch`, `-crnowatchdog` | No periodic watcher output / no watchdog panic for a traced call that hangs |
+| `-crnobreadcrumb` | Don't write the latest trace progress to the NVRAM variable `CR-progress` (kept for boots that end in a hard reset, where no panic report is written) |
 | `-crnoreglog`, `-crreglogall`, `-crreglogintsoff` | No register logging / log every access from probe / print interrupts-off lines directly |
 | `-crnoatomlog` | Don't record VBIOS command-table calls for the black box |
 | `-crnommio` | Skip the MMIO register probe |

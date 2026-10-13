@@ -624,12 +624,53 @@ static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_
 	iterator->release();
 }
 
+// NVRAM breadcrumb. The black box only reaches NVRAM through a panic; the second accelerated boot (nvram31) ended in a
+// hard reset (no panic text, straight back to the boot menu), which leaves nothing. While trace events keep arriving,
+// write the latest progress to the CR-progress variable (Apple's GUID, 7C436110-...) and force a sync: at most every
+// 500 ms and 160 times per boot. -crnobreadcrumb disables it.
+static void writeBreadcrumb(uint32_t t) {
+	static IORegistryEntry *options;
+	static uint32_t writes, lastHead = ~0U, lastIh;
+	static char text[1000];
+	uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
+	uint32_t ih = __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED);
+	if (writes >= 160 || (head == lastHead && (ih == lastIh || t % 5)))
+		return;
+	if (!options && !(options = IORegistryEntry::fromPath("/options", gIODTPlane)))
+		return;
+	lastHead = head;
+	lastIh = ih;
+	size_t len = static_cast<size_t>(snprintf(text, sizeof(text), "t=%u w=%u ev=%u ih=%u last:", t, writes, head, ih));
+	// Newest 10 events, oldest first.
+	for (uint32_t i = head > 10 ? head - 10 : 0; i != head && len < sizeof(text); i++) {
+		auto &event = traceRing[i % TraceRingSize];
+		len += static_cast<size_t>(snprintf(text + len, sizeof(text) - len, " %s%s=%x", event.exit ? "" : ">",
+			event.name ? event.name : "?", event.value));
+	}
+	// Then as much of the end of the trace summary as fits.
+	if (len + 8 < sizeof(text)) {
+		size_t summary = strlen(traceSummary), room = sizeof(text) - len - 8;
+		len += static_cast<size_t>(snprintf(text + len, sizeof(text) - len, " | %s",
+			traceSummary + (summary > room ? summary - room : 0)));
+	}
+	if (len >= sizeof(text))
+		len = sizeof(text) - 1;
+	auto *data = OSData::withBytes(text, static_cast<unsigned>(len));
+	if (!data)
+		return;
+	options->setProperty("CR-progress", data);
+	data->release();
+	options->setProperty("IONVRAM-FORCESYNCNOW-PROPERTY", "CR-progress");
+	writes++;
+}
+
 void CRDriver::watcherThread(void *arg, wait_result_t) {
 	auto *self = static_cast<CRDriver *>(arg);
 	static char last[1536], now[1536];
 	bool print = !checkKernelArgument("-crnowatch");
 	bool watchdog = !checkKernelArgument("-crnowatchdog");
 	bool controllerRequested = checkKernelArgument("-crnoloadctl");
+	bool breadcrumb = !checkKernelArgument("-crnobreadcrumb");
 	// crpanicat=N: panic on purpose at t=N s. Every "freeze" so far happened as the GUI session started (IOConsoleUsers,
 	// hidd), which is also when the kernel's verbose console stops drawing and WindowServer takes the screen; with only
 	// display-less AMD framebuffers, nothing would replace the last console image, and our heartbeat (printed through
@@ -704,6 +745,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			underflowTick();
 		if (restoreOn && gpuMmio)
 			restoreTick(t);
+		if (breadcrumb)
+			writeBreadcrumb(t);
 		if (panicAt && t >= panicAt)
 			self->panicReport(t, now);
 
