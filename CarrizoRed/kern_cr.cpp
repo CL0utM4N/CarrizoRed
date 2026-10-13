@@ -1087,7 +1087,8 @@ void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_add
 // AMDBaffinHardware) assumes a Polaris 11:
 //  - allocateHWEngines creates two sDMA engines (+0x3B8, +0x3C0); Stoney has one (Linux sdma_v3_0, 1 instance). The
 //    second slot is released again, and startHWEngines, which requires both, starts only the first. initializeHWEngines
-//    and getHWChannel already skip empty engine slots.
+//    skips empty engine slots, and getHWChannel(engine, ring) returns NULL for one, but createAccelChannels spreads the
+//    sDMA channels over both engines and calls into the result unchecked; engine 2 (sDMA1) is redirected to engine 1.
 //  - setupAndInitializeHWCapabilities hard-codes 2 shader engines (+0x64), 1 SH per SE (+0x6C) and 8 CUs per SH (+0xA0)
 //    (Ellesmere: 4/1/9). The VI base class then reads the real active-CU bitmaps from CAIL into +0x70.. and the
 //    minimum active CUs into +0xA4. Stoney: 1 SE, 1 SH, 3 CUs.
@@ -1098,7 +1099,7 @@ void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_add
 // Field offsets come from the 15.8.1 KDK; each patch first checks the instructions that carry them (the D509BA boots
 // the 15.4 recovery) and stays off if they differ.
 static bool accelSdma1Dropped, accelCapsFixed, vmFixOn, vmFixReady;
-static uint32_t accelStartPatched, accelCapsCu;
+static uint32_t accelStartPatched, accelCapsCu, accelSdma1Aliased;
 static uint64_t vmFbStart, vmFbEnd, vmCarveout;
 static uint32_t vmConverted, vmMcAddresses, vmOffsets, vmOther;
 static struct {
@@ -1194,6 +1195,10 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			route("__ZN26AMDRadeonX4000_AMDHardware14startHWEnginesEv",
 				reinterpret_cast<mach_vm_address_t>(wrapStartHWEngines), orgStartHWEngines, startChecks, 0xA0,
 				"startHWEngines");
+		static const char *const channelChecks[] {"488bbcc7b0030000", "488b80a0010000", nullptr};
+		route("__ZN26AMDRadeonX4000_AMDHardware12getHWChannelE20_eAMD_HW_ENGINE_TYPE18_eAMD_HW_RING_TYPE",
+			reinterpret_cast<mach_vm_address_t>(wrapGetHWChannel), orgGetHWChannel, channelChecks, 0x26,
+			"getHWChannel");
 	}
 	if (family == ChipFamily::Stoney && !checkKernelArgument("-crnocapsfix")) {
 		static const char *const capsChecks[] {"c7476402000000", "c7476c01000000", "c787a000000008000000", nullptr};
@@ -1241,6 +1246,18 @@ bool CRDriver::wrapStartHWEngines(void *that) {
 	traceEvent("hw.startHWEngines (sDMA0 only)", true, ok);
 	traceNote("startHWEngines=%x ", ok);
 	return ok;
+}
+
+// Engine types: 0 PM4, 1 sDMA0, 2 sDMA1 (slots +0x3B0 + 8 * type). With sDMA1 dropped, its channels are sDMA0's.
+void *CRDriver::wrapGetHWChannel(void *that, uint32_t engine, uint32_t ring) {
+	auto org = FunctionCast(wrapGetHWChannel, callback->orgGetHWChannel);
+	void *channel = org(that, engine, ring);
+	if (!channel && engine == 2 && accelSdma1Dropped) {
+		channel = org(that, 1, ring);
+		if (!accelSdma1Aliased++)
+			traceNote("sdma1->sdma0 ");
+	}
+	return channel;
 }
 
 uint64_t CRDriver::wrapSetupHWCapabilities(void *that) {
@@ -2643,9 +2660,9 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		};
 		add("iGPU Load* props: AMDSupport %s Controller %s HWServices %s Accelerator %s\n", flag("LoadAMDSupport"),
 			flag("LoadController"), flag("LoadHWServices"), flag("LoadAccelerator"));
-		add("accel: sDMA1 dropped %u, sDMA0-only starts %u, caps fixed %u (CUs %u); vm fix %s FB %llx-%llx carve-out "
+		add("accel: sDMA1 dropped %u (aliased %u), sDMA0-only starts %u, caps fixed %u (CUs %u); vm fix %s FB %llx-%llx carve-out "
 			"%llx: %u converted (%u MC, %u offset, %u other)",
-			accelSdma1Dropped, accelStartPatched, accelCapsFixed, accelCapsCu, vmFixOn ? "on" : "off", vmFbStart,
+			accelSdma1Dropped, accelSdma1Aliased, accelStartPatched, accelCapsFixed, accelCapsCu, vmFixOn ? "on" : "off", vmFbStart,
 			vmFbEnd, vmCarveout, vmConverted, vmMcAddresses, vmOffsets, vmOther);
 		for (uint32_t i = 0; i < vmConverted && i < arrsize(vmSamples); i++)
 			add(" %c %llx->%llx", vmSamples[i].kind, vmSamples[i].from, vmSamples[i].to);

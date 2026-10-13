@@ -120,12 +120,13 @@ private:
 	void patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);
 	static bool wrapAllocateHWEngines(void *that);
 	static bool wrapStartHWEngines(void *that);
+	static void *wrapGetHWChannel(void *that, uint32_t engine, uint32_t ring);
 	static uint64_t wrapSetupHWCapabilities(void *that);
 	static uint64_t wrapUpdatePTEsDMA(void *that, uint64_t dst, uint64_t count, uint64_t addr, uint64_t flags,
 		uint64_t incr);
 	static uint64_t wrapGetPTEValue(void *that, uint32_t level, uint64_t addr, uint32_t flags, uint32_t fragment);
 	static uint64_t wrapGetPDEValue(void *that, uint32_t level, uint64_t addr);
-	mach_vm_address_t orgAllocateHWEngines {0}, orgStartHWEngines {0}, orgSetupHWCapabilities {0}, orgUpdatePTEsDMA {0},
+	mach_vm_address_t orgAllocateHWEngines {0}, orgStartHWEngines {0}, orgGetHWChannel {0}, orgSetupHWCapabilities {0}, orgUpdatePTEsDMA {0},
 		orgGetPTEValue {0}, orgGetPDEValue {0};
 
 	void startWatcher();
