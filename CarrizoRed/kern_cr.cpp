@@ -3177,7 +3177,14 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			// CP_CPF_STATUS/BUSY_STAT/STALLED_STAT1; CP_ROQ_IB1_STAT .. CP_CE_ROQ_RB_STAT; SRBM_STATUS3, SRBM_READ_ERROR,
 			// SRBM_INT_STATUS, SRBM_READ_ERROR2; CP_RB0_BASE_HI, CP_RB_DOORBELL_CONTROL; RLC_GPR_REG2 (CZ safe mode).
 			{0xC092, 0xC092}, {0xC098, 0xC098}, {0xC0CC, 0xC0CE}, {0x2087, 0x2089}, {0x21E1, 0x21E8}, {0x395, 0x395},
-			{0x3A6, 0x3A6}, {0x3A9, 0x3A9}, {0x3AE, 0x3AE}, {0x30B1, 0x30B1}, {0x3059, 0x3059}, {0xEC7A, 0xEC7A}};
+			{0x3A6, 0x3A6}, {0x3A9, 0x3A9}, {0x3AE, 0x3AE}, {0x30B1, 0x30B1}, {0x3059, 0x3059}, {0xEC7A, 0xEC7A},
+			// nvram63: the first fetch on each stream (ring, IB) returns, the next never does. GPU memory path
+			// (gmc_8_1_d.h): VM_L2_CNTL..VM_DUMMY_PAGE_FAULT_CNTL, VM_CONTEXT0_CNTL2, VM_INVALIDATE_RESPONSE,
+			// VM_CONTEXT0_PROTECTION_FAULT_DEFAULT_ADDR, VM_CONTEXT0_PAGE_TABLE_BASE/START/END_ADDR, VM_L2_CNTL4,
+			// MC_VM_AGP_TOP..MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR, MC_VM_MX_L1_TLB_CNTL, MC_VM_FB_OFFSET; the CP's
+			// read-pointer writeback and WPTR poll addresses (CP_RB0_RPTR_ADDR/_HI, CP_RB_WPTR_POLL_ADDR_LO/_HI).
+			{0x500, 0x506}, {0x50C, 0x50C}, {0x51F, 0x51F}, {0x546, 0x546}, {0x54F, 0x54F}, {0x557, 0x557},
+			{0x55F, 0x55F}, {0x578, 0x578}, {0x80A, 0x80F}, {0x819, 0x81A}, {0x3043, 0x3047}};
 		// The GFX ring's contents around the read pointer (nvram54: stuck at dword 0x88 with an SRBM request pending).
 		// AMDBaffinHardware +0x3B0 = PM4 engine, +0x50 = its GFX ring (AMDVICommandsRing <- AMDCommandRing: +0x30 size in
 		// dwords, +0x40 CPU mapping, +0x48 GPU address).
