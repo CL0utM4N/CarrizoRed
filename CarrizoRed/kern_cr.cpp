@@ -209,6 +209,16 @@ namespace IhReg {
 	                          RB_WPTR_ADDR_LO = 0xE35, CNTL = 0xE36, STATUS = 0xE38;
 }
 static volatile uint32_t *gpuMmio;  // BAR5, mapped by probeMMIO
+static OSData *vbiosImage;            // our reference to the iGPU's "ATY,bin_image", see wrapCailEarlyInitialize
+static IORegistryEntry *vbiosOwner;
+
+static void keepVbiosImage(IORegistryEntry *gpu) {
+	vbiosImage = OSDynamicCast(OSData, gpu->getProperty(VBIOS::ImageProperty));
+	if (vbiosImage) {
+		vbiosImage->retain();
+		vbiosOwner = gpu;
+	}
+}
 static void *ihManager;                 // BaffinInterruptManager *
 static mach_vm_address_t ihGetWptrWbAddress, ihIsUsingVram;
 static bool ihStormBroken;
@@ -367,6 +377,7 @@ void CRDriver::processPatcher(KernelPatcher &) {
 		bool ok = VBIOS::inject(iGPU, WIOKit::VendorID::ATIAMD, deviceId);
 		iGPU->setProperty("CarrizoRed,vbios-injected", ok);
 	}
+	keepVbiosImage(iGPU);
 	setSoftPowerPlayTable();
 }
 
@@ -1909,7 +1920,9 @@ static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
 
 // Which of the HWLibs hooks below were installed (bit per hook, in HwlibsHook order) and which failed. nvram72 showed
 // none of them taking effect (no PowerPlay key notes, flags untouched, ATS not skipped) with no "noroute" note.
-enum HwlibsHook { HookPeciRead, HookPeciSize, HookWaitFor, HookAts, HookHaltRlc, HookFlags, HookSmuFormat, HookSmuLoad };
+enum HwlibsHook {
+	HookPeciRead, HookPeciSize, HookWaitFor, HookAts, HookHaltRlc, HookFlags, HookSmuFormat, HookSmuLoad, HookEarlyInit
+};
 static uint32_t hwlibsHooks, hwlibsHookFails;
 
 static bool routeHwlibs(KernelPatcher &patcher, size_t index, KernelPatcher::RouteRequest &request,
@@ -1924,10 +1937,31 @@ static bool routeHwlibs(KernelPatcher &patcher, size_t index, KernelPatcher::Rou
 	return false;
 }
 
+// CAIL's early start-up. AmdCailServices::earlyInitialize copies the VBIOS from the "ATY,bin_image" property and,
+// without it, returns 0xE00002BC before CAILEarlyASICInit: CAIL then never reads its registry settings (so the
+// DisableCailLoadUcode override, PowerPlay's Dummy back-end key and the ATS skip never happen; nvram72/73, both boots
+// where the display controller had started before the accelerator kexts loaded, after which the property was gone).
+// Put our copy back if it's missing.
+static mach_vm_address_t orgCailEarlyInitialize;
+static uint32_t binImageChecks, binImageRestores, earlyInitResult = 0xFFFFFFFF;
+
+static uint64_t wrapCailEarlyInitialize(void *that, void *callbacks, void *init) {
+	binImageChecks++;
+	if (vbiosImage && vbiosOwner && !vbiosOwner->getProperty(VBIOS::ImageProperty)) {
+		vbiosOwner->setProperty(VBIOS::ImageProperty, vbiosImage);
+		binImageRestores++;
+		traceNote("binimage=restored ");
+	}
+	auto ret = FunctionCast(wrapCailEarlyInitialize, orgCailEarlyInitialize)(that, callbacks, init);
+	earlyInitResult = static_cast<uint32_t>(ret);
+	return ret;
+}
+
 void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, size_t kext) {
-	if (!checkKernelArgument("-crnotrace"))
-		routeStages(patcher, index, slide, size,
-			kext == KextRadeonX4000 ? InAccel : kext == KextRadeonX4000HWServices ? InHWServices : InHWLibs);
+	// HWLibs' stages are routed after its hooks below: Stoney_LoadRlcUcode is both a stage and the SMU load's hook, and
+	// the one routed second fails (nvram73: the stage won, so the SMU load never ran).
+	if (!checkKernelArgument("-crnotrace") && kext != KextRadeonX4000HWLibs)
+		routeStages(patcher, index, slide, size, kext == KextRadeonX4000 ? InAccel : InHWServices);
 	if (kext == KextRadeonX4000HWLibs) {
 		ppDummyForced = (family == ChipFamily::Stoney || family == ChipFamily::Carrizo) &&
 			!checkKernelArgument("-crnoppdummy");
@@ -1936,6 +1970,9 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			{"_PECI_GetRegistrySize", wrapPeciGetRegistrySize, orgPeciGetRegistrySize},
 			{"_Cail_MCILWaitFor", wrapCailWaitFor, orgCailWaitFor},
 		};
+		KernelPatcher::RouteRequest early {"__ZN15AmdCailServices15earlyInitializeEP23_MCIL_SERVICE_CALLBACKSP15_CailInitialize",
+			wrapCailEarlyInitialize, orgCailEarlyInitialize};
+		routeHwlibs(patcher, index, early, slide, size, HookEarlyInit);
 		static const HwlibsHook hooks[] {HookPeciRead, HookPeciSize, HookWaitFor};
 		for (size_t i = 0; i < arrsize(requests); i++)
 			routeHwlibs(patcher, index, requests[i], slide, size, hooks[i]);
@@ -1982,6 +2019,8 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				}
 			}
 		}
+		if (!checkKernelArgument("-crnotrace"))
+			routeStages(patcher, index, slide, size, InHWLibs);
 	}
 }
 
@@ -3797,7 +3836,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			smuFormatCalls, smuCailSize, smuRegionStart, smuLoad.blockOffset, smuLoad.mc, smuLoad.phys, smuLoad.tasks,
 			smuLoad.resp[0], smuLoad.resp[1], smuLoad.resp[2], smuLoad.resp[3], smuLoad.resp[4], smuLoad.resp[5],
 			smuLoad.before, smuLoad.after, smuLoad.ms, smuLoad.mecBase[0], smuLoad.mecBase[1], smuLoad.mecBase[2]);
-		add("hooks: hwlibs routed %x failed %x; peci reads %u\n", hwlibsHooks, hwlibsHookFails, peciReads);
+		add("hooks: hwlibs routed %x failed %x; peci reads %u; bin_image checks %u restores %u, earlyInitialize %x\n",
+			hwlibsHooks, hwlibsHookFails, peciReads, binImageChecks, binImageRestores, earlyInitResult);
 	}
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
