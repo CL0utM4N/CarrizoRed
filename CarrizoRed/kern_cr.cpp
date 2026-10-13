@@ -3184,7 +3184,16 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			// MC_VM_AGP_TOP..MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR, MC_VM_MX_L1_TLB_CNTL, MC_VM_FB_OFFSET; the CP's
 			// read-pointer writeback and WPTR poll addresses (CP_RB0_RPTR_ADDR/_HI, CP_RB_WPTR_POLL_ADDR_LO/_HI).
 			{0x500, 0x506}, {0x50C, 0x50C}, {0x51F, 0x51F}, {0x546, 0x546}, {0x54F, 0x54F}, {0x557, 0x557},
-			{0x55F, 0x55F}, {0x578, 0x578}, {0x80A, 0x80F}, {0x819, 0x81A}, {0x3043, 0x3047}};
+			{0x55F, 0x55F}, {0x578, 0x578}, {0x80A, 0x80F}, {0x819, 0x81A}, {0x3043, 0x3047},
+			// nvram66: the CP's second ring fetch never returns. Cache channel set-up, where Stoney differs from
+			// Polaris 11 (Linux stoney_golden_*: GB_ADDR_CONFIG 0x12010001, TCP_CHAN_STEER_LO 0x10101010,
+			// TCP_ADDR_CONFIG 0xF1, TCC_EXE_DISABLE bit 1): GB_ADDR_CONFIG, TCP_CHAN_STEER_LO/HI, TCP_ADDR_CONFIG,
+			// TCI_CNTL_1/2, TCC_CTRL, TCC_EXE_DISABLE, HDP_HOST_PATH_CNTL, HDP_ADDR_CONFIG/MISC_CNTL; memory hub
+			// status: MC_HUB_MISC_STATUS, MC_HUB_WDP_ERR, MC_HUB_WDP_STATUS, _RDREQ_STATUS, _WRRET_STATUS,
+			// MC_HUB_MISC_IDLE_STATUS, MC_ARB_BUSY_STATUS, MC_VM_MB_L1_TLB0-2_STATUS.
+			{0x263E, 0x263E}, {0x2B03, 0x2B05}, {0x2B62, 0x2B63}, {0x2B80, 0x2B80}, {0x2B84, 0x2B84}, {0xB00, 0xB00},
+			{0xBD2, 0xBD3}, {0x832, 0x832}, {0x836, 0x836}, {0x838, 0x83A}, {0x847, 0x847}, {0x9FD, 0x9FD},
+			{0x895, 0x897}};
 		// The GFX ring's contents around the read pointer (nvram54: stuck at dword 0x88 with an SRBM request pending).
 		// AMDBaffinHardware +0x3B0 = PM4 engine, +0x50 = its GFX ring (AMDVICommandsRing <- AMDCommandRing: +0x30 size in
 		// dwords, +0x40 CPU mapping, +0x48 GPU address).
