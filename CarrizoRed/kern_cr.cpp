@@ -3207,24 +3207,38 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 					}
 				}
 				add("\n");
-				// The first INDIRECT_BUFFER on the ring (the clear-state buffer, in "VRAM"): its packets, read through BAR0.
-				// With the FB window at 0 a VRAM address is its BAR0 offset. Type-3 packets as op/count, with the register
-				// of SET_*_REG and the destination of WRITE_DATA; type-0 as t0:register/count.
+				// The first INDIRECT_BUFFER on the ring (the clear-state buffer, in "VRAM"): its packets, read from the
+				// carve-out's physical memory (MC_VM_FB_OFFSET << 22 + the address, the FB window being at 0; nvram61: BAR0
+				// is smaller than the 512 MB carve-out and the IB sits at its top). Type-3 packets as op/count, with the
+				// register of SET_*_REG and the destination of WRITE_DATA, "@" before the first packet past ROQ_IB1's
+				// read pointer; type-0 as t0:register/count.
 				for (uint32_t i = 0; i + 3 < end && i < dwords; i++) {
 					if (cpu[i] != 0xC0023F00)
 						continue;
 					uint64_t ib = (static_cast<uint64_t>(cpu[i + 2] & 0xFFFF) << 32) | (cpu[i + 1] & ~3U);
 					uint32_t ibDwords = cpu[i + 3] & 0xFFFFF;
-					auto *map = iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
-					if (!map || ib + ibDwords * 4ULL > map->getLength() || !ibDwords) {
-						add("ib %llx (%u dw): not in BAR0\n", ib, ibDwords);
-						OSSafeReleaseNULL(map);
+					uint64_t fbSize = (static_cast<uint64_t>(gpuMmio[Reg::MC_VM_FB_LOCATION] >> 16) + 1) << 24;
+					uint64_t phys = (static_cast<uint64_t>(gpuMmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22) + ib;
+					IOMemoryDescriptor *desc = nullptr;
+					IOMemoryMap *map = nullptr;
+					if (ibDwords && ib + ibDwords * 4ULL <= fbSize &&
+						(desc = IOMemoryDescriptor::withPhysicalAddress(phys, ibDwords * 4, kIODirectionIn)))
+						map = desc->map(kIOMapInhibitCache);
+					if (!map) {
+						add("ib %llx (%u dw) phys %llx: not mapped\n", ib, ibDwords, phys);
+						OSSafeReleaseNULL(desc);
 						break;
 					}
-					auto *data = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress() + ib);
-					add("ib %llx (%u dw):", ib, ibDwords);
+					auto *data = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
+					uint32_t roqIb1 = gpuMmio[0x21E1] & 0x3FF;  // CP_ROQ_IB1_STAT.ROQ_RPTR_INDIRECT1 (dwords fetched)
+					add("ib %llx (%u dw) phys %llx, roq %x:", ib, ibDwords, phys, roqIb1);
 					uint32_t packets = 0;
+					bool marked = false;
 					for (uint32_t j = 0; j < ibDwords && packets < 80; packets++) {
+						if (!marked && j >= roqIb1) {
+							add(" @");
+							marked = true;
+						}
 						uint32_t header = data[j], type = header >> 30, count = ((header >> 16) & 0x3FFF) + 1;
 						if (type == 3) {
 							uint32_t op = (header >> 8) & 0xFF;
@@ -3245,6 +3259,7 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 					}
 					add("\n");
 					map->release();
+					desc->release();
 					break;
 				}
 			} else {
