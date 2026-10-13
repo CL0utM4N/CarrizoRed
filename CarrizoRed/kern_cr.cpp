@@ -1120,6 +1120,11 @@ namespace {
 		{"_PhwDummy_Initialize", "PhwDummy_Initialize", InHWLibs, true, false, 0},
 		{"_Phw_CommonHwMgr_Initialize", "Phw_CommonHwMgr_Initialize", InHWLibs, true, false, 0},
 		{"_PHM_VerifyHwMgr", "PHM_VerifyHwMgr", InHWLibs, true, false, 0},
+		// The real back ends PHM_Initialize picks by family and revision (family 0x82, VI: Iceland, Tonga, Fiji,
+		// Polaris 10/11/12, Polaris 22). On the APU spoofed as Polaris 11 the Polaris one would run.
+		{"_PhwPolaris10_Initialize", "PhwPolaris10_Initialize", InHWLibs, true, false, 0},
+		{"_PhwPolaris22_Initialize", "PhwPolaris22_Initialize", InHWLibs, true, false, 0},
+		{"_PhwTonga_Initialize", "PhwTonga_Initialize", InHWLibs, true, false, 0},
 	};
 
 	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
@@ -1158,7 +1163,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 103, "one wrapper per stage");
+		static_assert(arrsize(stages) == 106, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -1173,6 +1178,7 @@ namespace {
 			CR_WRAP(80), CR_WRAP(81), CR_WRAP(82), CR_WRAP(83), CR_WRAP(84), CR_WRAP(85), CR_WRAP(86), CR_WRAP(87),
 			CR_WRAP(88), CR_WRAP(89), CR_WRAP(90), CR_WRAP(91), CR_WRAP(92), CR_WRAP(93), CR_WRAP(94), CR_WRAP(95),
 			CR_WRAP(96), CR_WRAP(97), CR_WRAP(98), CR_WRAP(99), CR_WRAP(100), CR_WRAP(101), CR_WRAP(102),
+			CR_WRAP(103), CR_WRAP(104), CR_WRAP(105),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -1409,11 +1415,47 @@ uint64_t CRDriver::wrapGetPDEValue(void *that, uint32_t level, uint64_t addr) {
 	return pde;
 }
 
+// PowerPlay registry reads (HWLibs PECI_ReadRegistry / PECI_GetRegistrySize -> PowerPlay callbacks -> the iGPU's
+// properties). nvram40: with PP_PhmUseDummyBackEnd and PP_PhmSoftPowerPlayTable set, PHM_Initialize still took the
+// non-Dummy path and never called PP_Tables_Initialize. Note what the PowerPlay keys that matter read back as.
+static mach_vm_address_t orgPeciReadRegistry, orgPeciGetRegistrySize;
+static uint32_t ppRegNotes;
+
+static bool ppRegInteresting(const char *name) {
+	return name && (strstr(name, "Dummy") || strstr(name, "Soft") || strstr(name, "DisableThermal"));
+}
+
+static uint32_t wrapPeciReadRegistry(void *peci, const char *name, uint32_t *value, uint32_t fallback) {
+	auto ret = FunctionCast(wrapPeciReadRegistry, orgPeciReadRegistry)(peci, name, value, fallback);
+	if (ppRegInteresting(name) && ppRegNotes++ < 12)
+		traceNote("reg:%s=%x(r%x) ", name, value ? *value : 0xFFFFFFFF, ret);
+	return ret;
+}
+
+static uint32_t wrapPeciGetRegistrySize(void *peci, const char *name, uint32_t *size) {
+	auto ret = FunctionCast(wrapPeciGetRegistrySize, orgPeciGetRegistrySize)(peci, name, size);
+	if (ppRegInteresting(name) && ppRegNotes++ < 12)
+		traceNote("regsize:%s=%x(r%x) ", name, size ? *size : 0xFFFFFFFF, ret);
+	return ret;
+}
+
 void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, size_t kext) {
 	if (checkKernelArgument("-crnotrace"))
 		return;
 	routeStages(patcher, index, slide, size,
 		kext == KextRadeonX4000 ? InAccel : kext == KextRadeonX4000HWServices ? InHWServices : InHWLibs);
+	if (kext == KextRadeonX4000HWLibs) {
+		KernelPatcher::RouteRequest requests[] {
+			{"_PECI_ReadRegistry", wrapPeciReadRegistry, orgPeciReadRegistry},
+			{"_PECI_GetRegistrySize", wrapPeciGetRegistrySize, orgPeciGetRegistrySize},
+		};
+		for (auto &request : requests) {
+			if (!routeChecked(patcher, index, request, slide, size)) {
+				traceNote("noroute:%s(%d) ", request.symbol, patcher.getError());
+				patcher.clearError();
+			}
+		}
+	}
 }
 
 void CRDriver::traceFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
