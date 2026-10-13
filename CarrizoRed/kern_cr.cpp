@@ -56,6 +56,7 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 
 // Short summary of the bring-up trace, repeated by the watcher so it survives the console scrolling.
 static char traceSummary[2560];
+static uint16_t softPPTableSize, softPPTableRev;  // see setSoftPowerPlayTable
 
 static void traceNote(const char *fmt, ...) {
 	size_t len = strlen(traceSummary);
@@ -365,6 +366,33 @@ void CRDriver::processPatcher(KernelPatcher &) {
 		bool ok = VBIOS::inject(iGPU, WIOKit::VendorID::ATIAMD, deviceId);
 		iGPU->setProperty("CarrizoRed,vbios-injected", ok);
 	}
+	setSoftPowerPlayTable();
+}
+
+// PowerPlay's table parser (HWLibs PP_Tables_Initialize) gets its table from the PP_PhmSoftPowerPlayTable registry key,
+// else, on a pre-Raven APU, from the VBIOS through PECI_RetrieveBiosDataTable(PowerPlayInfo). On the D509BA that path
+// appears to fail: PHM_Initialize returns PP_Result_Failed before any later back-end step (nvram36/39), although the
+// VBIOS has the table (PowerPlayInfo rev 6.1, 495 bytes: a classic PPLib table, which the Dummy back end's CZ clock-info
+// callback decodes). Hand it the VBIOS's own table as the soft table. Only for the Dummy back end; -crnosoftpptable
+// disables it.
+void CRDriver::setSoftPowerPlayTable() {
+	if (checkKernelArgument("-crnoppdummy") || checkKernelArgument("-crnosoftpptable") ||
+		iGPU->getProperty("PP_PhmSoftPowerPlayTable"))
+		return;
+	auto *image = OSDynamicCast(OSData, iGPU->getProperty(VBIOS::ImageProperty));
+	uint16_t size = 0;
+	const uint8_t *table = image ? VBIOS::findDataTable(static_cast<const uint8_t *>(image->getBytesNoCopy()),
+		image->getLength(), VBIOS::PowerPlayInfoTable, size) : nullptr;
+	if (!table) {
+		SYSLOG("cr", "no PowerPlayInfo table in the VBIOS, PowerPlay will look for it itself");
+		iGPU->setProperty("CarrizoRed,soft-pptable", "none");
+		return;
+	}
+	iGPU->setProperty("PP_PhmSoftPowerPlayTable", const_cast<uint8_t *>(table), size);
+	iGPU->setProperty("CarrizoRed,soft-pptable", size, 16);
+	softPPTableSize = size;
+	softPPTableRev = static_cast<uint16_t>(table[2] << 8 | table[3]);
+	SYSLOG("cr", "PP_PhmSoftPowerPlayTable: VBIOS PowerPlayInfo, %u bytes, rev %u.%u", size, table[2], table[3]);
 }
 
 void CRDriver::findByConfigSpace() {
@@ -2894,6 +2922,7 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		uint32_t pos2 = gpuMmio[0x1BA4], frame2 = gpuMmio[0x1BA6];
 		add("crtc0 position %x -> %x, frame %x -> %x\n", pos1, pos2, frame1, frame2);
 	}
+	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
 		breadcrumbNoOptions ? ", no /options" : "");
 	add("trace: %s\nlast events:", traceSummary);

@@ -120,3 +120,24 @@ bool VBIOS::inject(IOPCIDevice *pci, uint16_t vendorId, uint16_t deviceId) {
 	table->release();
 	return injected;
 }
+
+const uint8_t *VBIOS::findDataTable(const uint8_t *image, uint32_t size, uint32_t index, uint16_t &tableSize) {
+	auto word = [&](uint32_t offset) {
+		return static_cast<uint16_t>(image[offset] | static_cast<uint16_t>(image[offset + 1]) << 8);
+	};
+	if (!isAtomBios(image, size))
+		return nullptr;
+	uint32_t header = word(0x48);
+	if (header + 0x22 > size)
+		return nullptr;
+	uint32_t master = word(header + 0x20);
+	if (!master || master + 4 > size || 4 + 2 * (index + 1) > word(master) || master + 4 + 2 * (index + 1) > size)
+		return nullptr;
+	uint32_t table = word(master + 4 + 2 * index);
+	if (!table || table + 4 > size)
+		return nullptr;
+	tableSize = word(table);
+	if (tableSize < 4 || table + tableSize > size)
+		return nullptr;
+	return image + table;
+}

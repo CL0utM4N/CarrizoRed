@@ -70,6 +70,17 @@ namespace VBIOS {
 	 *  @return true if the property is present afterwards
 	 */
 	bool inject(IOPCIDevice *pci, uint16_t vendorId, uint16_t deviceId);
+
+	// ATOM master data table indices (atombios.h ATOM_MASTER_LIST_OF_DATA_TABLES).
+	static constexpr uint32_t PowerPlayInfoTable = 15;
+
+	/**
+	 *  Find ATOM data table `index` in a VBIOS image (ROM header at 0x48 -> usMasterDataTableOffset at +0x20 -> table
+	 *  offsets after the 4-byte common header). Each table starts with its own common header, usStructureSize first.
+	 *
+	 *  @return the table and its size, or nullptr if absent or out of bounds
+	 */
+	const uint8_t *findDataTable(const uint8_t *image, uint32_t size, uint32_t index, uint16_t &tableSize);
 }
 
 #endif /* kern_vbios_hpp */
