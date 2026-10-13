@@ -69,8 +69,8 @@ complete GPU firmware for them, but no display or GCN 2 accelerator driver; see
 so Ventura and later run without CPU hacks (AMD_Vanilla patches are still needed).
 
 **Why this family:** macOS never had drivers for these APUs, and removed its GCN 1–3 dGPU drivers in Ventura, but it
-still ships Polaris (GFX8, DCE 11.2). Carrizo-class APUs are the closest to Polaris: the same GFX8 instruction set and
-a near-identical display engine. Apple's still-shipping kexts are the base, and Apple's copy of AMD's CAIL init
+still ships Polaris (GFX8, DCE 11.2). Carrizo-class APUs are the closest to Polaris: the same GFX8 family (GCN 3 vs
+Polaris's GCN 4, with nearly the same instruction set) and a close relative of its display engine (DCE 11.0 vs 11.2). Apple's still-shipping kexts are the base, and Apple's copy of AMD's CAIL init
 library contains Carrizo and Stoney support (it's shared AMD code).
 
 ## Building
