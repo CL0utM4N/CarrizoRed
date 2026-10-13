@@ -2730,8 +2730,9 @@ void CRDriver::relocateFb() {
 		bool powered = (mmio[Reg::PIPE0_PG_STATUS + 3 * pipe] >> 30) == 0;
 		if (!powered || !(mmio[Reg::GRPH_ENABLE + r] & 1))
 			continue;
-		for (uint32_t low : {Reg::GRPH_PRIMARY_SURFACE_ADDRESS, Reg::GRPH_PRIMARY_SURFACE_ADDRESS + 1}) {
-			uint32_t high = low + 3;  // GRPH_PRIMARY/SECONDARY_SURFACE_ADDRESS_HIGH
+		for (uint32_t surface = 0; surface < 2; surface++) {
+			uint32_t low = Reg::GRPH_PRIMARY_SURFACE_ADDRESS + surface;  // primary, secondary
+			uint32_t high = low + 3;                                     // GRPH_PRIMARY/SECONDARY_SURFACE_ADDRESS_HIGH
 			uint64_t address = static_cast<uint64_t>(mmio[high + r]) << 32 | mmio[low + r];
 			if (address >= base && address <= (top | 0xFFFFFF)) {
 				address -= base;
