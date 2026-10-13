@@ -3472,6 +3472,24 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	// control (0x2D6). Those are IOMMUv2 features macOS doesn't set up for AMD.
 	add("ats (skipped %u): 2b6=%x 2c4=%x 2cc=%x 2d6=%x\n", atsSkipped, iGPU->extendedConfigRead16(0x2B6), iGPU->extendedConfigRead16(0x2C4),
 		iGPU->extendedConfigRead32(0x2CC), iGPU->extendedConfigRead16(0x2D6));
+	// Microcode RAM read-back (nvram70: the RLC is enabled but never runs, and current Linux only loads GFX8 microcode
+	// through the SMU). Read the first words of each RAM back through the ADDR/DATA pairs CAIL wrote them with
+	// (gfx_8_0_d.h); expected (Stoney images, = linux-firmware): RLC c4080015 308c0001, CE d8400022 d80003f6,
+	// PFP c4380015 c7b4000b, ME d8400018 cc0003e4, MEC c424000b 8000019f. Zeros or garbage mean the writes were dropped.
+	if (gpuMmio && !checkKernelArgument("-crnoucodecheck")) {
+		static const struct {
+			const char *name;
+			uint16_t addr, data;
+		} rams[] {{"rlc", 0xF83C, 0xF83D}, {"ce", 0xF818, 0xF819}, {"pfp", 0xF814, 0xF815}, {"me", 0xF816, 0xF817},
+			{"mec", 0xF81A, 0xF81B}};
+		add("ucode:");
+		for (auto &ram : rams) {
+			gpuMmio[ram.addr] = 0;
+			uint32_t w0 = gpuMmio[ram.data], w1 = gpuMmio[ram.data], w2 = gpuMmio[ram.data];
+			add(" %s %x %x %x", ram.name, w0, w1, w2);
+		}
+		add("\n");
+	}
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
 		breadcrumbNoOptions ? ", no /options" : "");
