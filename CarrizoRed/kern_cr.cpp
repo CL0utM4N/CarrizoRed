@@ -3122,6 +3122,20 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		for (auto reg : gfxRegs)
 			add(" %x=%x", reg, gpuMmio[reg]);
 		add("\n");
+		// nvram51: the CP still stalls at ring dword 0x88 with fetches pending. CP_STALLED_STAT3/1/2, CP_BUSY_STAT,
+		// CP_STAT, the ME/PFP/CE header dumps (last packet headers) and the CPF status (0x219C-0x21A8); the ring and
+		// indirect-buffer registers (0x21C0-0x21D7); VM context 0/1 protection fault status and address
+		// (VM_CONTEXT0/1_PROTECTION_FAULT_STATUS 0x536/0x537, _ADDR 0x53E/0x53F).
+		static const struct {
+			uint16_t first, last;
+		} cpRanges[] {{0x219C, 0x21A8}, {0x21C0, 0x21D7}, {0x536, 0x537}, {0x53E, 0x53F}};
+		add("cp:");
+		for (auto &range : cpRanges) {
+			add(" %x:", range.first);
+			for (uint32_t reg = range.first; reg <= range.last; reg++)
+				add(" %x", gpuMmio[reg]);
+		}
+		add("\n");
 	}
 	add("fbreloc: base %llx loc %x -> %x (reads %x, now %x), hdp was %x now %x; sysap %x-%x\n", fbRelocBase,
 		fbRelocOld, fbRelocNew, fbRelocReadback, gpuMmio ? gpuMmio[Reg::MC_VM_FB_LOCATION] : 0, fbRelocHdp,
