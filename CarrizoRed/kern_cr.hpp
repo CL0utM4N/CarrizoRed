@@ -136,6 +136,7 @@ private:
 	void findByConfigSpace();
 	void logPCIInfo();
 	void probeMMIO();
+	void relocateFb();
 	void initDisplayRegs();
 	void checkDisplayRegs(uint32_t t);
 	void panicReport(uint32_t t, const char *tree, const char *reason);

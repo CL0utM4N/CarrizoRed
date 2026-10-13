@@ -120,6 +120,7 @@ The APUs' built-in USB 3 controller (FCH xHCI `1022:7914`) never delivers its in
 | `-crnoppdummy` | Stoney/Carrizo: don't set `PP_PhmUseDummyBackEnd` (PowerPlay has no back end for these APUs; without the Dummy one, `initializePowerPlay` fails and the accelerator never powers up); also turns PowerPlay off |
 | `-crnosoftpptable` | Stoney/Carrizo: don't hand PowerPlay the VBIOS's PowerPlayInfo table as `PP_PhmSoftPowerPlayTable` (HWLibs' own VBIOS lookup appears to fail on the APU, and PowerPlay then fails to initialise) |
 | `-crnodirectucode` | Stoney/Carrizo: leave CAIL's `DisableCailLoadUcode` on (the default), so the RLC/CP/SDMA microcode is left to the SMU. With the Dummy PowerPlay back end nothing asks the SMU to load it, and the accelerator's power-up waits forever |
+| `-crnofbreloc` | With acceleration: leave the carve-out's GPU address window where the firmware put it (`0xF4_0000_0000` on the D509BA) instead of moving it to 0. Apple's accelerator assumes VRAM at GPU address 0; elsewhere its "VRAM" accesses land in physical RAM |
 | `-crnopp`, `-crpp` | Force PowerPlay off / on. By default it is on with acceleration and the Dummy back end, and off otherwise (`CFG_NO_PP`; without PowerPlay the accelerator never powers up its engines) |
 | `-crnocapsfix` | Stoney: 1 shader engine and the CAIL-reported CU count instead of Polaris 11's 2 SE / 8 CUs |
 | `-crnovmfix` | Converting local GPU page-table entries to the carve-out's physical address (`MC_VM_FB_OFFSET << 22`) |

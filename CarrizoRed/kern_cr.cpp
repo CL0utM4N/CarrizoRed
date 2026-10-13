@@ -2695,6 +2695,60 @@ void CRDriver::probeMMIO() {
 	iGPU->setProperty("CarrizoRed,gb-addr-config", gbAddrConfig, 32);
 
 	initDisplayRegs();
+	relocateFb();
+}
+
+// The accelerator (AMDRadeonX4000) assumes Polaris's memory layout: VRAM at GPU address 0, the GART right after it
+// (0x20000000 for 512 MB), and a system aperture covering [0, GART) (AMDVIHardware::initializeSystemApertureRegs). It
+// never reads MC_VM_FB_LOCATION. On the APU the firmware maps the carve-out at 0xF4_0000_0000, so a "VRAM" address
+// such as 0x01000000 falls in the system aperture but outside the FB, and the memory controller treats it as a
+// physical RAM address: the GPU reads garbage and writes into whatever macOS keeps in low memory (nvram50: the CP
+// stalled with fetches pending after its first packets; earlier accelerated boots reset hard). Move the FB window to
+// 0, as Linux radeon did on APUs (radeon_vram_location(..., 0)); the carve-out itself (MC_VM_FB_OFFSET) stays where it
+// is. The CPU's BAR0 window (HDP_NONSURFACE_BASE) and any live scanout surface move with it; AMD9500Controller reads
+// the FB base back from the register (AtiAsicInfo::refreshFbLocation). Only with acceleration; -crnofbreloc disables
+// it.
+static uint32_t fbRelocOld, fbRelocNew, fbRelocReadback, fbRelocHdp;
+static uint64_t fbRelocBase;
+
+void CRDriver::relocateFb() {
+	if (!gpuMmio || checkKernelArgument("-crnoaccel") || checkKernelArgument("-crnofbreloc"))
+		return;
+	auto *mmio = gpuMmio;
+	uint32_t location = mmio[Reg::MC_VM_FB_LOCATION];
+	uint64_t base = static_cast<uint64_t>(location & 0xFFFF) << 24;
+	uint64_t top = static_cast<uint64_t>(location >> 16) << 24;
+	if (!base || top < base)
+		return;
+	uint32_t moved = static_cast<uint32_t>((top - base) >> 24) << 16;
+	fbRelocOld = location;
+	fbRelocNew = moved;
+	fbRelocBase = base;
+	// Scanout surfaces are MC addresses: move every enabled pipe's primary and secondary surface down with the FB.
+	for (uint32_t pipe = 0; pipe < displayPipes(family); pipe++) {
+		uint32_t r = pipeRegisterBase(pipe);
+		bool powered = (mmio[Reg::PIPE0_PG_STATUS + 3 * pipe] >> 30) == 0;
+		if (!powered || !(mmio[Reg::GRPH_ENABLE + r] & 1))
+			continue;
+		for (uint32_t low : {Reg::GRPH_PRIMARY_SURFACE_ADDRESS, Reg::GRPH_PRIMARY_SURFACE_ADDRESS + 1}) {
+			uint32_t high = low + 3;  // GRPH_PRIMARY/SECONDARY_SURFACE_ADDRESS_HIGH
+			uint64_t address = static_cast<uint64_t>(mmio[high + r]) << 32 | mmio[low + r];
+			if (address >= base && address <= (top | 0xFFFFFF)) {
+				address -= base;
+				mmio[high + r] = static_cast<uint32_t>(address >> 32);
+				mmio[low + r] = static_cast<uint32_t>(address);
+			}
+		}
+	}
+	mmio[Reg::MC_VM_FB_LOCATION] = moved;
+	uint32_t hdp = mmio[Reg::HDP_NONSURFACE_BASE];
+	if (hdp == static_cast<uint32_t>(base >> 8))
+		mmio[Reg::HDP_NONSURFACE_BASE] = 0;
+	fbRelocHdp = hdp;
+	fbRelocReadback = mmio[Reg::MC_VM_FB_LOCATION];
+	SYSLOG("cr", "FB window moved from 0x%llX to 0: MC_VM_FB_LOCATION 0x%08X -> 0x%08X (reads 0x%08X), HDP base 0x%X",
+		base, location, moved, fbRelocReadback, hdp);
+	iGPU->setProperty("CarrizoRed,fb-relocated", fbRelocReadback == moved);
 }
 
 // Display and memory-controller registers watched from boot (firmware/GOP values) through Apple's bring-up: FB
@@ -3068,6 +3122,10 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			add(" %x=%x", reg, gpuMmio[reg]);
 		add("\n");
 	}
+	add("fbreloc: base %llx loc %x -> %x (reads %x, now %x), hdp was %x now %x; sysap %x-%x\n", fbRelocBase,
+		fbRelocOld, fbRelocNew, fbRelocReadback, gpuMmio ? gpuMmio[Reg::MC_VM_FB_LOCATION] : 0, fbRelocHdp,
+		gpuMmio ? gpuMmio[Reg::HDP_NONSURFACE_BASE] : 0, gpuMmio ? gpuMmio[Reg::MC_VM_SYSTEM_APERTURE_LOW_ADDR] : 0,
+		gpuMmio ? gpuMmio[Reg::MC_VM_SYSTEM_APERTURE_HIGH_ADDR] : 0);
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
 		breadcrumbNoOptions ? ", no /options" : "");
