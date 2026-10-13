@@ -1103,7 +1103,8 @@ namespace {
 		{"__ZN28AMDRadeonX4000_AMDVIHardware16initializeVMRegsEv", "hw.initializeVMRegs", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware27initializeHardwareRegistersEv", "hw.initializeHardwareRegisters", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware19initializeHWEnginesEv", "hw.initializeHWEngines", InAccel, true, true, 0},
-		{"__ZN26AMDRadeonX4000_AMDHardware16powerUpHWEnginesEv", "hw.powerUpHWEngines", InAccel, true, true, 0},
+		// (AMDHardware::powerUpHWEngines has its own wrapper, wrapPowerUpHWEngines.)
+		{"__ZN30AMDRadeonX4000_AMDPM4HWChannel21infiniteWaitOnPowerUpEv", "pm4.infiniteWaitOnPowerUp", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDVIPM4Engine7powerUpEv", "pm4.powerUp", InAccel, true, true, 0},
 		{"__ZN29AMDRadeonX4000_AMDVIPM4Engine21initializeMicroEngineEv", "pm4.initializeMicroEngine", InAccel, true, true, 0},
 		{"__ZN29AMDRadeonX4000_AMDVIPM4Engine5startEv", "pm4.start", InAccel, true, true, 0},
@@ -1345,10 +1346,15 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			"66895008", nullptr};
 		if (route("__ZN32AMDRadeonX4000_AMDBaffinHardware17allocateHWEnginesEv",
 				reinterpret_cast<mach_vm_address_t>(wrapAllocateHWEngines), orgAllocateHWEngines, allocChecks, 0x100,
-				"allocateHWEngines"))
+				"allocateHWEngines")) {
 			route("__ZN26AMDRadeonX4000_AMDHardware14startHWEnginesEv",
 				reinterpret_cast<mach_vm_address_t>(wrapStartHWEngines), orgStartHWEngines, startChecks, 0xA0,
 				"startHWEngines");
+		}
+		static const char *const powerUpChecks[] {"4b8bbcfeb0030000", nullptr};
+		route("__ZN26AMDRadeonX4000_AMDHardware16powerUpHWEnginesEv",
+			reinterpret_cast<mach_vm_address_t>(wrapPowerUpHWEngines), orgPowerUpHWEngines, powerUpChecks, 0x30,
+			"powerUpHWEngines");
 		static const char *const channelChecks[] {"488bbcc7b0030000", "488b80a0010000", nullptr};
 		route("__ZN26AMDRadeonX4000_AMDHardware12getHWChannelE20_eAMD_HW_ENGINE_TYPE18_eAMD_HW_RING_TYPE",
 			reinterpret_cast<mach_vm_address_t>(wrapGetHWChannel), orgGetHWChannel, channelChecks, 0x26,
@@ -1408,22 +1414,37 @@ bool CRDriver::wrapAllocateHWEngines(void *that) {
 		sdma1 = nullptr;
 		accelSdma1Dropped = true;
 	}
-	// UVD 6.3 (+0x3D8), VCE 3.4 (+0x3E8) and SAMU (+0x400). On the APU the SMU keeps UVD, VCE and SAMU power-gated
-	// until a PowerPlay back end asks it to power them up (Linux smu8: PPSMC_MSG_UVDPowerON etc.); the Dummy back end
-	// never does, and powerUpHWEngines would program their registers next, which on an APU can hang the bus. Neither a
-	// desktop nor Metal needs them; engine loops skip empty slots. -crmm keeps them.
-	if (!checkKernelArgument("-crmm")) {
-		static const uint32_t multimedia[] {0x3D8, 0x3E8, 0x400};
-		for (auto offset : multimedia) {
-			auto &engine = *reinterpret_cast<OSObject **>(static_cast<uint8_t *>(that) + offset);
-			if (engine) {
-				engine->release();
-				engine = nullptr;
+	traceEvent("hw.allocateHWEngines (sDMA1 dropped)", true, ret);
+	return ret;
+}
+
+// UVD 6.3 (+0x3D8), VCE 3.4 (+0x3E8) and SAMU (+0x400): on the APU the SMU keeps them power-gated until a PowerPlay
+// back end asks it to power them up (Linux smu8: PPSMC_MSG_UVDPowerON etc.); the Dummy back end never does, and
+// programming a gated block can hang the bus. Releasing the engines made AMDGraphicsAccelerator::start fail (nvram68,
+// then a NULL dereference in its clean-up path), so they stay; only their power-up is skipped: the slots are emptied
+// for the duration of AMDHardware::powerUpHWEngines, whose loop skips empty slots. -crmm powers them up too.
+static mach_vm_address_t orgPowerUpHWEngines;
+
+static bool wrapPowerUpHWEngines(void *that) {
+	static const uint32_t multimedia[] {0x3D8, 0x3E8, 0x400};
+	void *saved[arrsize(multimedia)] {};
+	bool skip = !checkKernelArgument("-crmm");
+	if (skip) {
+		for (size_t i = 0; i < arrsize(multimedia); i++) {
+			auto &engine = *reinterpret_cast<void **>(static_cast<uint8_t *>(that) + multimedia[i]);
+			saved[i] = engine;
+			if (engine)
 				accelMmDropped++;
-			}
+			engine = nullptr;
 		}
 	}
-	traceEvent("hw.allocateHWEngines (sDMA1 dropped)", true, ret);
+	traceEvent("hw.powerUpHWEngines", false, 0);
+	bool ret = FunctionCast(wrapPowerUpHWEngines, orgPowerUpHWEngines)(that);
+	if (skip)
+		for (size_t i = 0; i < arrsize(multimedia); i++)
+			*reinterpret_cast<void **>(static_cast<uint8_t *>(that) + multimedia[i]) = saved[i];
+	traceEvent("hw.powerUpHWEngines", true, ret);
+	traceNote("hw.powerUpHWEngines=%x(mm skipped %u) ", ret, skip ? accelMmDropped : 0);
 	return ret;
 }
 
@@ -3088,7 +3109,7 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		};
 		add("iGPU Load* props: AMDSupport %s Controller %s HWServices %s Accelerator %s\n", flag("LoadAMDSupport"),
 			flag("LoadController"), flag("LoadHWServices"), flag("LoadAccelerator"));
-		add("accel: multimedia engines dropped %u, arbiter patches %u; ", accelMmDropped, accelArbPatched);
+		add("accel: multimedia engine power-ups skipped %u, arbiter patches %u; ", accelMmDropped, accelArbPatched);
 		add("accel: sDMA1 dropped %u (aliased %u), sDMA0-only starts %u, caps fixed %u (CUs %u); vm fix %s FB %llx-%llx carve-out "
 			"%llx: %u converted (%u MC, %u offset, %u other)",
 			accelSdma1Dropped, accelSdma1Aliased, accelStartPatched, accelCapsFixed, accelCapsCu, vmFixOn ? "on" : "off", vmFbStart,
