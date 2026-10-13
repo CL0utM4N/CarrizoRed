@@ -1152,6 +1152,7 @@ namespace {
 			KernelPatcher::RouteRequest request {stages[i].symbol, wrappers[i], stages[i].org};
 			if (!routeChecked(patcher, index, request, slide, size)) {
 				SYSLOG("cr", "trace: failed to route %s (error %d)", stages[i].name, patcher.getError());
+				traceNote("noroute:%s(%d) ", stages[i].name, patcher.getError());
 				patcher.clearError();
 			}
 		}
