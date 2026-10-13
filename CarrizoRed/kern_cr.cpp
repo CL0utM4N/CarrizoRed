@@ -628,16 +628,22 @@ static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_
 // hard reset (no panic text, straight back to the boot menu), which leaves nothing. While trace events keep arriving,
 // write the latest progress to the CR-progress variable (Apple's GUID, 7C436110-...) and force a sync: at most every
 // 500 ms and 160 times per boot. -crnobreadcrumb disables it.
+static uint32_t breadcrumbWrites, breadcrumbRefused;
+static bool breadcrumbNoOptions;
+
 static void writeBreadcrumb(uint32_t t) {
 	static IORegistryEntry *options;
-	static uint32_t writes, lastHead = ~0U, lastIh;
+	static uint32_t lastHead = ~0U, lastIh;
+	uint32_t &writes = breadcrumbWrites;
 	static char text[1000];
 	uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
 	uint32_t ih = __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED);
 	if (writes >= 160 || (head == lastHead && (ih == lastIh || t % 5)))
 		return;
-	if (!options && !(options = IORegistryEntry::fromPath("/options", gIODTPlane)))
+	if (!options && !(options = IORegistryEntry::fromPath("/options", gIODTPlane))) {
+		breadcrumbNoOptions = true;
 		return;
+	}
 	lastHead = head;
 	lastIh = ih;
 	size_t len = static_cast<size_t>(snprintf(text, sizeof(text), "t=%u w=%u ev=%u ih=%u last:", t, writes, head, ih));
@@ -658,9 +664,11 @@ static void writeBreadcrumb(uint32_t t) {
 	auto *data = OSData::withBytes(text, static_cast<unsigned>(len));
 	if (!data)
 		return;
-	options->setProperty("CR-progress", data);
+	if (!options->setProperty("CR-progress", data))
+		breadcrumbRefused++;
 	data->release();
 	options->setProperty("IONVRAM-FORCESYNCNOW-PROPERTY", "CR-progress");
+	options->setProperty("IONVRAM-SYNCNOW-PROPERTY", "CR-progress");
 	writes++;
 }
 
@@ -2843,6 +2851,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree) {
 		uint32_t pos2 = gpuMmio[0x1BA4], frame2 = gpuMmio[0x1BA6];
 		add("crtc0 position %x -> %x, frame %x -> %x\n", pos1, pos2, frame1, frame2);
 	}
+	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
+		breadcrumbNoOptions ? ", no /options" : "");
 	add("trace: %s\nlast events:", traceSummary);
 	// Newest 16 events, oldest first, without the repetitive attribute and vblank-wait calls.
 	uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
