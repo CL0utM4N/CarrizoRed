@@ -1228,6 +1228,7 @@ void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_add
 // Field offsets come from the 15.8.1 KDK; each patch first checks the instructions that carry them (the D509BA boots
 // the 15.4 recovery) and stays off if they differ.
 static bool accelSdma1Dropped, accelCapsFixed, vmFixOn, vmFixReady;
+static void *accelHardware;  // AMDBaffinHardware, from allocateHWEngines (for the black box's ring dump)
 static uint32_t accelStartPatched, accelCapsCu, accelSdma1Aliased;
 static uint64_t vmFbStart, vmFbEnd, vmCarveout;
 static uint32_t vmConverted, vmMcAddresses, vmOffsets, vmOther;
@@ -1349,6 +1350,7 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 
 bool CRDriver::wrapAllocateHWEngines(void *that) {
 	bool ret = FunctionCast(wrapAllocateHWEngines, callback->orgAllocateHWEngines)(that);
+	accelHardware = that;
 	auto &sdma1 = *reinterpret_cast<OSObject **>(static_cast<uint8_t *>(that) + 0x3C0);
 	if (sdma1) {
 		sdma1->release();
@@ -3171,6 +3173,26 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		static const struct {
 			uint16_t first, last;
 		} cpRanges[] {{0x219C, 0x21A8}, {0x21C0, 0x21D7}, {0x536, 0x537}, {0x53E, 0x53F}};
+		// The GFX ring's contents around the read pointer (nvram54: stuck at dword 0x88 with an SRBM request pending).
+		// AMDBaffinHardware +0x3B0 = PM4 engine, +0x50 = its GFX ring (AMDVICommandsRing <- AMDCommandRing: +0x30 size in
+		// dwords, +0x40 CPU mapping, +0x48 GPU address).
+		if (auto *hw = static_cast<uint8_t *>(accelHardware)) {
+			auto *pm4 = *reinterpret_cast<uint8_t **>(hw + 0x3B0);
+			auto *ring = pm4 ? *reinterpret_cast<uint8_t **>(pm4 + 0x50) : nullptr;
+			auto *cpu = ring ? *reinterpret_cast<uint32_t **>(ring + 0x40) : nullptr;
+			uint32_t dwords = ring ? *reinterpret_cast<uint32_t *>(ring + 0x30) : 0;
+			uint32_t rptr = gpuMmio[0x21C0];
+			if (cpu && dwords >= 0x100) {
+				add("ring %llx (%u dw) @%x:", ring ? *reinterpret_cast<uint64_t *>(ring + 0x48) : 0, dwords,
+					rptr > 0x40 ? rptr - 0x40 : 0);
+				for (uint32_t i = rptr > 0x40 ? rptr - 0x40 : 0; i < rptr + 0x20 && i < dwords; i++)
+					add("%s%x", i == rptr ? " |" : " ", cpu[i]);
+				add("\n");
+			} else {
+				add("ring: none (hw %d pm4 %d ring %d cpu %d, %u dw)\n", hw != nullptr, pm4 != nullptr, ring != nullptr,
+					cpu != nullptr, dwords);
+			}
+		}
 		add("cp:");
 		for (auto &range : cpRanges) {
 			add(" %x:", range.first);
