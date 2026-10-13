@@ -3285,11 +3285,12 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			auto readPhys = [](uint64_t phys, uint32_t bytes, void *out) {
 				auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, bytes, kIODirectionIn);
 				auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
-				if (map)
+				bool mapped = map != nullptr;
+				if (mapped)
 					memcpy(out, reinterpret_cast<const void *>(map->getVirtualAddress()), bytes);
 				OSSafeReleaseNULL(map);
 				OSSafeReleaseNULL(desc);
-				return map != nullptr;
+				return mapped;
 			};
 			add("gart: table %llx start %llx:", table, start);
 			if (table + 0x200 <= fbTop && start) {
