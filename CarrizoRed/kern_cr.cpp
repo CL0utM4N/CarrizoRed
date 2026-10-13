@@ -3172,7 +3172,12 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		// (VM_CONTEXT0/1_PROTECTION_FAULT_STATUS 0x536/0x537, _ADDR 0x53E/0x53F).
 		static const struct {
 			uint16_t first, last;
-		} cpRanges[] {{0x219C, 0x21A8}, {0x21C0, 0x21D7}, {0x536, 0x537}, {0x53E, 0x53F}};
+		} cpRanges[] {{0x219C, 0x21A4}, {0x21C0, 0x21C2}, {0x536, 0x537}, {0x53E, 0x53F},
+			// nvram60 (gfx_8_0_d.h / oss_3_0_d.h): CP_IB1_OFFSET, CP_CE_IB1_OFFSET, CP_IB1_BASE_LO/HI, CP_IB1_BUFSZ;
+			// CP_CPF_STATUS/BUSY_STAT/STALLED_STAT1; CP_ROQ_IB1_STAT .. CP_CE_ROQ_RB_STAT; SRBM_STATUS3, SRBM_READ_ERROR,
+			// SRBM_INT_STATUS, SRBM_READ_ERROR2; CP_RB0_BASE_HI, CP_RB_DOORBELL_CONTROL; RLC_GPR_REG2 (CZ safe mode).
+			{0xC092, 0xC092}, {0xC098, 0xC098}, {0xC0CC, 0xC0CE}, {0x2087, 0x2089}, {0x21E1, 0x21E8}, {0x395, 0x395},
+			{0x3A6, 0x3A6}, {0x3A9, 0x3A9}, {0x3AE, 0x3AE}, {0x30B1, 0x30B1}, {0x3059, 0x3059}, {0xEC7A, 0xEC7A}};
 		// The GFX ring's contents around the read pointer (nvram54: stuck at dword 0x88 with an SRBM request pending).
 		// AMDBaffinHardware +0x3B0 = PM4 engine, +0x50 = its GFX ring (AMDVICommandsRing <- AMDCommandRing: +0x30 size in
 		// dwords, +0x40 CPU mapping, +0x48 GPU address).
@@ -3202,6 +3207,46 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 					}
 				}
 				add("\n");
+				// The first INDIRECT_BUFFER on the ring (the clear-state buffer, in "VRAM"): its packets, read through BAR0.
+				// With the FB window at 0 a VRAM address is its BAR0 offset. Type-3 packets as op/count, with the register
+				// of SET_*_REG and the destination of WRITE_DATA; type-0 as t0:register/count.
+				for (uint32_t i = 0; i + 3 < end && i < dwords; i++) {
+					if (cpu[i] != 0xC0023F00)
+						continue;
+					uint64_t ib = (static_cast<uint64_t>(cpu[i + 2] & 0xFFFF) << 32) | (cpu[i + 1] & ~3U);
+					uint32_t ibDwords = cpu[i + 3] & 0xFFFFF;
+					auto *map = iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+					if (!map || ib + ibDwords * 4ULL > map->getLength() || !ibDwords) {
+						add("ib %llx (%u dw): not in BAR0\n", ib, ibDwords);
+						OSSafeReleaseNULL(map);
+						break;
+					}
+					auto *data = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress() + ib);
+					add("ib %llx (%u dw):", ib, ibDwords);
+					uint32_t packets = 0;
+					for (uint32_t j = 0; j < ibDwords && packets < 80; packets++) {
+						uint32_t header = data[j], type = header >> 30, count = ((header >> 16) & 0x3FFF) + 1;
+						if (type == 3) {
+							uint32_t op = (header >> 8) & 0xFF;
+							if ((op == 0x68 || op == 0x69 || op == 0x76 || op == 0x79) && j + 1 < ibDwords)
+								add(" %x/%u:%x", op, count, data[j + 1]);
+							else if (op == 0x37 && j + 3 < ibDwords)
+								add(" %x/%u:%x>%x", op, count, data[j + 1], data[j + 2]);
+							else
+								add(" %x/%u", op, count);
+							j += 1 + count;
+						} else if (type == 0) {
+							add(" t0:%x/%u", header & 0xFFFF, count);
+							j += 1 + count;
+						} else {
+							add(" t%u:%x", type, header);
+							j++;
+						}
+					}
+					add("\n");
+					map->release();
+					break;
+				}
 			} else {
 				add("ring: none (hw %d pm4 %d ring %d cpu %d, %u dw)\n", hw != nullptr, pm4 != nullptr, ring != nullptr,
 					cpu != nullptr, dwords);
