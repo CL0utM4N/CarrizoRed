@@ -117,7 +117,8 @@ The APUs' built-in USB 3 controller (FCH xHCI `1022:7914`) never delivers its in
 | `-crnoloadctl` | Setting `LoadAMDSupport` / `LoadController` on the iGPU when the graphics policy hasn't (needed for the controller to match) |
 | `-crnoaccel` | The acceleration stack (AMDRadeonX4000, HWServices/CAIL); otherwise CarrizoRed requests it once the display is up |
 | `-crnosdmafix` | Stoney: releasing Apple's second sDMA engine and starting sDMA0 alone |
-| `-crnoppdummy` | Stoney/Carrizo: don't set `PP_PhmUseDummyBackEnd` (PowerPlay has no back end for these APUs; without the Dummy one, `initializePowerPlay` fails and the accelerator never powers up) |
+| `-crnoppdummy` | Stoney/Carrizo: don't set `PP_PhmUseDummyBackEnd` (PowerPlay has no back end for these APUs; without the Dummy one, `initializePowerPlay` fails and the accelerator never powers up); also turns PowerPlay off |
+| `-crnopp`, `-crpp` | Force PowerPlay off / on. By default it is on with acceleration and the Dummy back end, and off otherwise (`CFG_NO_PP`; without PowerPlay the accelerator never powers up its engines) |
 | `-crnocapsfix` | Stoney: 1 shader engine and the CAIL-reported CU count instead of Polaris 11's 2 SE / 8 CUs |
 | `-crnovmfix` | Converting local GPU page-table entries to the carve-out's physical address (`MC_VM_FB_OFFSET << 22`) |
 

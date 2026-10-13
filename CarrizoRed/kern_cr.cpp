@@ -888,7 +888,10 @@ bool CRDriver::wrapTestVram(void *that, uint32_t region, bool flag) {
 //  CFG_NON_ZERO_MC_LOC: see patchSupport.
 //  CFG_NO_PP: no PowerPlay. Apple's PowerPlay drives the Polaris SMU7 power controller; Stoney has an SMU8, which
 //  also controls the CPU and memory clocks. Spoof boots 5-7 froze the whole machine instantly as the GUI (and AGPM's
-//  power management) started, outside every traced display function.
+//  power management) started, outside every traced display function (before the ASSR and IH fixes). The accelerator
+//  needs PowerPlay, though: with CFG_NO_PP, BaffinPowerPlayManager::initialize fails (kIOReturnUnsupported, nvram35)
+//  and the engines are never powered up. With acceleration and the Dummy PowerPlay back end (see logPCIInfo), which
+//  doesn't talk to the SMU, it stays on; -crnopp forces it off, -crpp forces it on.
 //  CFG_USE_STUTTER, CFG_USE_FEDS, CFG_USE_FBWRKLP: off. Apple tunes display stutter (memory self-refresh), FEDS and
 //  the framebuffer work loop for a Polaris with its own GDDR5; on the APU the display shares DDR4 and the NB P-state
 //  logic with the CPU, and Apple's watermark inputs come from a dGPU VRAM table the APU VBIOS doesn't have. Spoof
@@ -904,7 +907,6 @@ static const struct {
 	bool optIn;  // apply only with arg (else: apply unless arg)
 } configOverrides[] {
 	{"CFG_NON_ZERO_MC_LOC", 1, "-crnomcloc", false},
-	{"CFG_NO_PP", 1, "-crpp", false},
 	{"CFG_USE_STUTTER", 0, "-crstutter", false},
 	{"CFG_USE_FEDS", 0, "-crfeds", false},
 	{"CFG_USE_FBWRKLP", 0, "-crfbwrklp", false},
@@ -926,6 +928,14 @@ uint64_t CRDriver::wrapGetConfigProperty(void *that, const char *name, void *val
 			if (!ret)
 				ret = 1;
 		}
+	}
+	if (!strcmp(name, "CFG_NO_PP") && !checkKernelArgument("-crpp") &&
+		(checkKernelArgument("-crnopp") || checkKernelArgument("-crnoaccel") || checkKernelArgument("-crnoppdummy"))) {
+		memset(value, 0, size);
+		*static_cast<uint8_t *>(value) = 1;
+		traceEvent("CFG_NO_PP", true, 1);
+		if (!ret)
+			ret = 1;
 	}
 	// CFG_FB_LIMIT caps the framebuffer count ATIController::start uses (otherwise 6). Each framebuffer index is also a
 	// CRTC index (cleanUpConnections → setDisplayEnabled → AMD9500Controller::shutDownDisplayHardware(index)), but with
@@ -1068,7 +1078,7 @@ namespace {
 		{"__ZN22BaffinPowerPlayManager10initializeEv", "ppm.initialize", InController, true, true, 0},
 		{"__ZN22BaffinPowerPlayManager24createPowerPlayInterfaceEv", "ppm.createInterface", InController, true, false, 0},
 		{"__ZN22BaffinPowerPlayManager15updatePowerPlayEv", "ppm.update", InController, true, false, 0},
-		{"__ZN13ATIController24sendRequestToAcceleratorE25_eAMDAccelIOFBRequestTypePvS1_S1_", "toAccel", InSupport, true, false, 0, 1},
+		{"__ZN13ATIController24sendRequestToAcceleratorE25_eAMDAccelIOFBRequestTypePvS1_S1_", "toAccel", InSupport, false, false, 0, 1},
 		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator20callPlatformFunctionEPK8OSSymbolbPvS3_S3_S3_", "accel.cpf", InAccel, false, false, 0},
 		{"__ZN20AtiPowerPlayServices12ppInitializeEP22PPDisplayConfiguration", "pp.ppInitialize", InHWLibs, true, true, 0},
 		{"_PP_InitializeEX", "PP_InitializeEX", InHWLibs, true, false, 0},
