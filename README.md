@@ -35,7 +35,9 @@ Expect panics and black screens. This is a development project, not something to
 | Stoney Ridge | A9-9420/9425, A6-9220/9225, A4-9120, E2-9000 | 1002:98E4 | gfx810 | DCE 11.0, 2 pipes | Display working (D509BA) |
 | Carrizo / Bristol Ridge | A12-9800, A10-9700, FX-9800P, A10-8700P, FX-8800P | 1002:9870, 9874–9877 | gfx801 | DCE 11.0, 3 pipes | Untested |
 
-Older GCN 2 APUs (Kaveri, Kabini, Mullins) may follow later.
+Older GCN 2 APUs (Kaveri, Kabini, Beema/Mullins) may follow later. Sequoia still contains AMD's init code and
+complete GPU firmware for them, but no display or GCN 2 accelerator driver; see
+[docs/OLDER_APUS.md](docs/OLDER_APUS.md).
 
 **macOS:** the development target is **Sequoia (15.x)**; Monterey through Tahoe are allowed. Excavator CPUs have AVX2,
 so Ventura and later run without CPU hacks (AMD_Vanilla patches are still needed).
@@ -163,6 +165,7 @@ docs/
   CARRIZO_VS_POLARIS.md    Where Linux amdgpu treats Carrizo differently from Polaris
   DCE11_REGISTER_DIFF.md   DCE 11.0 vs 11.2 display register diff (full data in docs/data/)
   FCH_XHCI.md              Why USB crawls on these APUs under macOS, and FCHXHCIFix
+  OLDER_APUS.md            What Sequoia still has for GCN 2 APUs (Kaveri, Kabini, Mullins)
   PHASE0.md                Hardware / environment / reverse-engineering checklist
   opencore/                SSDTs and the USB map for the D509BA
 scripts/

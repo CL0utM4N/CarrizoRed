@@ -18,8 +18,7 @@ CarrizoRed's own targets (Carrizo, Bristol Ridge, Stoney Ridge) come first. This
 | Kabini ("Kalindi") | A4-5000, A6-5200, E1/E2-2xxx, Athlon/Sempron on AM1 | 1002:9830–983D | GCN 2 (gfx703), 2 CUs | DCE 8.3 | same |
 | Beema / Mullins ("Godavari") | A4-6210, A6-6310, E1-6010, E2-6110; A10 Micro-6700T, A4 Micro-6400T | 1002:9850–985F | GCN 2 (gfx703), 2 CUs | DCE 8.3 | same |
 
-CAIL's names are AMD-internal. Its `GODAVARI` rows cover 9850–985F, the IDs Linux lists as Mullins (and Beema),
-and they use the Kalindi code path family.
+CAIL's names are AMD-internal. Its `GODAVARI` rows cover 9850–985F, the IDs Linux lists as Mullins (and Beema).
 
 ## What Sequoia still contains
 
