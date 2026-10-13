@@ -376,3 +376,33 @@ Stoney gets type 0. Polaris 11 assumptions that CarrizoRed patches on Stoney:
   (inside `MC_VM_FB_LOCATION`) and FB offsets in all three. The black box records which form Apple actually uses.
 - Not handled yet: BAR0 (256 MB) is smaller than the 512 MB carve-out (CPU mappings of VRAM above 256 MB); UVD/VCE/SAMU
   on Stoney (UVD 6.2, VCE 3.4, no GPUVM for UVD/VCE on APUs); power management (SMU8 vs SMU7 messages); user space.
+
+### Bring-up on the D509BA (2026-10-13, boots nvram30–66)
+
+What stood between `accel.start` and a running command processor, in the order it was found. Each item has a
+boot-arg to undo it (see the README).
+
+| Step | Polaris assumption / gap | CarrizoRed |
+|---|---|---|
+| `createAccelChannels` | spreads sDMA channels over sDMA0 and sDMA1, uses `getHWChannel` unchecked | sDMA1 lookups return sDMA0's channel |
+| `BaffinPowerPlayManager::initialize` | `CFG_NO_PP` was forced by CarrizoRed itself (display-era workaround) | PowerPlay on with acceleration |
+| `PHM_Initialize` | no back end for family 0x87; the VI path (Tonga table parser, Polaris SMU7 back end) fails | `PP_PhmUseDummyBackEnd` answered as 1 in `PECI_ReadRegistry` (the iGPU property reads back as 0); VBIOS PowerPlayInfo (rev 6.1) as `PP_PhmSoftPowerPlayTable` |
+| `Stoney_LoadRlcUcode` | `DisableCailLoadUcode` (CAIL flags `+0x6F0` bit 21, default 1) leaves the RLC/CP/SDMA microcode to the SMU, which the Dummy back end never asks | flag cleared: CAIL loads the microcode itself (as Linux `fw_load_type=0`); the embedded Stoney RLC/CE/PFP/ME/MEC images are byte-identical to linux-firmware's |
+| GPU addresses | `AMDRadeonX4000` assumes VRAM at MC 0 (system aperture `[0, GART)`, GART at 0x20000000) and never reads `MC_VM_FB_LOCATION`; the firmware maps the carve-out at 0xF4_0000_0000, so "VRAM" accesses hit physical RAM | FB window moved to 0 (as Linux `radeon` did on APUs), with HDP and live scanout |
+| RLC / gating | the RLC firmware starts but never answers a safe-mode request; CP power gating was allowed (`CP_PG_DISABLE` = 0) and MGCG/CGCG/memory light sleep on | gating off when CAIL loads the RLC: CGCG/CGLS, MGCG overrides, CP/RLC memory light sleep, `CP_PG_DISABLE` |
+| `powerUpHWEngines` | UVD 6.3, VCE 3.4 and SAMU stay power-gated without SMU messages | those engines released |
+| `AMDBaffinHardware::powerUp` | ORs Polaris GDDR5 bits (`SEQ_RDY_POP_IDLE`, `POP_IDLE_REPLAY`) into `MC_ARB_MISC2` | both ORs patched to 0 |
+
+Checked and found to match Linux's Stoney code: CAIL's `aStoney_GoldenRegisterSettings` (all 37 entries:
+`GB_ADDR_CONFIG` 0x12010001, `TCP_CHAN_STEER_LO` 0x10101010, `TCC_EXE_DISABLE`, raster config 0, MGCG/CGCG init,
+MC/HDP/ATC/SDMA entries); CAIL's set-up order `StoneyAsicSetupTable` (vce_pgfsm, register_update_for_asic_sku,
+init_ucode_buffer, halt_rlc, reset_rlc, init_power_gating = CSIB + save/restore list + jump-table restore + AO CU mask,
+init_LBPW, init_clock_gating, enable_perfmon_mgcg, init_nonsurf_aperture, power_down_uvd_block_for_dpg_mode,
+init_enable_ats), the same order as Linux `gfx_v8_0_rlc_resume` / `init_pg`; the VMID0 set-up (L1 TLB, L2 cache,
+context 0, 1 GB GART); the CP ring set-up and its start-up stream (CSB IB, EOP fence, CE partition `SET_BASE`); compute
+rings on MEC1 only. Apple's accelerator itself writes almost no GFX registers; the chip-specific work is CAIL's.
+
+Still open at the time of writing: the CP's second ring fetch never returning (RLC not answering is the lead);
+`stoney_init_enable_ats` (→ `Cail_Spectre_EnableAts`) turns on the iGPU's ATS/PRI/PASID capabilities, which belong to
+an IOMMUv2 driver macOS doesn't have; CAIL applies SDMA golden settings to a second instance (`SDMA1_POWER_CNTL` read
+error).
