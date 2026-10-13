@@ -23,14 +23,10 @@ jobs:
       - name: Build XHCIProbe (diagnostic tool)
         run: make -C tools/XHCIProbe
 
-      - name: Build FCHXHCIFix
-        run: make -C FCHXHCIFix
-
       - uses: actions/upload-artifact@v4
         with:
           name: CarrizoRed
           path: |
             build/*/*.zip
             tools/XHCIProbe/build/*.zip
-            FCHXHCIFix/build/*.zip
             Lilu.kext

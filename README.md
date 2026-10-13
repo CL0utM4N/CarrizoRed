@@ -54,10 +54,9 @@ Requires macOS with the Xcode command-line tools:
 bash scripts/bootstrap.sh   # fetches Lilu.kext (SDK) and MacKernelSDK
 make DEBUG=1                # build/Debug/CarrizoRed.kext
 make                        # build/Release/CarrizoRed.kext
-make -C FCHXHCIFix          # FCHXHCIFix/build/FCHXHCIFix.kext (USB fix, see below)
 ```
 
-No Mac? Push to GitHub: `.github/workflows/build.yml` builds CarrizoRed (Debug and Release), FCHXHCIFix and the
+No Mac? Push to GitHub: `.github/workflows/build.yml` builds CarrizoRed (Debug and Release) and the
 XHCIProbe diagnostic on a macOS runner, and uploads them with a debug `Lilu.kext` as one workflow artifact.
 Development for this project is done entirely on Windows this way.
 
@@ -69,7 +68,7 @@ similar machines. It includes:
 - AMD_Vanilla;
 - the ACPI fixes (`SSDT-XOSI`, EC/USBX) and a USB map;
 - VoodooPS2 and VoodooI2C (touchpad);
-- FCHXHCIFix;
+- [FCHXHCIFix](https://github.com/CL0utM4N/FCHXHCIFix) (USB, see below);
 - with `--carrizored --spoof`, CarrizoRed and the iGPU spoof below.
 
 The pieces CarrizoRed needs:
@@ -90,9 +89,9 @@ The pieces CarrizoRed needs:
 
 The APUs' built-in USB 3 controller (FCH xHCI `1022:7914`) never delivers its interrupts to macOS, so USB crawls
 (a USB stick reads at ~130 KB/s, and installing macOS from one takes most of a day). The standalone
-[FCHXHCIFix](FCHXHCIFix/README.md) kext fixes it. It doesn't depend on CarrizoRed or Lilu, so put it in the EFI
-**before** installing macOS. The cause, the diagnosis and the list of affected machines are in
-[docs/FCH_XHCI.md](docs/FCH_XHCI.md).
+[FCHXHCIFix](https://github.com/CL0utM4N/FCHXHCIFix) kext fixes it (its own repository, with releases). It doesn't
+depend on CarrizoRed or Lilu, so put it in the EFI **before** installing macOS. Its README has the cause, the diagnosis
+and the list of affected machines.
 
 ## Boot arguments
 
@@ -166,7 +165,6 @@ CarrizoRed/
   kern_vbios.*     VBIOS from the ACPI VFCT table → "ATY,bin_image" (read first by AMDSupport)
   kern_info.c      kmod_info declaration
   Info.plist.in    Bundle template (filled in by the Makefile)
-FCHXHCIFix/        Standalone kext: services the FCH xHCI (1022:7914), whose interrupts never reach macOS
 tools/XHCIProbe/   Diagnostic kext for that controller (state, interrupts, link states)
 docs/
   ROADMAP.md               Phase plan
@@ -174,7 +172,6 @@ docs/
   APPLE_KEXTS.md           Getting Apple's AMD kexts from a KDK on Windows, and what's inside them
   CARRIZO_VS_POLARIS.md    Where Linux amdgpu treats Carrizo differently from Polaris
   DCE11_REGISTER_DIFF.md   DCE 11.0 vs 11.2 display register diff (full data in docs/data/)
-  FCH_XHCI.md              Why USB crawls on these APUs under macOS, and FCHXHCIFix
   OLDER_APUS.md            What Sequoia still has for GCN 2 APUs (Kaveri, Kabini, Mullins)
   PHASE0.md                Hardware / environment / reverse-engineering checklist
   opencore/                SSDTs and the USB map for the D509BA
