@@ -2459,6 +2459,16 @@ void CRDriver::logPCIInfo() {
 
 	iGPU->setProperty("CarrizoRed,family", familyName(family));
 	iGPU->setProperty("CarrizoRed,revision", revision, 8);
+
+	// PowerPlay (HWLibs PHM_Initialize) has back ends for VI dGPUs, Vega, Navi and Raven/Renoir, but none for family
+	// 0x87 (Carrizo/Stoney): AMD9500Controller::initializePowerPlay fails with kIOReturnUnsupported (nvram33) and the
+	// accelerator is never powered up. PP_* registry keys are read from the GPU's PCI device properties
+	// (ATIController::getRegistryKey); PP_PhmUseDummyBackEnd selects the Dummy back end, which leaves clocks and power
+	// to the SMU firmware, as Linux amdgpu does with dpm=0. -crnoppdummy disables this.
+	if (!checkKernelArgument("-crnoppdummy")) {
+		uint32_t one = 1;
+		iGPU->setProperty("PP_PhmUseDummyBackEnd", &one, sizeof(one));
+	}
 }
 
 void CRDriver::probeMMIO() {
