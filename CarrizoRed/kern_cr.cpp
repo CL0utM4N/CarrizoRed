@@ -3274,6 +3274,40 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 					cpu != nullptr, dwords);
 			}
 		}
+		// GART (VMID0) entries for the CP's writeback page (fence at 0x20000000, read pointer at 0x20000008) and the
+		// ring page, and what the GPU wrote there. nvram64: the VM set-up matches Linux, the first read on each stream
+		// returns and the next never does, as if a GPU write to system memory never completed and blocked the queue.
+		// The table is in "VRAM" (VM_CONTEXT0_PAGE_TABLE_BASE_ADDR), read through the carve-out's physical memory.
+		{
+			uint64_t carveout = static_cast<uint64_t>(gpuMmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22;
+			uint64_t table = static_cast<uint64_t>(gpuMmio[0x54F]) << 12, start = static_cast<uint64_t>(gpuMmio[0x557]) << 12;
+			uint64_t fbTop = (static_cast<uint64_t>(gpuMmio[Reg::MC_VM_FB_LOCATION] >> 16) + 1) << 24;
+			auto readPhys = [](uint64_t phys, uint32_t bytes, void *out) {
+				auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, bytes, kIODirectionIn);
+				auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+				if (map)
+					memcpy(out, reinterpret_cast<const void *>(map->getVirtualAddress()), bytes);
+				OSSafeReleaseNULL(map);
+				OSSafeReleaseNULL(desc);
+				return map != nullptr;
+			};
+			add("gart: table %llx start %llx:", table, start);
+			if (table + 0x200 <= fbTop && start) {
+				uint64_t ptes[0x22] {};
+				if (readPhys(carveout + table, sizeof(ptes), ptes)) {
+					for (uint32_t index : {0U, 0x20U, 0x21U}) {
+						uint64_t pte = ptes[index], page = pte & 0xFFFFFFFFF000ULL;
+						uint32_t words[4] {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+						if ((pte & 1) && page)
+							readPhys(page, sizeof(words), words);
+						add(" [%x] %llx -> %x %x %x %x", index, pte, words[0], words[1], words[2], words[3]);
+					}
+				} else {
+					add(" unmapped");
+				}
+			}
+			add("\n");
+		}
 		add("cp:");
 		for (auto &range : cpRanges) {
 			add(" %x:", range.first);
