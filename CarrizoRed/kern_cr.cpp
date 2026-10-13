@@ -1136,6 +1136,27 @@ namespace {
 		{"_PhwPolaris10_Initialize", "PhwPolaris10_Initialize", InHWLibs, true, false, 0},
 		{"_PhwPolaris22_Initialize", "PhwPolaris22_Initialize", InHWLibs, true, false, 0},
 		{"_PhwTonga_Initialize", "PhwTonga_Initialize", InHWLibs, true, false, 0},
+		// CAIL's RLC and gating set-up for Stoney (nvram49-66: the RLC is enabled but never answers). Linux
+		// gfx_v8_0_init_pg on Carrizo/Stoney writes the CSIB, the save/restore list and machine, the CP jump-table
+		// restore address, the PG parameters and the always-on CU mask before starting the RLC; CAIL has its own
+		// versions of each. Which run, and when, relative to Stoney_LoadRlcUcode and pm4.start?
+		{"_Cail_Tonga_InitCSBHeader", "Cail_Tonga_InitCSBHeader", InHWLibs, true, false, 0},
+		{"_Cail_Stoney_InitializePowerGating", "Cail_Stoney_InitializePowerGating", InHWLibs, true, false, 0},
+		{"_stoney_init_power_gating", "stoney_init_power_gating", InHWLibs, true, false, 0},
+		{"_Cail_Tonga_InitRlcSaveRestoreList", "Cail_Tonga_InitRlcSaveRestoreList", InHWLibs, true, false, 0},
+		{"_Cail_Stoney_EnablePowerGating", "Cail_Stoney_EnablePowerGating", InHWLibs, true, false, 0},
+		{"_Stoney_UpdateGfxPowerGating", "Stoney_UpdateGfxPowerGating", InHWLibs, true, false, 0},
+		{"_Stoney_EnableCpPowerGating", "Stoney_EnableCpPowerGating", InHWLibs, true, false, 0},
+		{"_Stoney_UpdateCoarseGrainClockGating", "Stoney_UpdateCoarseGrainClockGating", InHWLibs, true, false, 0},
+		{"_Stoney_UpdateMediumGrainClockGating", "Stoney_UpdateMediumGrainClockGating", InHWLibs, true, false, 0},
+		{"_Cail_Fiji_EnableLBPW", "Cail_Fiji_EnableLBPW", InHWLibs, true, false, 0},
+		{"_stoney_init_LBPW", "stoney_init_LBPW", InHWLibs, true, false, 0},
+		{"_Cail_Tonga_MicroEngineControlCp", "Cail_Tonga_MicroEngineControlCp", InHWLibs, true, false, 0},
+		{"_Cail_Tonga_MicroEngineControlMec", "Cail_Tonga_MicroEngineControlMec", InHWLibs, true, false, 0},
+		{"_Cail_Tonga_MicroEngineControlSdma", "Cail_Tonga_MicroEngineControlSdma", InHWLibs, true, false, 0},
+		{"_CAILEarlyASICInit", "CAILEarlyASICInit", InHWLibs, true, false, 0},
+		{"_Cail_Stoney_InitCPJumpTable", "Cail_Stoney_InitCPJumpTable", InHWLibs, true, false, 0},
+		{"_InitializeRlcHistoryBuffer", "InitializeRlcHistoryBuffer", InHWLibs, true, false, 0},
 	};
 
 	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
@@ -1174,7 +1195,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 106, "one wrapper per stage");
+		static_assert(arrsize(stages) == 123, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -1190,6 +1211,8 @@ namespace {
 			CR_WRAP(88), CR_WRAP(89), CR_WRAP(90), CR_WRAP(91), CR_WRAP(92), CR_WRAP(93), CR_WRAP(94), CR_WRAP(95),
 			CR_WRAP(96), CR_WRAP(97), CR_WRAP(98), CR_WRAP(99), CR_WRAP(100), CR_WRAP(101), CR_WRAP(102),
 			CR_WRAP(103), CR_WRAP(104), CR_WRAP(105),
+			CR_WRAP(106), CR_WRAP(107), CR_WRAP(108), CR_WRAP(109), CR_WRAP(110), CR_WRAP(111), CR_WRAP(112), CR_WRAP(113),
+			CR_WRAP(114), CR_WRAP(115), CR_WRAP(116), CR_WRAP(117), CR_WRAP(118), CR_WRAP(119), CR_WRAP(120), CR_WRAP(121), CR_WRAP(122),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -1514,7 +1537,7 @@ static uint64_t wrapCailReadinOverrideRegistrySetting(void *cail) {
 // acknowledged, CGCG and CGLS on (0x21003F), and the CP busy at ring dword 0x88 with nothing stalled, as a CP whose
 // clock the dead RLC never ungates would be. Do the missing steps after CAIL halts the RLC. -crnorlcreset disables it.
 static mach_vm_address_t orgStoneyHaltRlc;
-static uint32_t rlcResets, rlcCgcgBefore, rlcPgBefore;
+static uint32_t rlcResets, rlcCgcgBefore, rlcPgBefore, rlcMgcgBefore;
 
 static uint64_t wrapStoneyHaltRlc(void *cail) {
 	auto ret = FunctionCast(wrapStoneyHaltRlc, orgStoneyHaltRlc)(cail);
@@ -1524,6 +1547,17 @@ static uint64_t wrapStoneyHaltRlc(void *cail) {
 		rlcPgBefore = mmio[RLC_PG_CNTL];
 		mmio[RLC_CGCG_CGLS_CTRL] = rlcCgcgBefore & ~3U;
 		mmio[RLC_PG_CNTL] = 0;
+		// Nothing may gate the CP while the RLC isn't answering: as Linux's "clock gating off" paths do, force the
+		// MGCG overrides (CPF, RLC, MGCG, CGCG, CGLS, GRBM), turn off CP and RLC memory light sleep, and set
+		// RLC_PG_CNTL.CP_PG_DISABLE. -crgating leaves CAIL's settings.
+		if (!checkKernelArgument("-crgating")) {
+			constexpr uint32_t RLC_MEM_SLP_CNTL = 0xEC06, RLC_CGTT_MGCG_OVERRIDE = 0xEC48, CP_MEM_SLP_CNTL = 0x3079;
+			rlcMgcgBefore = mmio[RLC_CGTT_MGCG_OVERRIDE];
+			mmio[RLC_CGTT_MGCG_OVERRIDE] = rlcMgcgBefore | 0x3F;
+			mmio[RLC_MEM_SLP_CNTL] = mmio[RLC_MEM_SLP_CNTL] & ~1U;
+			mmio[CP_MEM_SLP_CNTL] = mmio[CP_MEM_SLP_CNTL] & ~1U;
+			mmio[RLC_PG_CNTL] = 0x8000;
+		}
 		uint32_t reset = mmio[GRBM_SOFT_RESET];
 		mmio[GRBM_SOFT_RESET] = reset | 4;
 		(void)mmio[GRBM_SOFT_RESET];
@@ -3146,7 +3180,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		uint32_t pos2 = gpuMmio[0x1BA4], frame2 = gpuMmio[0x1BA6];
 		add("crtc0 position %x -> %x, frame %x -> %x\n", pos1, pos2, frame1, frame2);
 	}
-	add("rlc resets %u (CGCG_CGLS was %x, PG_CNTL was %x); ", rlcResets, rlcCgcgBefore, rlcPgBefore);
+	add("rlc resets %u (CGCG_CGLS was %x, PG_CNTL was %x, MGCG_OVERRIDE was %x); ", rlcResets, rlcCgcgBefore, rlcPgBefore,
+		rlcMgcgBefore);
 	add("cail waits: %u, %u failed:", cailWaits, cailWaitFailures);
 	for (uint32_t i = 0; i < cailWaitFailures && i < arrsize(cailWaitFails); i++)
 		add(" [%x]&%x!=%x(%x r%x @%llu)", cailWaitFails[i].reg, cailWaitFails[i].mask, cailWaitFails[i].value,
@@ -3193,7 +3228,13 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			// MC_HUB_MISC_IDLE_STATUS, MC_ARB_BUSY_STATUS, MC_VM_MB_L1_TLB0-2_STATUS.
 			{0x263E, 0x263E}, {0x2B03, 0x2B05}, {0x2B62, 0x2B63}, {0x2B80, 0x2B80}, {0x2B84, 0x2B84}, {0xB00, 0xB00},
 			{0xBD2, 0xBD3}, {0x832, 0x832}, {0x836, 0x836}, {0x838, 0x83A}, {0x847, 0x847}, {0x9FD, 0x9FD},
-			{0x895, 0x897}};
+			{0x895, 0x897},
+			// RLC set-up (gfx_8_0_d.h): RLC_DEBUG_SELECT/DEBUG, RLC_MEM_SLP_CNTL, RLC_LB_CNTL,
+			// RLC_SAVE_AND_RESTORE_BASE, RLC_JUMP_TABLE_RESTORE, RLC_GPM_THREAD_ENABLE, RLC_CGTT_MGCG_OVERRIDE,
+			// RLC_PG_DELAY, RLC_PG_ALWAYS_ON_CU_MASK .. RLC_AUTO_PG_CTRL, RLC_SRM_CNTL, RLC_CSIB_ADDR_LO/HI/LENGTH,
+			// CP_MEM_SLP_CNTL, CGTS_SM_CTRL_REG.
+			{0xEC01, 0xEC02}, {0xEC06, 0xEC06}, {0xEC19, 0xEC19}, {0xEC1D, 0xEC1E}, {0xEC45, 0xEC45}, {0xEC48, 0xEC48},
+			{0xEC4D, 0xEC4D}, {0xEC53, 0xEC55}, {0xEC80, 0xEC80}, {0xECA2, 0xECA4}, {0x3079, 0x3079}, {0xF000, 0xF000}};
 		// The GFX ring's contents around the read pointer (nvram54: stuck at dword 0x88 with an SRBM request pending).
 		// AMDBaffinHardware +0x3B0 = PM4 engine, +0x50 = its GFX ring (AMDVICommandsRing <- AMDCommandRing: +0x30 size in
 		// dwords, +0x40 CPU mapping, +0x48 GPU address).
