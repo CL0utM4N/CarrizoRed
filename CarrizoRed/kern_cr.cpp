@@ -3182,11 +3182,25 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			auto *cpu = ring ? *reinterpret_cast<uint32_t **>(ring + 0x40) : nullptr;
 			uint32_t dwords = ring ? *reinterpret_cast<uint32_t *>(ring + 0x30) : 0;
 			uint32_t rptr = gpuMmio[0x21C0];
+			// From dword 0 (nvram55: the fetcher was at 0x88, past the start sequence, which ends with SET_BASE at 0x80),
+			// with runs of the GFX8 NOP filler (PACKET3(NOP, 0x3FFF) = 0xFFFF1000) collapsed to "*n".
 			if (cpu && dwords >= 0x100) {
-				add("ring %llx (%u dw) @%x:", ring ? *reinterpret_cast<uint64_t *>(ring + 0x48) : 0, dwords,
-					rptr > 0x40 ? rptr - 0x40 : 0);
-				for (uint32_t i = rptr > 0x40 ? rptr - 0x40 : 0; i < rptr + 0x20 && i < dwords; i++)
-					add("%s%x", i == rptr ? " |" : " ", cpu[i]);
+				add("ring %llx (%u dw):", ring ? *reinterpret_cast<uint64_t *>(ring + 0x48) : 0, dwords);
+				uint32_t end = rptr + 8 < 0x200 ? rptr + 8 : 0x200;
+				for (uint32_t i = 0; i < end && i < dwords;) {
+					if (i == rptr)
+						add(" |");
+					uint32_t run = 0;
+					while (i + run < end && cpu[i + run] == 0xFFFF1000 && (run == 0 || i + run != rptr))
+						run++;
+					if (run > 1) {
+						add(" *%u", run);
+						i += run;
+					} else {
+						add(" %x", cpu[i]);
+						i++;
+					}
+				}
 				add("\n");
 			} else {
 				add("ring: none (hw %d pm4 %d ring %d cpu %d, %u dw)\n", hw != nullptr, pm4 != nullptr, ring != nullptr,
