@@ -1252,6 +1252,7 @@ void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_add
 // the 15.4 recovery) and stays off if they differ.
 static bool accelSdma1Dropped, accelCapsFixed, vmFixOn, vmFixReady;
 static void *accelHardware;  // AMDBaffinHardware, from allocateHWEngines (for the black box's ring dump)
+static uint32_t accelMmDropped, accelArbPatched;
 static uint32_t accelStartPatched, accelCapsCu, accelSdma1Aliased;
 static uint64_t vmFbStart, vmFbEnd, vmCarveout;
 static uint32_t vmConverted, vmMcAddresses, vmOffsets, vmOther;
@@ -1353,6 +1354,33 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			reinterpret_cast<mach_vm_address_t>(wrapGetHWChannel), orgGetHWChannel, channelChecks, 0x26,
 			"getHWChannel");
 	}
+	// AMDBaffinHardware::powerUp (and AMDEllesmereHardware's copy) ORs MC_ARB_MISC2.SEQ_RDY_POP_IDLE (0x40000000) and
+	// POP_IDLE_REPLAY (0x800) into the memory arbiter: Polaris GDDR5 sequencer tweaks, which Linux never sets on an APU,
+	// whose arbiter the CPU shares. Make both ORs write 0 (mov esi, 0x9D5; mov edx, imm; call [rax + 0x128]).
+	// -crnoarbfix leaves them.
+	if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crnoarbfix")) {
+		static const uint8_t find1[] {0xBE, 0xD5, 0x09, 0x00, 0x00, 0xBA, 0x00, 0x00,
+			0x00, 0x40, 0xFF, 0x90, 0x28, 0x01, 0x00, 0x00};
+		static const uint8_t repl1[] {0xBE, 0xD5, 0x09, 0x00, 0x00, 0xBA, 0x00, 0x00,
+			0x00, 0x00, 0xFF, 0x90, 0x28, 0x01, 0x00, 0x00};
+		static const uint8_t find2[] {0xBE, 0xD5, 0x09, 0x00, 0x00, 0xBA, 0x00, 0x08,
+			0x00, 0x00, 0xFF, 0x90, 0x28, 0x01, 0x00, 0x00};
+		static const uint8_t repl2[] {0xBE, 0xD5, 0x09, 0x00, 0x00, 0xBA, 0x00, 0x00,
+			0x00, 0x00, 0xFF, 0x90, 0x28, 0x01, 0x00, 0x00};
+		KernelPatcher::LookupPatch patches[] {
+			{&kexts[KextRadeonX4000], find1, repl1, sizeof(find1), 2},
+			{&kexts[KextRadeonX4000], find2, repl2, sizeof(find2), 2},
+		};
+		for (auto &patch : patches) {
+			patcher.applyLookupPatch(&patch);
+			if (patcher.getError() == KernelPatcher::Error::NoError) {
+				accelArbPatched++;
+			} else {
+				traceNote("arbfix=err%d ", patcher.getError());
+				patcher.clearError();
+			}
+		}
+	}
 	if (family == ChipFamily::Stoney && !checkKernelArgument("-crnocapsfix")) {
 		static const char *const capsChecks[] {"c7476402000000", "c7476c01000000", "c787a000000008000000", nullptr};
 		route("__ZN32AMDRadeonX4000_AMDBaffinHardware32setupAndInitializeHWCapabilitiesEv",
@@ -1379,6 +1407,21 @@ bool CRDriver::wrapAllocateHWEngines(void *that) {
 		sdma1->release();
 		sdma1 = nullptr;
 		accelSdma1Dropped = true;
+	}
+	// UVD 6.3 (+0x3D8), VCE 3.4 (+0x3E8) and SAMU (+0x400). On the APU the SMU keeps UVD, VCE and SAMU power-gated
+	// until a PowerPlay back end asks it to power them up (Linux smu8: PPSMC_MSG_UVDPowerON etc.); the Dummy back end
+	// never does, and powerUpHWEngines would program their registers next, which on an APU can hang the bus. Neither a
+	// desktop nor Metal needs them; engine loops skip empty slots. -crmm keeps them.
+	if (!checkKernelArgument("-crmm")) {
+		static const uint32_t multimedia[] {0x3D8, 0x3E8, 0x400};
+		for (auto offset : multimedia) {
+			auto &engine = *reinterpret_cast<OSObject **>(static_cast<uint8_t *>(that) + offset);
+			if (engine) {
+				engine->release();
+				engine = nullptr;
+				accelMmDropped++;
+			}
+		}
 	}
 	traceEvent("hw.allocateHWEngines (sDMA1 dropped)", true, ret);
 	return ret;
@@ -3045,6 +3088,7 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		};
 		add("iGPU Load* props: AMDSupport %s Controller %s HWServices %s Accelerator %s\n", flag("LoadAMDSupport"),
 			flag("LoadController"), flag("LoadHWServices"), flag("LoadAccelerator"));
+		add("accel: multimedia engines dropped %u, arbiter patches %u; ", accelMmDropped, accelArbPatched);
 		add("accel: sDMA1 dropped %u (aliased %u), sDMA0-only starts %u, caps fixed %u (CUs %u); vm fix %s FB %llx-%llx carve-out "
 			"%llx: %u converted (%u MC, %u offset, %u other)",
 			accelSdma1Dropped, accelSdma1Aliased, accelStartPatched, accelCapsFixed, accelCapsCu, vmFixOn ? "on" : "off", vmFbStart,
