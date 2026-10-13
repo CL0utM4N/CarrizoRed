@@ -2,7 +2,8 @@
 
 A [Lilu](https://github.com/acidanthera/Lilu) plugin that brings macOS graphics to AMD's GCN 3 (GFX8) APUs by adapting
 Apple's own Polaris drivers (`AMD9500Controller` + `AMDSupport` for display, `AMDRadeonX4000` for acceleration). It's
-the same idea NootedRed applies to Vega iGPUs on top of `AMDRadeonX5000`, for chips macOS dropped in Ventura.
+the same idea NootedRed applies to Vega iGPUs on top of `AMDRadeonX5000`. macOS has never supported these APUs (no Mac
+used them), so on a hackintosh they've only had the firmware framebuffer.
 
 ## Status
 
@@ -67,9 +68,10 @@ complete GPU firmware for them, but no display or GCN 2 accelerator driver; see
 **macOS:** the development target is **Sequoia (15.x)**; Monterey through Tahoe are allowed. Excavator CPUs have AVX2,
 so Ventura and later run without CPU hacks (AMD_Vanilla patches are still needed).
 
-**Why this family:** macOS removed the GCN 1–3 drivers in Ventura but kept Polaris (GFX8, DCE 11.2). Carrizo-class
-APUs are the closest to Polaris: the same GFX8 instruction set and a near-identical display engine. Apple's
-still-shipping kexts are the base, and Apple's own CAIL library still contains Carrizo and Stoney support.
+**Why this family:** macOS never had drivers for these APUs, and removed its GCN 1–3 dGPU drivers in Ventura, but it
+still ships Polaris (GFX8, DCE 11.2). Carrizo-class APUs are the closest to Polaris: the same GFX8 instruction set and
+a near-identical display engine. Apple's still-shipping kexts are the base, and Apple's copy of AMD's CAIL init
+library contains Carrizo and Stoney support (it's shared AMD code).
 
 ## Building
 
