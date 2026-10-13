@@ -3295,7 +3295,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			if (table + 0x200 <= fbTop && start) {
 				uint64_t ptes[0x22] {};
 				if (readPhys(carveout + table, sizeof(ptes), ptes)) {
-					for (uint32_t index : {0U, 0x20U, 0x21U}) {
+					static const uint32_t indices[] {0, 0x20, 0x21};
+					for (uint32_t index : indices) {
 						uint64_t pte = ptes[index], page = pte & 0xFFFFFFFFF000ULL;
 						uint32_t words[4] {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
 						if ((pte & 1) && page)
