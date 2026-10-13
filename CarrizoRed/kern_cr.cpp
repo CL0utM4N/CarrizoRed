@@ -1640,6 +1640,20 @@ static uint64_t wrapStoneyHaltRlc(void *cail) {
 	return ret;
 }
 
+// ATS / PRI / PASID. CAIL's Stoney set-up ends with stoney_init_enable_ats -> Cail_Spectre_EnableAts, which turns on
+// the iGPU's own PCIe ATS (0x2B6 = 0x8000), PRI (0x2C4/0x2CC) and PASID (0x2D6) capabilities (nvram69: all three on).
+// They belong to an IOMMUv2 driver (Linux amd_iommu_v2 / amdkfd; amdgpu never sets them itself), which macOS doesn't
+// have for AMD; GPU reads that need a translation would never be answered (nvram69: reads stuck in the memory
+// arbiter). Leave them off. -crats keeps CAIL's behaviour.
+static mach_vm_address_t orgCailEnableAts;
+static uint32_t atsSkipped;
+
+static uint64_t wrapCailEnableAts(void *) {
+	atsSkipped++;
+	traceNote("ats=skipped ");
+	return 0;
+}
+
 void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, size_t kext) {
 	if (!checkKernelArgument("-crnotrace"))
 		routeStages(patcher, index, slide, size,
@@ -1655,6 +1669,13 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		for (auto &request : requests) {
 			if (!routeChecked(patcher, index, request, slide, size)) {
 				traceNote("noroute:%s(%d) ", request.symbol, patcher.getError());
+				patcher.clearError();
+			}
+		}
+		if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crats")) {
+			KernelPatcher::RouteRequest ats {"_Cail_Spectre_EnableAts", wrapCailEnableAts, orgCailEnableAts};
+			if (!routeChecked(patcher, index, ats, slide, size)) {
+				traceNote("noroute:%s(%d) ", ats.symbol, patcher.getError());
 				patcher.clearError();
 			}
 		}
@@ -3305,7 +3326,10 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			// RLC_PG_DELAY, RLC_PG_ALWAYS_ON_CU_MASK .. RLC_AUTO_PG_CTRL, RLC_SRM_CNTL, RLC_CSIB_ADDR_LO/HI/LENGTH,
 			// CP_MEM_SLP_CNTL, CGTS_SM_CTRL_REG.
 			{0xEC01, 0xEC02}, {0xEC06, 0xEC06}, {0xEC19, 0xEC19}, {0xEC1D, 0xEC1E}, {0xEC45, 0xEC45}, {0xEC48, 0xEC48},
-			{0xEC4D, 0xEC4D}, {0xEC53, 0xEC55}, {0xEC80, 0xEC80}, {0xECA2, 0xECA4}, {0x3079, 0x3079}, {0xF000, 0xF000}};
+			{0xEC4D, 0xEC4D}, {0xEC53, 0xEC55}, {0xEC80, 0xEC80}, {0xECA2, 0xECA4}, {0x3079, 0x3079}, {0xF000, 0xF000},
+			// ATC (gmc_8_1_d.h): VM apertures 0/1 low/high/CNTL/CNTL2, ATS_CNTL/DEBUG/FAULT_DEBUG/STATUS/FAULT_CNTL,
+			// MISC_CG, L2_CNTL/CNTL2/DEBUG/DEBUG2, VMID_PASID_MAPPING_UPDATE_STATUS and VMID0-15_PASID_MAPPING.
+			{0xCC0, 0xCC7}, {0xCC9, 0xCCD}, {0xCD4, 0xCD8}, {0xCE6, 0xCF6}};
 		// The GFX ring's contents around the read pointer (nvram54: stuck at dword 0x88 with an SRBM request pending).
 		// AMDBaffinHardware +0x3B0 = PM4 engine, +0x50 = its GFX ring (AMDVICommandsRing <- AMDCommandRing: +0x30 size in
 		// dwords, +0x40 CPU mapping, +0x48 GPU address).
@@ -3446,7 +3470,7 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	// CAIL's Stoney set-up ends with stoney_init_enable_ats -> Cail_Spectre_EnableAts, which (if its caps allow) writes
 	// the iGPU's own PCIe capabilities: ATS control (0x2B6 = 0x8000), PRI control/allocation (0x2C4, 0x2CC) and PASID
 	// control (0x2D6). Those are IOMMUv2 features macOS doesn't set up for AMD.
-	add("ats: 2b6=%x 2c4=%x 2cc=%x 2d6=%x\n", iGPU->extendedConfigRead16(0x2B6), iGPU->extendedConfigRead16(0x2C4),
+	add("ats (skipped %u): 2b6=%x 2c4=%x 2cc=%x 2d6=%x\n", atsSkipped, iGPU->extendedConfigRead16(0x2B6), iGPU->extendedConfigRead16(0x2C4),
 		iGPU->extendedConfigRead32(0x2CC), iGPU->extendedConfigRead16(0x2D6));
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
