@@ -128,7 +128,7 @@ static void kickStalledFlip() {
 // accelerator stack match in parallel. When HWServices/the accelerator start first (nvram109/113/124), CAIL's early
 // initialisation (AmdCailServices::earlyInitialize) is never called at all: no registry settings, no SMU load, no
 // PowerPlay, no GUI. Until AMD9500Controller has finished its hardware set-up (initializeProjectDependentResources),
-// their probes report no match; the watcher then re-registers the iGPU so they match again. -crnoacceldefer disables it.
+// their probes report no match; the watcher then re-registers the iGPU so they match again. Off unless -cracceldefer.
 static bool controllerReady, accelDeferred, accelDeferOff;
 static uint32_t accelDeferrals, accelRematches;
 
@@ -448,7 +448,10 @@ void CRDriver::processPatcher(KernelPatcher &) {
 	restoreOn = checkKernelArgument("-crrestore");
 	assrOff = checkKernelArgument("-crnoassr");
 	parseStopAt();
-	accelDeferOff = checkKernelArgument("-crnoacceldefer") || checkKernelArgument("-crnoaccel");
+	// Opt-in (-cracceldefer): nvram127-130 showed the start order wasn't the cause (the controller was always ready
+	// first), and re-registering the iGPU to re-match the accelerator risks a second instance being started and stopped
+	// (nvram132: WindowServer used an accelerator whose VM manager had been torn down by acceleratorWillStop).
+	accelDeferOff = !checkKernelArgument("-cracceldefer") || checkKernelArgument("-crnoaccel");
 
 	logPCIInfo();
 	if (checkKernelArgument("-crmacgpu"))
