@@ -101,6 +101,28 @@ static char stopAtName[64];
 static uint32_t stopAtCount = 1, stopAtHits;
 static const char *stoppedStage;
 
+// Lost flip completions. nvram108/120: after hundreds to thousands of flips, one display-pipe transaction never gets
+// its completion ('txni' -> AMDAccelDisplayPipe::processTransactionInterrupt) while vblank interrupts keep coming and
+// the GPU is idle, so WindowServer never presents again (frozen screen). The watcher delivers it: when the newest
+// transaction has been performed for 250 ms without its completion, call processTransactionInterrupt itself (harmless
+// if it's not pending: it only signals when the pipe's transaction-pending flag is set). -crnoflipkick disables it.
+static void *flipPipe;               // AMDAccelDisplayPipe of the last performTransaction
+static uint64_t flipPerformMs;       // when it was performed
+static uint32_t flipPerforms, flipIrqs, flipKicks;
+static mach_vm_address_t flipProcessIrq;  // AMDAccelDisplayPipe::processTransactionInterrupt
+
+static uint64_t uptimeMs();
+
+static void kickStalledFlip() {
+	if (!flipPipe || !flipProcessIrq || checkKernelArgument("-crnoflipkick"))
+		return;
+	uint32_t performs = __atomic_load_n(&flipPerforms, __ATOMIC_RELAXED), irqs = __atomic_load_n(&flipIrqs, __ATOMIC_RELAXED);
+	if (performs <= irqs || uptimeMs() - flipPerformMs < 250)
+		return;
+	flipKicks++;
+	reinterpret_cast<void (*)(void *, void *, void *)>(flipProcessIrq)(flipPipe, nullptr, nullptr);
+}
+
 // Defined with the SMU loader / black box below; called from the stage wrappers.
 static void smuReloadCp();
 static void snapshotHang(uint32_t arg);
@@ -850,6 +872,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			writeBreadcrumb(t);
 		if (panicAt && t >= panicAt)
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
+		kickStalledFlip();
 		if (__atomic_load_n(&smuStoppedAt, __ATOMIC_RELAXED))
 			self->panicReport(t, now, "CarrizoRed: SMU load stopped by crsmustep.");
 		if (auto *stage = __atomic_load_n(&stoppedStage, __ATOMIC_RELAXED)) {
@@ -1309,6 +1332,13 @@ namespace {
 			case 5: arg = static_cast<uint32_t>(ac); break;
 		}
 		stageLastArg[N] = arg;
+		if (!strcmp(stages[N].name, "uc.dpPerform")) {
+			flipPipe = a;
+			flipPerformMs = uptimeMs();
+			__atomic_fetch_add(&flipPerforms, 1, __ATOMIC_RELAXED);
+		} else if (!strcmp(stages[N].name, "uc.dpIrq")) {
+			__atomic_fetch_add(&flipIrqs, 1, __ATOMIC_RELAXED);
+		}
 		uint32_t calls = stageCalls[N];
 		if (calls == 1 && !strcmp(stages[N].name, "uc.resetHW"))
 			snapshotHang(arg);
@@ -2288,6 +2318,9 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 	if (!checkKernelArgument("-crnotrace") && kext != KextRadeonX4000HWLibs)
 		routeStages(patcher, index, slide, size, kext == KextRadeonX4000 ? InAccel : InHWServices);
 	if (kext == KextRadeonX4000) {
+		flipProcessIrq = patcher.solveSymbol(index,
+			"__ZN34AMDRadeonX4000_AMDAccelDisplayPipe27processTransactionInterruptEP8OSObjectPv", slide, size);
+		patcher.clearError();
 		KernelPatcher::RouteRequest hwInfo {"__ZN29AMDRadeonX4000_AMDAccelDevice15getHardwareInfoEP24_sAMD_GET_HW_INFO_VALUES",
 			wrapGetHardwareInfo, orgGetHardwareInfo};
 		if (!routeChecked(patcher, index, hwInfo, slide, size)) {
@@ -3850,6 +3883,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("kexts: X4000 %u(+%u)@%llx HWServices %u(+%u)@%llx HWLibs %u(+%u)@%llx\n", accelKextLoads[0], accelKextRepeats[0],
 		accelKextSlide[0], accelKextLoads[1], accelKextRepeats[1], accelKextSlide[1], accelKextLoads[2],
 		accelKextRepeats[2], accelKextSlide[2]);
+	add("flips: performed %u, completed %u, kicked %u, last @%llu\n", flipPerforms, flipIrqs, flipKicks,
+		flipPerformMs / 100);
 	add("pg: blocked %u, RLC_PG_CNTL %x\n", pgBlocked, gpuMmio ? gpuMmio[0xEC43] : 0);
 	add("smu reload: %u, last @%llu status %x -> %x resp %x in %u ms\n", smuReload.count, smuReload.at / 100,
 		smuReload.before, smuReload.after, smuReload.resp, smuReload.ms);
