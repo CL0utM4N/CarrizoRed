@@ -3560,6 +3560,25 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			"VINT0 %x\n",
 			wb, ringGpu, vram ? "vram" : "sysmem", m[0x151A], m[0x151B], m[0x1857], m[0x1858], m[0x1859], m[0x1BB4],
 			m[0x1BC4], m[0x1BCF]);
+		// The storm breaker's snapshot (nvram73-90: it fired every accelerated boot, at 501 handler calls, leaving the
+		// accelerator's 48 submissions waiting for completion interrupts), the read pointers the driver wrote, and the
+		// ring's first entries (VI IH entry: src_id, src_data, ring/vmid/pasid, timestamp).
+		if (ihStormBroken) {
+			auto &snap = ihSnapshot;
+			add("ihstorm: at %llu ms after %u calls; RB_CNTL %x BASE %x RPTR %x WPTR %x WPTR_ADDR %x:%x CNTL %x STATUS %x; "
+				"wb %x at %llx; ring cpu %llx gpu %llx size %x %s; rptr writes %u last %x; entries:", snap.ms, snap.calls,
+				snap.rbCntl, snap.rbBase, snap.rptr, snap.wptr, snap.wptrAddrHi, snap.wptrAddrLo, snap.cntl, snap.status,
+				snap.wbValue, snap.wbAddress, snap.ringCpu, snap.ringGpu, snap.size, snap.vram ? "vram" : "sysmem",
+				ihReadPointerWrites, ihLastReadPointer);
+			if (snap.ringCpu)
+				for (uint32_t i = 0; i < 8; i++) {
+					auto *e = reinterpret_cast<volatile uint32_t *>(snap.ringCpu) + i * 4;
+					add(" %x/%x/%x", e[0], e[1], e[2]);
+				}
+			add("\n");
+		} else {
+			add("ih: rptr writes %u last %x\n", ihReadPointerWrites, ihLastReadPointer);
+		}
 		if (auto *gpu = iGPU) {
 			uint16_t command = gpu->configRead16(0x04), status = gpu->configRead16(0x06);
 			uint8_t cap = gpu->configRead8(0x34) & 0xFC;
