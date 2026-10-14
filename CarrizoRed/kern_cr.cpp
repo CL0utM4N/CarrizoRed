@@ -3576,6 +3576,48 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 					add(" %x/%x/%x", e[0], e[1], e[2]);
 				}
 			add("\n");
+			// nvram91: the IH's WPTR register was 0x10 (one entry written) while the CPU saw a zero write-back and an
+			// empty ring. Read the same ring entries and write-back from the carve-out's physical memory (where the GPU's
+			// FB-relative address lands) and through BAR0 (the CPU's VRAM window), to see which side is off.
+			auto readPhys = [](uint64_t phys, uint32_t bytes, void *out) {
+				auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, bytes, kIODirectionIn);
+				auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+				bool mapped = map != nullptr;
+				if (mapped)
+					memcpy(out, reinterpret_cast<const void *>(map->getVirtualAddress()), bytes);
+				OSSafeReleaseNULL(map);
+				OSSafeReleaseNULL(desc);
+				return mapped;
+			};
+			uint64_t carveout = static_cast<uint64_t>(m[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22;
+			uint64_t fbBase = static_cast<uint64_t>(m[Reg::MC_VM_FB_LOCATION] & 0xFFFF) << 24;
+			uint64_t wbMc = static_cast<uint64_t>(snap.wptrAddrHi & 0xFF) << 32 | (snap.wptrAddrLo & ~3U);
+			uint64_t ringFb = snap.ringGpu - fbBase, wbFb = wbMc - fbBase;
+			uint64_t bar0 = 0, bar0Size = 0;
+			if (auto *gpu = iGPU)
+				if (auto *range = gpu->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0)) {
+					bar0 = range->getPhysicalAddress();
+					bar0Size = range->getLength();
+				}
+			add("ihstorm views: ring fb+%llx wb fb+%llx; HDP base %x;", ringFb, wbFb, m[Reg::HDP_NONSURFACE_BASE]);
+			static const struct {
+				const char *name;
+				bool viaBar;
+			} views[] {{"carve-out", false}, {"bar0", true}};
+			for (auto &view : views) {
+				uint64_t base = view.viaBar ? bar0 : carveout;
+				if (!base || (view.viaBar && (ringFb + 64 > bar0Size || wbFb + 4 > bar0Size))) {
+					add(" %s n/a;", view.name);
+					continue;
+				}
+				uint32_t entries[16] {}, wb = 0xFFFFFFFF;
+				bool ok = readPhys(base + ringFb, sizeof(entries), entries) && readPhys(base + wbFb, sizeof(wb), &wb);
+				add(" %s%s wb %x:", view.name, ok ? "" : " (map failed)", wb);
+				for (uint32_t i = 0; i < 4; i++)
+					add(" %x/%x/%x", entries[i * 4], entries[i * 4 + 1], entries[i * 4 + 2]);
+				add(";");
+			}
+			add("\n");
 		} else {
 			add("ih: rptr writes %u last %x\n", ihReadPointerWrites, ihLastReadPointer);
 		}
