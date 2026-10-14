@@ -85,6 +85,25 @@ static uint32_t traceHead;
 static uint32_t stageOpen[MaxTraceStages];
 static uint64_t stageEnterMs[MaxTraceStages];
 static const char *stageNames[MaxTraceStages];
+// crstopat=<stage>[#n]: on entering that traced stage (the n-th time, default 1st), block the calling thread and have the
+// watcher panic with the report. nvram81/82: with real microcode the machine froze somewhere after
+// Stoney_LoadRlcUcode; this walks the stop point forward without a freeze swallowing the report.
+static char stopAtName[64];
+static uint32_t stopAtCount = 1, stopAtHits;
+static const char *stoppedStage;
+
+static void parseStopAt() {
+	if (!PE_parse_boot_argn("crstopat", stopAtName, sizeof(stopAtName)))
+		stopAtName[0] = '\0';
+	if (char *hash = strchr(stopAtName, '#')) {
+		*hash = '\0';
+		stopAtCount = 0;
+		for (char *c = hash + 1; *c >= '0' && *c <= '9'; c++)
+			stopAtCount = stopAtCount * 10 + static_cast<uint32_t>(*c - '0');
+		if (!stopAtCount)
+			stopAtCount = 1;
+	}
+}
 // Interrupt-handler (IH ring) activity, shown by the watcher.
 static uint32_t ihHandlerCalls, ihReadPointerWrites, ihLastReadPointer;
 
@@ -368,6 +387,7 @@ void CRDriver::processPatcher(KernelPatcher &) {
 	bpcCapOff = checkKernelArgument("-crnobpccap");
 	restoreOn = checkKernelArgument("-crrestore");
 	assrOff = checkKernelArgument("-crnoassr");
+	parseStopAt();
 
 	logPCIInfo();
 	if (checkKernelArgument("-crmacgpu"))
@@ -802,6 +822,11 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
 		if (__atomic_load_n(&smuStoppedAt, __ATOMIC_RELAXED))
 			self->panicReport(t, now, "CarrizoRed: SMU load stopped by crsmustep.");
+		if (auto *stage = __atomic_load_n(&stoppedStage, __ATOMIC_RELAXED)) {
+			static char reason[160];
+			snprintf(reason, sizeof(reason), "CarrizoRed: stopped on entering %s (#%u, crstopat).", stage, stopAtCount);
+			self->panicReport(t, now, reason);
+		}
 
 		// Watchdog: a traced call that never returns (a hard hang with this CPU still alive) becomes a panic that
 		// names it and stays on screen (debug=0x100). -crnowatchdog disables this.
@@ -1195,6 +1220,12 @@ namespace {
 			case 5: arg = static_cast<uint32_t>(ac); break;
 		}
 		traceEvent(stages[N].name, false, arg);
+		if (stopAtName[0] && !strcmp(stopAtName, stages[N].name) &&
+			__atomic_add_fetch(&stopAtHits, 1, __ATOMIC_RELAXED) == stopAtCount) {
+			__atomic_store_n(&stoppedStage, stages[N].name, __ATOMIC_RELAXED);
+			for (;;)
+				IOSleep(1000);
+		}
 		if (stages[N].sync) {
 			IOLog("CarrizoRed: => %s\n", stages[N].name);
 			IOSleep(30);
