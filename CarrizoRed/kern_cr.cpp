@@ -78,12 +78,13 @@ struct TraceEvent {
 	bool exit;
 };
 
-static constexpr size_t TraceRingSize = 512, MaxTraceStages = 128;
+static constexpr size_t TraceRingSize = 512, MaxTraceStages = 160;
 static constexpr uint64_t WatchdogMs = 60000;
 static TraceEvent traceRing[TraceRingSize];
 static uint32_t traceHead;
 static uint32_t stageOpen[MaxTraceStages];
 static uint64_t stageEnterMs[MaxTraceStages];
+static uint32_t stageCalls[MaxTraceStages];
 static const char *stageNames[MaxTraceStages];
 // crstopat=<stage>[#n]: on entering that traced stage (the n-th time, default 1st), block the calling thread and have the
 // watcher panic with the report. nvram81/82: with real microcode the machine froze somewhere after
@@ -1199,6 +1200,19 @@ namespace {
 		{"_CAILEarlyASICInit", "CAILEarlyASICInit", InHWLibs, true, false, 0},
 		{"_Cail_Stoney_InitCPJumpTable", "Cail_Stoney_InitCPJumpTable", InHWLibs, true, false, 0},
 		{"_InitializeRlcHistoryBuffer", "InitializeRlcHistoryBuffer", InHWLibs, true, false, 0},
+		// User space and the GPU (nvram88/89: accelerator fully up, but at 75 s nothing beyond Apple's start-up packets
+		// had reached the ring, and the panel was backlit black). Who opens the accelerator, and does any command
+		// buffer get submitted? Counted ("uc:" line in the report), not summarised.
+		{"__ZN29AMDRadeonX4000_AMDAccelShared4initEP22IOGraphicsAccelerator2P4task", "uc.shared", InAccel, false, false, 0},
+		{"__ZN39AMDRadeonX4000_AMDAccelSharedUserClient5startEP9IOService", "uc.sharedUC", InAccel, false, false, 0},
+		{"__ZN35AMDRadeonX4000_AMDAccelCommandQueue18initSubmitChannelsEv", "uc.cmdq", InAccel, false, false, 0},
+		{"__ZN35AMDRadeonX4000_AMDAccelCommandQueue14submitCommandsEv", "uc.submitCommands", InAccel, false, false, 0},
+		{"__ZN35AMDRadeonX4000_AMDAccelCommandQueue20processCommandBufferEjj", "uc.process", InAccel, false, false, 0},
+		{"__ZN29AMDRadeonX4000_AMDSWScheduler19submitCommandBufferEmP30AMD_SUBMIT_COMMAND_BUFFER_INFOP16AMD_BARRIER_INFO",
+			"uc.swsubmit", InAccel, false, false, 0},
+		// The PM4/DMA channels' own versions tail-call this through the vtable (RIP-relative, not routable).
+		{"__ZN27AMDRadeonX4000_AMDHWChannel19submitCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO", "uc.hwsubmit",
+			InAccel, false, false, 0},
 	};
 
 	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
@@ -1209,6 +1223,7 @@ namespace {
 		static_assert(N < MaxTraceStages, "too many traced stages");
 		stageNames[N] = stages[N].name;
 		stageEnterMs[N] = uptimeMs();
+		__atomic_fetch_add(&stageCalls[N], 1, __ATOMIC_RELAXED);
 		__atomic_fetch_add(&stageOpen[N], 1, __ATOMIC_RELAXED);
 		uint64_t ab = reinterpret_cast<uint64_t>(b), ac = reinterpret_cast<uint64_t>(c), ad = reinterpret_cast<uint64_t>(d);
 		uint32_t arg = 0;
@@ -1243,7 +1258,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 123, "one wrapper per stage");
+		static_assert(arrsize(stages) == 130, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -1261,12 +1276,15 @@ namespace {
 			CR_WRAP(103), CR_WRAP(104), CR_WRAP(105),
 			CR_WRAP(106), CR_WRAP(107), CR_WRAP(108), CR_WRAP(109), CR_WRAP(110), CR_WRAP(111), CR_WRAP(112), CR_WRAP(113),
 			CR_WRAP(114), CR_WRAP(115), CR_WRAP(116), CR_WRAP(117), CR_WRAP(118), CR_WRAP(119), CR_WRAP(120), CR_WRAP(121), CR_WRAP(122),
+			CR_WRAP(123), CR_WRAP(124), CR_WRAP(125), CR_WRAP(126), CR_WRAP(127), CR_WRAP(128), CR_WRAP(129),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
 				continue;
 			KernelPatcher::RouteRequest request {stages[i].symbol, wrappers[i], stages[i].org};
-			if (!routeChecked(patcher, index, request, slide, size)) {
+			if (routeChecked(patcher, index, request, slide, size)) {
+				stageNames[i] = stages[i].name;
+			} else {
 				SYSLOG("cr", "trace: failed to route %s (error %d)", stages[i].name, patcher.getError());
 				traceNote("noroute:%s(%d) ", stages[i].name, patcher.getError());
 				patcher.clearError();
@@ -3906,6 +3924,11 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
 		breadcrumbNoOptions ? ", no /options" : "");
+	add("uc:");
+	for (size_t i = 0; i < MaxTraceStages; i++)
+		if (stageNames[i] && !strncmp(stageNames[i], "uc.", 3))
+			add(" %s=%u%s", stageNames[i] + 3, stageCalls[i], stageOpen[i] ? "(open)" : "");
+	add("\n");
 	add("trace: %s\nlast events:", traceSummary);
 	// Newest 16 events, oldest first, without the repetitive attribute and vblank-wait calls.
 	uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
