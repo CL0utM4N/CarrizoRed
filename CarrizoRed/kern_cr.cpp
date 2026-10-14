@@ -138,6 +138,9 @@ static uint32_t accelDeferrals, accelRematches;
 // came). Put our copy back on entry to setupCAIL too, and count how often it was missing there.
 static uint32_t binImageSetupChecks, binImageSetupMissing;
 static void restoreVbiosImageForSetup();
+// The live HWLibs copy (see checkLiveHwlibs): nvram124/127/128 called earlyInitialize through the CAIL object's vtable
+// with ATY,bin_image present, yet none of the HWLibs hooks ran.
+static void checkLiveHwlibs(void *hardware);
 
 // Defined with the SMU loader / black box below; called from the stage wrappers.
 static void smuReloadCp();
@@ -1386,8 +1389,10 @@ namespace {
 			IOLog("CarrizoRed: => %s\n", stages[N].name);
 			IOSleep(30);
 		}
-		if (!strcmp(stages[N].name, "hw.setupCAIL"))
+		if (!strcmp(stages[N].name, "hw.setupCAIL")) {
 			restoreVbiosImageForSetup();
+			checkLiveHwlibs(a);
+		}
 		if (!controllerReady && !accelDeferOff &&
 			(!strcmp(stages[N].name, "hws.probe") || !strcmp(stages[N].name, "accel.probe"))) {
 			accelDeferred = true;
@@ -2343,6 +2348,43 @@ static bool routeHwlibs(KernelPatcher &patcher, size_t index, KernelPatcher::Rou
 // DisableCailLoadUcode override, PowerPlay's Dummy back-end key and the ATS skip never happen; nvram72/73, both boots
 // where the display controller had started before the accelerator kexts loaded, after which the property was gone).
 // Put our copy back if it's missing.
+// Where HWLibs was patched, and the live copy's earlyInitialize (from the CAIL object AMDHardware+0x338 that setupCAIL
+// calls through vtable +0x10). If they differ, re-apply the HWLibs patches at the live copy's address.
+static KernelPatcher *hwlibsPatcher;
+static size_t hwlibsIndex, hwlibsSize;
+static mach_vm_address_t hwlibsSlide, hwlibsEarlyInit, hwlibsLiveEarlyInit;
+static uint32_t hwlibsRepatches, hwlibsLiveChecks;
+static void (*hwlibsRepatch)(KernelPatcher &, size_t, mach_vm_address_t, size_t);
+
+static void checkLiveHwlibs(void *hardware) {
+	hwlibsLiveChecks++;
+	if (!hardware || !hwlibsEarlyInit)
+		return;
+	auto *cail = *reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(hardware) + 0x338);
+	if (!cail)
+		return;
+	auto *vtable = *reinterpret_cast<mach_vm_address_t **>(cail);
+	if (!vtable)
+		return;
+	hwlibsLiveEarlyInit = vtable[2];
+	if (hwlibsLiveEarlyInit == hwlibsEarlyInit || !hwlibsPatcher || !hwlibsRepatch ||
+		checkKernelArgument("-crnohwlibsrepatch"))
+		return;
+	// Same image elsewhere: a page-aligned offset, and a normal prologue (push rbp; mov rbp, rsp) at the live entry.
+	auto *entry = reinterpret_cast<const uint8_t *>(hwlibsLiveEarlyInit);
+	if (((hwlibsLiveEarlyInit - hwlibsEarlyInit) & 0xFFF) || entry[0] != 0x55 || entry[1] != 0x48 || entry[2] != 0x89 ||
+		entry[3] != 0xE5) {
+		traceNote("hwlibs=live?%llx ", static_cast<uint64_t>(hwlibsLiveEarlyInit));
+		return;
+	}
+	mach_vm_address_t liveSlide = hwlibsSlide + (hwlibsLiveEarlyInit - hwlibsEarlyInit);
+	hwlibsRepatches++;
+	traceNote("hwlibs=live@%llx ", static_cast<uint64_t>(liveSlide));
+	hwlibsPatcher->updateRunningInfo(hwlibsIndex, liveSlide, hwlibsSize, true);
+	hwlibsSlide = liveSlide;
+	hwlibsRepatch(*hwlibsPatcher, hwlibsIndex, liveSlide, hwlibsSize);
+}
+
 static void restoreVbiosImageForSetup() {
 	binImageSetupChecks++;
 	if (vbiosImage && vbiosOwner && !vbiosOwner->getProperty(VBIOS::ImageProperty)) {
@@ -2384,6 +2426,17 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		}
 	}
 	if (kext == KextRadeonX4000HWLibs) {
+		hwlibsPatcher = &patcher;
+		hwlibsIndex = index;
+		hwlibsSize = size;
+		hwlibsSlide = slide;
+		hwlibsEarlyInit = patcher.solveSymbol(index,
+			"__ZN15AmdCailServices15earlyInitializeEP23_MCIL_SERVICE_CALLBACKSP15_CailInitialize", slide, size);
+		patcher.clearError();
+		if (!hwlibsRepatch)
+			hwlibsRepatch = [](KernelPatcher &p, size_t i, mach_vm_address_t sl, size_t sz) {
+				callback->traceKext(p, i, sl, sz, KextRadeonX4000HWLibs);
+			};
 		ppDummyForced = (family == ChipFamily::Stoney || family == ChipFamily::Carrizo) &&
 			!checkKernelArgument("-crnoppdummy");
 		KernelPatcher::RouteRequest requests[] {
@@ -3938,6 +3991,9 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("kexts: X4000 %u(+%u)@%llx HWServices %u(+%u)@%llx HWLibs %u(+%u)@%llx\n", accelKextLoads[0], accelKextRepeats[0],
 		accelKextSlide[0], accelKextLoads[1], accelKextRepeats[1], accelKextSlide[1], accelKextLoads[2],
 		accelKextRepeats[2], accelKextSlide[2]);
+	add("hwlibs: patched @%llx earlyInit %llx, live earlyInit %llx (checks %u), repatched %u\n",
+		static_cast<uint64_t>(hwlibsSlide), static_cast<uint64_t>(hwlibsEarlyInit),
+		static_cast<uint64_t>(hwlibsLiveEarlyInit), hwlibsLiveChecks, hwlibsRepatches);
 	add("start order: controller ready %d, accel probes deferred %u, rematches %u\n", controllerReady,
 		accelDeferrals, accelRematches);
 	add("flips: performed %u, completed %u, kicked %u, last @%llu\n", flipPerforms, flipIrqs, flipKicks,
