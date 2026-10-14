@@ -2354,6 +2354,9 @@ static KernelPatcher *hwlibsPatcher;
 static size_t hwlibsIndex, hwlibsSize;
 static mach_vm_address_t hwlibsSlide, hwlibsEarlyInit, hwlibsLiveEarlyInit;
 static uint32_t hwlibsRepatches, hwlibsLiveChecks;
+static IOMemoryDescriptor *hwlibsWired;
+static uint8_t hwlibsEntryBytes[8];  // earlyInitialize's first bytes at setupCAIL (a Lilu route starts with a jump)
+static bool hwlibsUnpatched;
 static void (*hwlibsRepatch)(KernelPatcher &, size_t, mach_vm_address_t, size_t);
 
 static void checkLiveHwlibs(void *hardware) {
@@ -2367,8 +2370,19 @@ static void checkLiveHwlibs(void *hardware) {
 	if (!vtable)
 		return;
 	hwlibsLiveEarlyInit = vtable[2];
-	if (hwlibsLiveEarlyInit == hwlibsEarlyInit || !hwlibsPatcher || !hwlibsRepatch ||
-		checkKernelArgument("-crnohwlibsrepatch"))
+	memcpy(hwlibsEntryBytes, reinterpret_cast<const void *>(hwlibsLiveEarlyInit), sizeof(hwlibsEntryBytes));
+	// Still Apple's prologue (push rbp; mov rbp, rsp) where our route's jump should be: the patches are gone. Apply
+	// them again at the same address.
+	if (hwlibsLiveEarlyInit == hwlibsEarlyInit) {
+		hwlibsUnpatched = hwlibsEntryBytes[0] == 0x55 && hwlibsEntryBytes[1] == 0x48;
+		if (hwlibsUnpatched && hwlibsPatcher && hwlibsRepatch && !checkKernelArgument("-crnohwlibsrepatch")) {
+			hwlibsRepatches++;
+			traceNote("hwlibs=repatch ");
+			hwlibsRepatch(*hwlibsPatcher, hwlibsIndex, hwlibsSlide, hwlibsSize);
+		}
+		return;
+	}
+	if (!hwlibsPatcher || !hwlibsRepatch || checkKernelArgument("-crnohwlibsrepatch"))
 		return;
 	// Same image elsewhere: a page-aligned offset, and a normal prologue (push rbp; mov rbp, rsp) at the live entry.
 	auto *entry = reinterpret_cast<const uint8_t *>(hwlibsLiveEarlyInit);
@@ -2426,6 +2440,15 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		}
 	}
 	if (kext == KextRadeonX4000HWLibs) {
+		// Wire the image before patching: nvram129 had the CAIL object call exactly the patched earlyInitialize, yet
+		// no HWLibs hook ever ran, as if its code pages had been dropped and re-read from the kext collection (losing
+		// every patch). Locked pages can't be.
+		if (!hwlibsWired && !checkKernelArgument("-crnohwlibswire")) {
+			hwlibsWired = IOMemoryDescriptor::withAddressRange(slide, size, kIODirectionInOut, kernel_task);
+			if (hwlibsWired && hwlibsWired->prepare() != kIOReturnSuccess)
+				OSSafeReleaseNULL(hwlibsWired);
+			traceNote("hwlibs=%s ", hwlibsWired ? "wired" : "notwired");
+		}
 		hwlibsPatcher = &patcher;
 		hwlibsIndex = index;
 		hwlibsSize = size;
@@ -3991,9 +4014,11 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("kexts: X4000 %u(+%u)@%llx HWServices %u(+%u)@%llx HWLibs %u(+%u)@%llx\n", accelKextLoads[0], accelKextRepeats[0],
 		accelKextSlide[0], accelKextLoads[1], accelKextRepeats[1], accelKextSlide[1], accelKextLoads[2],
 		accelKextRepeats[2], accelKextSlide[2]);
-	add("hwlibs: patched @%llx earlyInit %llx, live earlyInit %llx (checks %u), repatched %u\n",
-		static_cast<uint64_t>(hwlibsSlide), static_cast<uint64_t>(hwlibsEarlyInit),
-		static_cast<uint64_t>(hwlibsLiveEarlyInit), hwlibsLiveChecks, hwlibsRepatches);
+	add("hwlibs: patched @%llx earlyInit %llx, live earlyInit %llx (checks %u) bytes %02x %02x %02x %02x %02x%s, "
+		"repatched %u, wired %d\n", static_cast<uint64_t>(hwlibsSlide), static_cast<uint64_t>(hwlibsEarlyInit),
+		static_cast<uint64_t>(hwlibsLiveEarlyInit), hwlibsLiveChecks, hwlibsEntryBytes[0], hwlibsEntryBytes[1],
+		hwlibsEntryBytes[2], hwlibsEntryBytes[3], hwlibsEntryBytes[4], hwlibsUnpatched ? " (UNPATCHED)" : "",
+		hwlibsRepatches, hwlibsWired != nullptr);
 	add("start order: controller ready %d, accel probes deferred %u, rematches %u\n", controllerReady,
 		accelDeferrals, accelRematches);
 	add("flips: performed %u, completed %u, kicked %u, last @%llu\n", flipPerforms, flipIrqs, flipKicks,
