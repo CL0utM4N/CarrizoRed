@@ -142,6 +142,25 @@ static void restoreVbiosImageForSetup();
 // with ATY,bin_image present, yet none of the HWLibs hooks ran.
 static void checkLiveHwlibs(void *hardware);
 
+// GPU not responding: every register reads 0xFFFFFFFF, the PCI "nobody home" value (nvram99/137: CAIL's waits read
+// RLC_SAFE_MODE as 0xFFFFFFFF and nothing after that could work; a full power-off fixed it). Checked at start-up
+// (probeMMIO) and by the watcher every tick: GRBM_STATUS and MC_VM_FB_LOCATION are never all-ones on a live GPU.
+static bool gpuDeadAtStart;
+static uint64_t gpuDeadMs;  // uptime when it was first seen dead (0: never)
+static uint64_t uptimeMs();
+
+static bool gpuRegistersDead(volatile uint32_t *mmio) {
+	return mmio && mmio[0x2004] == 0xFFFFFFFF && mmio[0x809] == 0xFFFFFFFF;  // GRBM_STATUS, MC_VM_FB_LOCATION
+}
+
+static void checkGpuAlive(volatile uint32_t *mmio) {
+	if (!gpuDeadMs && gpuRegistersDead(mmio)) {
+		uint64_t ms = uptimeMs();
+		gpuDeadMs = ms ? ms : 1;
+		IOLog("CarrizoRed: the GPU stopped responding (registers read 0xFFFFFFFF); power the machine off fully\n");
+	}
+}
+
 // Defined with the SMU loader / black box below; called from the stage wrappers.
 static void smuReloadCp();
 static void snapshotHang(uint32_t arg);
@@ -898,6 +917,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (panicAt && t >= panicAt)
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
 		kickStalledFlip();
+		checkGpuAlive(gpuMmio);
 		if (accelDeferred && controllerReady) {
 			accelDeferred = false;
 			accelRematches++;
@@ -908,7 +928,10 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		// report on an EFI without crpanicat. If the accelerator kexts loaded but the microcode still isn't loaded at
 		// 120 s, panic with the report. -crnoautopanic disables it.
 		if (t >= 120 && accelKextLoads[2] && !smuLoadOk() && !autoPanicOff)
-			self->panicReport(t, now, "CarrizoRed: the accelerator didn't start (no SMU microcode load by 120 s).");
+			self->panicReport(t, now, gpuDeadMs ?
+				"CarrizoRed: the GPU stopped responding (registers read 0xFFFFFFFF), so the accelerator couldn't start. "
+				"Not a driver bug: power the machine off fully (hold power, wait 10 s) before the next boot." :
+				"CarrizoRed: the accelerator didn't start (no SMU microcode load by 120 s).");
 		if (__atomic_load_n(&smuStoppedAt, __ATOMIC_RELAXED))
 			self->panicReport(t, now, "CarrizoRed: SMU load stopped by crsmustep.");
 		if (auto *stage = __atomic_load_n(&stoppedStage, __ATOMIC_RELAXED)) {
@@ -929,7 +952,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				stuck = __atomic_load_n(&stageOpen[i], __ATOMIC_RELAXED) && ms - stageEnterMs[i] > WatchdogMs;
 			if (stuck) {
 				static char reason[512];
-				size_t len = static_cast<size_t>(snprintf(reason, sizeof(reason), "CarrizoRed watchdog: open stages:"));
+				size_t len = static_cast<size_t>(snprintf(reason, sizeof(reason), "%sCarrizoRed watchdog: open stages:",
+					gpuDeadMs ? "GPU NOT RESPONDING (power off fully). " : ""));
 				for (size_t i = 0; i < MaxTraceStages && len < sizeof(reason); i++)
 					if (__atomic_load_n(&stageOpen[i], __ATOMIC_RELAXED))
 						len += static_cast<size_t>(snprintf(reason + len, sizeof(reason) - len, " %s(%llu ms)",
@@ -3796,6 +3820,12 @@ void CRDriver::probeMMIO() {
 	auto fbLocation = mmio[Reg::MC_VM_FB_LOCATION];
 	auto fbOffset = mmio[Reg::MC_VM_FB_OFFSET];
 	auto grbmStatus = mmio[Reg::GRBM_STATUS];
+	if (gpuRegistersDead(mmio)) {
+		gpuDeadAtStart = true;
+		checkGpuAlive(mmio);
+		SYSLOG("cr", "the GPU isn't responding at start-up (registers read 0xFFFFFFFF): power the machine off fully");
+		iGPU->setProperty("CarrizoRed,gpu-dead", true);
+	}
 	auto gbAddrConfig = mmio[Reg::GB_ADDR_CONFIG];
 	auto shaderArrayConfig = mmio[Reg::CC_GC_SHADER_ARRAY_CONFIG];
 	auto rbBackendDisable = mmio[Reg::CC_RB_BACKEND_DISABLE];
@@ -4092,6 +4122,9 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			add(i == 40 ? " | %x" : " %x", hangSnap.ring[i]);
 		add("\n");
 	}
+	if (gpuDeadMs)
+		add("GPU NOT RESPONDING (registers read ffffffff) %s, first seen @%llu: power off fully before the next boot\n",
+			gpuDeadAtStart ? "from start-up" : "since", gpuDeadMs / 100);
 	add("kexts: X4000 %u(+%u)@%llx HWServices %u(+%u)@%llx HWLibs %u(+%u)@%llx\n", accelKextLoads[0], accelKextRepeats[0],
 		accelKextSlide[0], accelKextLoads[1], accelKextRepeats[1], accelKextSlide[1], accelKextLoads[2],
 		accelKextRepeats[2], accelKextSlide[2]);
