@@ -1230,6 +1230,11 @@ namespace {
 			false, 0},
 		{"__ZN17AMD9500Controller19hwSetDisplaySurfaceEP11CRTC_PARAMSjj", "uc.setSurface", InController, false, false, 2},
 		{"__ZN17AMD9500Controller26waitForSurfaceFlipCompleteEhb", "uc.flipWait", InController, false, false, 0},
+		// nvram106: 323 transactions but 322 transaction interrupts, then nothing: the display pipe's interrupt is the
+		// framebuffer's (IOFramebuffer::setInterruptState on its sources); last argument = the state (1 on, 0 off).
+		{"__ZN14AMDFramebuffer17setInterruptStateEPvj", "uc.fbIrqState", InFramebuffer, false, false, 2},
+		{"__ZN14AMDFramebuffer24registerForInterruptTypeEjPFvP8OSObjectPvES1_S2_PS2_", "uc.fbIrqRegister",
+			InFramebuffer, false, false, 1},
 	};
 
 	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
@@ -1276,7 +1281,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 139, "one wrapper per stage");
+		static_assert(arrsize(stages) == 141, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -1296,7 +1301,7 @@ namespace {
 			CR_WRAP(114), CR_WRAP(115), CR_WRAP(116), CR_WRAP(117), CR_WRAP(118), CR_WRAP(119), CR_WRAP(120), CR_WRAP(121), CR_WRAP(122),
 			CR_WRAP(123), CR_WRAP(124), CR_WRAP(125), CR_WRAP(126), CR_WRAP(127), CR_WRAP(128), CR_WRAP(129),
 			CR_WRAP(130), CR_WRAP(131), CR_WRAP(132), CR_WRAP(133), CR_WRAP(134), CR_WRAP(135), CR_WRAP(136), CR_WRAP(137),
-			CR_WRAP(138),
+			CR_WRAP(138), CR_WRAP(139), CR_WRAP(140),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -3657,12 +3662,14 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("hwinfo: calls %u ret %x fixed %u spoofed %u; ref %llx sys %llx mem %llx d8 %llx; device %llx raster %llx shader %llx\n",
 		hwInfoCalls, hwInfoRet, hwInfoFixed, hwInfoSpoofed, hwInfoValues[0], hwInfoValues[1], hwInfoValues[2], hwInfoValues[3],
 		hwInfoValues[4], hwInfoValues[5], hwInfoValues[6]);
-	add("uc:");
+	add("uc (now @%llu):", uptimeMs() / 100);
 	for (size_t i = 0; i < MaxTraceStages; i++)
 		if (stageNames[i] && !strncmp(stageNames[i], "uc.", 3)) {
 			add(" %s=%u%s", stageNames[i] + 3, stageCalls[i], stageOpen[i] ? "(open)" : "");
 			if (stageCalls[i] && stageLastArg[i])
 				add("(last %x)", stageLastArg[i]);
+			if (stageCalls[i])
+				add("@%llu", stageEnterMs[i] / 100);  // last entry, in 0.1 s of uptime
 		}
 	add("\n");
 	if (!checkKernelArgument("-crnoaccel")) {
@@ -4184,7 +4191,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	for (uint32_t i = head; i != 0 && head - i < TraceRingSize && count < 16;) {
 		i--;
 		auto &event = traceRing[i % TraceRingSize];
-		if (!event.name || !strncmp(event.name, "fb.setAttribute", 15) || !strncmp(event.name, "tg.wait", 7))
+		if (!event.name || !strncmp(event.name, "fb.setAttribute", 15) || !strncmp(event.name, "tg.wait", 7) ||
+			!strncmp(event.name, "uc.", 3))
 			continue;
 		picked[count++] = i;
 	}
