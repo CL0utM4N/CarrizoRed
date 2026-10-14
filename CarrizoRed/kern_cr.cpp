@@ -3812,6 +3812,41 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		for (auto reg : gfxRegs)
 			add(" %x=%x", reg, gpuMmio[reg]);
 		add("\n");
+		// SDMA0 (nvram98: interrupts work, the accelerator's 25 submissions reached the HW channel, but none landed on
+		// the graphics ring; blits go to SDMA). SDMA0_CNTL, STATUS, STATUS1, F32_CNTL, GFX_RB_CNTL, BASE, BASE_HI,
+		// RPTR, WPTR, RPTR_ADDR_HI/LO, IB_CNTL, CONTEXT_STATUS; then the ring's first dwords and those before the
+		// read pointer, from the carve-out when the ring is in VRAM.
+		{
+			static const uint16_t sdmaRegs[] {0x3404, 0x340D, 0x340E, 0x3412, 0x3480, 0x3481, 0x3482, 0x3483, 0x3484,
+				0x3488, 0x3489, 0x348A, 0x3491};
+			add("sdma:");
+			for (auto reg : sdmaRegs)
+				add(" %x=%x", reg, gpuMmio[reg]);
+			uint64_t ringMc = static_cast<uint64_t>(gpuMmio[0x3481]) << 8 | static_cast<uint64_t>(gpuMmio[0x3482]) << 40;
+			uint64_t fbBase = static_cast<uint64_t>(gpuMmio[Reg::MC_VM_FB_LOCATION] & 0xFFFF) << 24;
+			uint64_t fbTop = (static_cast<uint64_t>(gpuMmio[Reg::MC_VM_FB_LOCATION] >> 16) + 1) << 24;
+			uint32_t rptr = (gpuMmio[0x3483] >> 2) & 0xFFFF;  // bytes -> dwords
+			if (ringMc >= fbBase && ringMc + 0x10000 <= fbTop) {
+				uint64_t phys = (static_cast<uint64_t>(gpuMmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22) + ringMc - fbBase;
+				uint32_t start = rptr > 16 ? rptr - 16 : 0;
+				auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, 0x10000, kIODirectionIn);
+				auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+				if (map) {
+					auto *ring = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
+					add(" | ring vram:");
+					for (uint32_t i = 0; i < 8; i++)
+						add(" %x", ring[i]);
+					add(" | @%x:", start);
+					for (uint32_t i = start; i < start + 24 && i < 0x4000; i++)
+						add(" %x", ring[i]);
+				}
+				OSSafeReleaseNULL(map);
+				OSSafeReleaseNULL(desc);
+			} else {
+				add(" | ring at %llx (not VRAM)", ringMc);
+			}
+			add("\n");
+		}
 		// nvram51: the CP still stalls at ring dword 0x88 with fetches pending. CP_STALLED_STAT3/1/2, CP_BUSY_STAT,
 		// CP_STAT, the ME/PFP/CE header dumps (last packet headers) and the CPF status (0x219C-0x21A8); the ring and
 		// indirect-buffer registers (0x21C0-0x21D7); VM context 0/1 protection fault status and address
