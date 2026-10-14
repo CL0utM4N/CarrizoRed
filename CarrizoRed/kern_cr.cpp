@@ -301,7 +301,7 @@ enum KextIndex : size_t {
 	KextCount,
 };
 
-static uint32_t accelKextLoads[3];         // X4000, HWServices, HWLibs: times Lilu handed us each
+static uint32_t accelKextLoads[3], accelKextRepeats[3];  // X4000, HWServices, HWLibs: new loads, repeats (skipped)
 static mach_vm_address_t accelKextSlide[3];  // and where the last load was
 
 static KernelPatcher::KextInfo kexts[KextCount] {
@@ -473,8 +473,15 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 			static_cast<unsigned long>(size));
 		// The acceleration kexts load late (IOKit matching), if at all: note it, for the black box.
 		if (i == KextRadeonX4000 || i == KextRadeonX4000HWServices || i == KextRadeonX4000HWLibs) {
-			traceNote("kext:%s ", i == KextRadeonX4000 ? "X4000" : i == KextRadeonX4000HWServices ? "HWServices" : "HWLibs");
+			const char *name = i == KextRadeonX4000 ? "X4000" : i == KextRadeonX4000HWServices ? "HWServices" : "HWLibs";
 			size_t k = i == KextRadeonX4000 ? 0 : i == KextRadeonX4000HWServices ? 1 : 2;
+			// Reloadable kexts (see kexts[]) also come back here for an image we've already patched (nvram116: patched
+			// twice, invalid opcode in AMDSWScheduler::advance). Only a new load address is a new copy.
+			if (accelKextLoads[k] && accelKextSlide[k] == slide) {
+				accelKextRepeats[k]++;
+				return;
+			}
+			traceNote("kext:%s ", name);
 			accelKextLoads[k]++;
 			accelKextSlide[k] = slide;
 		}
@@ -3789,8 +3796,9 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			add(i == 40 ? " | %x" : " %x", hangSnap.ring[i]);
 		add("\n");
 	}
-	add("kexts: X4000 %ux@%llx HWServices %ux@%llx HWLibs %ux@%llx\n", accelKextLoads[0], accelKextSlide[0],
-		accelKextLoads[1], accelKextSlide[1], accelKextLoads[2], accelKextSlide[2]);
+	add("kexts: X4000 %u(+%u)@%llx HWServices %u(+%u)@%llx HWLibs %u(+%u)@%llx\n", accelKextLoads[0], accelKextRepeats[0],
+		accelKextSlide[0], accelKextLoads[1], accelKextRepeats[1], accelKextSlide[1], accelKextLoads[2],
+		accelKextRepeats[2], accelKextSlide[2]);
 	add("smu reload: %u, last @%llu status %x -> %x resp %x in %u ms\n", smuReload.count, smuReload.at / 100,
 		smuReload.before, smuReload.after, smuReload.resp, smuReload.ms);
 	add("uc (now @%llu):", uptimeMs() / 100);
