@@ -132,6 +132,13 @@ static void kickStalledFlip() {
 static bool controllerReady, accelDeferred, accelDeferOff;
 static uint32_t accelDeferrals, accelRematches;
 
+// AMDHardware::setupCAIL reads the VBIOS from the iGPU's ATY,bin_image and, if it's missing, returns before ever
+// initialising CAIL (AmdCailServices::earlyInitialize): no registry settings, no SMU load, no PowerPlay, no GUI. The
+// property can be gone by then (nvram124/127; the restore in wrapCailEarlyInitialize never ran because that call never
+// came). Put our copy back on entry to setupCAIL too, and count how often it was missing there.
+static uint32_t binImageSetupChecks, binImageSetupMissing;
+static void restoreVbiosImageForSetup();
+
 // Defined with the SMU loader / black box below; called from the stage wrappers.
 static void smuReloadCp();
 static void snapshotHang(uint32_t arg);
@@ -1379,6 +1386,8 @@ namespace {
 			IOLog("CarrizoRed: => %s\n", stages[N].name);
 			IOSleep(30);
 		}
+		if (!strcmp(stages[N].name, "hw.setupCAIL"))
+			restoreVbiosImageForSetup();
 		if (!controllerReady && !accelDeferOff &&
 			(!strcmp(stages[N].name, "hws.probe") || !strcmp(stages[N].name, "accel.probe"))) {
 			accelDeferred = true;
@@ -2334,6 +2343,15 @@ static bool routeHwlibs(KernelPatcher &patcher, size_t index, KernelPatcher::Rou
 // DisableCailLoadUcode override, PowerPlay's Dummy back-end key and the ATS skip never happen; nvram72/73, both boots
 // where the display controller had started before the accelerator kexts loaded, after which the property was gone).
 // Put our copy back if it's missing.
+static void restoreVbiosImageForSetup() {
+	binImageSetupChecks++;
+	if (vbiosImage && vbiosOwner && !vbiosOwner->getProperty(VBIOS::ImageProperty)) {
+		vbiosOwner->setProperty(VBIOS::ImageProperty, vbiosImage);
+		binImageSetupMissing++;
+		traceNote("binimage@setupCAIL=restored ");
+	}
+}
+
 static mach_vm_address_t orgCailEarlyInitialize;
 static uint32_t binImageChecks, binImageRestores, earlyInitResult = 0xFFFFFFFF;
 
@@ -4443,8 +4461,9 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			smuFormatCalls, smuCailSize, smuRegionStart, smuLoad.blockOffset, smuLoad.mc, smuLoad.phys, smuLoad.tasks,
 			smuLoad.resp[0], smuLoad.resp[1], smuLoad.resp[2], smuLoad.resp[3], smuLoad.resp[4], smuLoad.resp[5],
 			smuLoad.before, smuLoad.after, smuLoad.ms, smuLoad.mecBase[0], smuLoad.mecBase[1], smuLoad.mecBase[2]);
-		add("hooks: hwlibs routed %x failed %x; peci reads %u; bin_image checks %u restores %u, earlyInitialize %x\n",
-			hwlibsHooks, hwlibsHookFails, peciReads, binImageChecks, binImageRestores, earlyInitResult);
+		add("hooks: hwlibs routed %x failed %x; peci reads %u; bin_image at setupCAIL %u missing %u, at earlyInit %u restores %u, earlyInitialize %x\n",
+			hwlibsHooks, hwlibsHookFails, peciReads, binImageSetupChecks, binImageSetupMissing, binImageChecks, binImageRestores,
+			earlyInitResult);
 	}
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
