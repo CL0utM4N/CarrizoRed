@@ -2020,6 +2020,41 @@ static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
 	return ret;
 }
 
+// Metal device creation. The user-space Metal driver (AMDMTLBronzeDriver) asks AMDAccelDevice::getHardwareInfo for
+// the GPU's description, and it fails (0xE00002BC) if refClkFreq, sysClkFreq, memClkFreq or the fourth clock (+0xC0..
+// +0xD8: AMDHardware::initHWInfo takes them from the VBIOS firmware info, then PowerPlay's engine/memory clocks) or the
+// device ID / raster / shader pipe counts are zero. nvram102: 7 processes opened the accelerator, none ever created a
+// command queue, and WindowServer never flipped. On the APU the VBIOS has no memory clock and the Dummy PowerPlay back
+// end reports none either. Record what it returns, and fill zero clocks with Stoney's (10 kHz units, as the VBIOS):
+// 100 MHz reference, 847 MHz engine, 1066 MHz memory (DDR4-2133). -crnohwinfofix only records.
+static mach_vm_address_t orgGetHardwareInfo;
+static uint32_t hwInfoCalls, hwInfoFixed, hwInfoRet = 0xFFFFFFFF;
+static uint64_t hwInfoValues[7];  // ref, sys, mem, +0xD8 clocks; device ID, raster pipes, shader pipes (as returned)
+
+static uint32_t wrapGetHardwareInfo(void *that, uint8_t *info) {
+	auto ret = FunctionCast(wrapGetHardwareInfo, orgGetHardwareInfo)(that, info);
+	hwInfoCalls++;
+	if (!info)
+		return ret;
+	auto *clocks = reinterpret_cast<uint64_t *>(info + 0xC0);
+	for (int i = 0; i < 4; i++)
+		hwInfoValues[i] = clocks[i];
+	hwInfoValues[4] = *reinterpret_cast<uint16_t *>(info);
+	hwInfoValues[5] = *reinterpret_cast<uint64_t *>(info + 0x18);
+	hwInfoValues[6] = *reinterpret_cast<uint64_t *>(info + 0x20);
+	hwInfoRet = ret;
+	if (ret == 0xE00002BC && hwInfoValues[4] && hwInfoValues[5] && hwInfoValues[6] &&
+		!checkKernelArgument("-crnohwinfofix")) {
+		static const uint64_t stoney[4] {10000, 84700, 106600, 84700};
+		for (int i = 0; i < 4; i++)
+			if (!clocks[i])
+				clocks[i] = stoney[i];
+		hwInfoFixed++;
+		ret = 0;
+	}
+	return ret;
+}
+
 // Which of the HWLibs hooks below were installed (bit per hook, in HwlibsHook order) and which failed. nvram72 showed
 // none of them taking effect (no PowerPlay key notes, flags untouched, ATS not skipped) with no "noroute" note.
 enum HwlibsHook {
@@ -2064,6 +2099,14 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 	// the one routed second fails (nvram73: the stage won, so the SMU load never ran).
 	if (!checkKernelArgument("-crnotrace") && kext != KextRadeonX4000HWLibs)
 		routeStages(patcher, index, slide, size, kext == KextRadeonX4000 ? InAccel : InHWServices);
+	if (kext == KextRadeonX4000) {
+		KernelPatcher::RouteRequest hwInfo {"__ZN29AMDRadeonX4000_AMDAccelDevice15getHardwareInfoEP24_sAMD_GET_HW_INFO_VALUES",
+			wrapGetHardwareInfo, orgGetHardwareInfo};
+		if (!routeChecked(patcher, index, hwInfo, slide, size)) {
+			traceNote("noroute:getHardwareInfo(%d) ", patcher.getError());
+			patcher.clearError();
+		}
+	}
 	if (kext == KextRadeonX4000HWLibs) {
 		ppDummyForced = (family == ChipFamily::Stoney || family == ChipFamily::Carrizo) &&
 			!checkKernelArgument("-crnoppdummy");
@@ -4101,6 +4144,9 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
 		breadcrumbNoOptions ? ", no /options" : "");
+	add("hwinfo: calls %u ret %x fixed %u; ref %llx sys %llx mem %llx d8 %llx; device %llx raster %llx shader %llx\n",
+		hwInfoCalls, hwInfoRet, hwInfoFixed, hwInfoValues[0], hwInfoValues[1], hwInfoValues[2], hwInfoValues[3],
+		hwInfoValues[4], hwInfoValues[5], hwInfoValues[6]);
 	add("uc:");
 	for (size_t i = 0; i < MaxTraceStages; i++)
 		if (stageNames[i] && !strncmp(stageNames[i], "uc.", 3)) {
