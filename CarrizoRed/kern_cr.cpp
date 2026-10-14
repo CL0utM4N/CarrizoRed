@@ -2211,10 +2211,42 @@ static uint32_t wrapGetHardwareInfo(void *that, uint8_t *info) {
 	return ret;
 }
 
+// Graphics power gating. CAIL's Stoney start-up ends with Cail_Stoney_EnablePowerGating: SCLK slow-down around power
+// changes, CP power gating (Stoney_EnableCpPowerGating) and GFX power gating (Stoney_UpdateGfxPowerGating), leaving
+// RLC_PG_CNTL at 0x60015. Powering the GFX block down and back up needs the SMU's save/restore jobs, which Linux's
+// SMU8 power manager drives and Apple's Dummy PowerPlay doesn't. nvram118: after ~100 s of desktop use the CP hung in
+// the context's CLEAR_STATE / PREAMBLE_CNTL (GRBM: only CP/CPF busy, no faults), Apple reset the GPU, and flips
+// stopped. Keep it all off: the three are no-ops and RLC_PG_CNTL stays CP_PG_DISABLE (0x8000). -crgating keeps them.
+static mach_vm_address_t orgCailStoneyEnablePg, orgStoneyUpdateGfxPg, orgStoneyEnableCpPg;
+static uint32_t pgBlocked;
+
+static void pgOff() {
+	pgBlocked++;
+	if (auto *mmio = gpuMmio)
+		mmio[0xEC43] = 0x8000;  // RLC_PG_CNTL: CP_PG_DISABLE, nothing enabled
+}
+
+static uint64_t wrapCailStoneyEnablePg(void *) {
+	pgOff();
+	traceNote("pg=off ");
+	return 0;
+}
+
+static uint64_t wrapStoneyUpdateGfxPg(void *, uint64_t) {
+	pgOff();
+	return 0;
+}
+
+static uint64_t wrapStoneyEnableCpPg(void *, uint64_t) {
+	pgOff();
+	return 0;
+}
+
 // Which of the HWLibs hooks below were installed (bit per hook, in HwlibsHook order) and which failed. nvram72 showed
 // none of them taking effect (no PowerPlay key notes, flags untouched, ATS not skipped) with no "noroute" note.
 enum HwlibsHook {
-	HookPeciRead, HookPeciSize, HookWaitFor, HookAts, HookHaltRlc, HookFlags, HookSmuFormat, HookSmuLoad, HookEarlyInit
+	HookPeciRead, HookPeciSize, HookWaitFor, HookAts, HookHaltRlc, HookFlags, HookSmuFormat, HookSmuLoad, HookEarlyInit,
+	HookPgEnable, HookPgGfx, HookPgCp
 };
 static uint32_t hwlibsHooks, hwlibsHookFails;
 
@@ -2277,6 +2309,16 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		static const HwlibsHook hooks[] {HookPeciRead, HookPeciSize, HookWaitFor};
 		for (size_t i = 0; i < arrsize(requests); i++)
 			routeHwlibs(patcher, index, requests[i], slide, size, hooks[i]);
+		if (family == ChipFamily::Stoney && !checkKernelArgument("-crgating")) {
+			KernelPatcher::RouteRequest pg[] {
+				{"_Cail_Stoney_EnablePowerGating", wrapCailStoneyEnablePg, orgCailStoneyEnablePg},
+				{"_Stoney_UpdateGfxPowerGating", wrapStoneyUpdateGfxPg, orgStoneyUpdateGfxPg},
+				{"_Stoney_EnableCpPowerGating", wrapStoneyEnableCpPg, orgStoneyEnableCpPg},
+			};
+			static const HwlibsHook pgHooks[] {HookPgEnable, HookPgGfx, HookPgCp};
+			for (size_t i = 0; i < arrsize(pg); i++)
+				routeHwlibs(patcher, index, pg[i], slide, size, pgHooks[i]);
+		}
 		if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crats")) {
 			KernelPatcher::RouteRequest ats {"_Cail_Spectre_EnableAts", wrapCailEnableAts, orgCailEnableAts};
 			routeHwlibs(patcher, index, ats, slide, size, HookAts);
@@ -3808,6 +3850,7 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("kexts: X4000 %u(+%u)@%llx HWServices %u(+%u)@%llx HWLibs %u(+%u)@%llx\n", accelKextLoads[0], accelKextRepeats[0],
 		accelKextSlide[0], accelKextLoads[1], accelKextRepeats[1], accelKextSlide[1], accelKextLoads[2],
 		accelKextRepeats[2], accelKextSlide[2]);
+	add("pg: blocked %u, RLC_PG_CNTL %x\n", pgBlocked, gpuMmio ? gpuMmio[0xEC43] : 0);
 	add("smu reload: %u, last @%llu status %x -> %x resp %x in %u ms\n", smuReload.count, smuReload.at / 100,
 		smuReload.before, smuReload.after, smuReload.resp, smuReload.ms);
 	add("uc (now @%llu):", uptimeMs() / 100);
