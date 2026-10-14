@@ -112,6 +112,7 @@ static uint32_t flipPerforms, flipIrqs, flipKicks;
 static mach_vm_address_t flipProcessIrq;  // AMDAccelDisplayPipe::processTransactionInterrupt
 
 static uint64_t uptimeMs();
+static bool smuLoadOk();  // see the SMU loader
 
 static void kickStalledFlip() {
 	if (!flipPipe || !flipProcessIrq || checkKernelArgument("-crnoflipkick"))
@@ -799,6 +800,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 	// display-less AMD framebuffers, nothing would replace the last console image, and our heartbeat (printed through
 	// that console) would vanish too. A panic screen (debug=0x100) and the panic text in NVRAM prove the kernel was
 	// still running; no panic means a real hang.
+	bool autoPanicOff = checkKernelArgument("-crnoautopanic") || checkKernelArgument("-crnosmuload") ||
+		checkKernelArgument("-crnodirectucode") || self->family != ChipFamily::Stoney;
 	uint32_t panicAt = 0;
 	if (!PE_parse_boot_argn("crpanicat", &panicAt, sizeof(panicAt)))
 		panicAt = 0;
@@ -873,6 +876,11 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (panicAt && t >= panicAt)
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
 		kickStalledFlip();
+		// A failed accelerator start (nvram109/113/123: HWLibs ran unpatched, so no SMU load and no GUI) leaves no
+		// report on an EFI without crpanicat. If the accelerator kexts loaded but the microcode still isn't loaded at
+		// 120 s, panic with the report. -crnoautopanic disables it.
+		if (t >= 120 && accelKextLoads[2] && !smuLoadOk() && !autoPanicOff)
+			self->panicReport(t, now, "CarrizoRed: the accelerator didn't start (no SMU microcode load by 120 s).");
 		if (__atomic_load_n(&smuStoppedAt, __ATOMIC_RELAXED))
 			self->panicReport(t, now, "CarrizoRed: SMU load stopped by crsmustep.");
 		if (auto *stage = __atomic_load_n(&stoppedStage, __ATOMIC_RELAXED)) {
@@ -2179,6 +2187,10 @@ static void smuReloadCp() {
 	smuReload.at = start;
 	smuReload.count++;
 	traceNote("smureload=%x ", status);
+}
+
+static bool smuLoadOk() {
+	return smuLoad.result && !strcmp(smuLoad.result, "loaded");
 }
 
 static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
