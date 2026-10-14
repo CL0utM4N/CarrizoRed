@@ -1235,6 +1235,19 @@ namespace {
 		{"__ZN14AMDFramebuffer17setInterruptStateEPvj", "uc.fbIrqState", InFramebuffer, false, false, 2},
 		{"__ZN14AMDFramebuffer24registerForInterruptTypeEjPFvP8OSObjectPvES1_S2_PS2_", "uc.fbIrqRegister",
 			InFramebuffer, false, false, 1},
+		// nvram108: the 876th flip was performed at 150.2 s and its 'txni' completion (a software interrupt the
+		// framebuffer raises when it finishes a display-pipe transaction) never came, while vblank/v-update interrupts
+		// kept arriving. AMDFramebuffer's transaction queue and its vblank/v-update/vsync handlers.
+		{"__ZN14AMDFramebuffer28queueDisplayPipeTransactionsEy", "uc.fbQueue", InFramebuffer, false, false, 1},
+		{"__ZN14AMDFramebuffer30dequeueDisplayPipeTransactionsEy", "uc.fbDequeue", InFramebuffer, false, false, 1},
+		{"__ZN14AMDFramebuffer28handleDisplayPipeTransactionEP21_AMD_PIPE_TRANSACTION", "uc.fbHandle", InFramebuffer, false, false, 0},
+		{"__ZN14AMDFramebuffer29processDisplayPipeTransactionEjb", "uc.fbProcess", InFramebuffer, false, false, 3},
+		{"__ZN14AMDFramebuffer35displayPipeTransactionVBlankHandlerEP8OSObjectPv", "uc.fbVBlank", InFramebuffer, false, false, 0},
+		{"__ZN14AMDFramebuffer36displayPipeTransactionVUpdateHandlerEP8OSObjectPv", "uc.fbVUpdate", InFramebuffer, false, false, 0},
+		{"__ZN14AMDFramebuffer34displayPipeTransactionVSyncHandlerEP8OSObjectPv", "uc.fbVSync", InFramebuffer, false, false, 0},
+		{"__ZN14AMDFramebuffer27scheduledTransactionHandlerEP8OSObjectP22IOInterruptEventSourcei", "uc.fbScheduled", InFramebuffer, false, false, 0},
+		{"__ZN14AMDFramebuffer26deferredTransactionHandlerEP8OSObjectP22IOInterruptEventSourcei", "uc.fbDeferred", InFramebuffer, false, false, 0},
+		{"__ZN14AMDFramebuffer36finishDeferredDisplayPipeTransactionEv", "uc.fbFinishDeferred", InFramebuffer, false, false, 0},
 	};
 
 	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
@@ -1281,7 +1294,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 141, "one wrapper per stage");
+		static_assert(arrsize(stages) == 151, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -1301,7 +1314,8 @@ namespace {
 			CR_WRAP(114), CR_WRAP(115), CR_WRAP(116), CR_WRAP(117), CR_WRAP(118), CR_WRAP(119), CR_WRAP(120), CR_WRAP(121), CR_WRAP(122),
 			CR_WRAP(123), CR_WRAP(124), CR_WRAP(125), CR_WRAP(126), CR_WRAP(127), CR_WRAP(128), CR_WRAP(129),
 			CR_WRAP(130), CR_WRAP(131), CR_WRAP(132), CR_WRAP(133), CR_WRAP(134), CR_WRAP(135), CR_WRAP(136), CR_WRAP(137),
-			CR_WRAP(138), CR_WRAP(139), CR_WRAP(140),
+			CR_WRAP(138), CR_WRAP(139), CR_WRAP(140), CR_WRAP(141), CR_WRAP(142), CR_WRAP(143), CR_WRAP(144),
+			CR_WRAP(145), CR_WRAP(146), CR_WRAP(147), CR_WRAP(148), CR_WRAP(149), CR_WRAP(150),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -4184,7 +4198,11 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
 		breadcrumbNoOptions ? ", no /options" : "");
-	add("trace: %s\nlast events:", traceSummary);
+	{
+		// Only the tail once it's long (nvram104-108: the start-up notes pushed the end of the report out of the buffer).
+		size_t traceLen = strlen(traceSummary);
+		add("trace: %s%s\nlast events:", traceLen > 700 ? "..." : "", traceSummary + (traceLen > 700 ? traceLen - 700 : 0));
+	}
 	// Newest 16 events, oldest first, without the repetitive attribute and vblank-wait calls.
 	uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
 	uint32_t picked[16], count = 0;
