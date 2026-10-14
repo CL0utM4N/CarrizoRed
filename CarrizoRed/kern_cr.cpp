@@ -243,7 +243,7 @@ static void keepVbiosImage(IORegistryEntry *gpu) {
 	}
 }
 static void *ihManager;                 // BaffinInterruptManager *
-static mach_vm_address_t ihGetWptrWbAddress, ihIsUsingVram;
+static mach_vm_address_t ihGetWptrWbAddress, ihIsUsingVram, ihSetRingBufferLocation;
 static bool ihStormBroken;
 static uint64_t ihWindowStart;
 static uint32_t ihWindowCalls;
@@ -1744,8 +1744,10 @@ namespace Smu8 {
 	static constexpr uint8_t ArgInitMmPwrLog = 0, ArgInitClkTable = 1;                 // TASK_ARG_INIT_*
 	static constexpr uint32_t JobListEntries = 32;                                     // NUM_JOBLIST_ENTRIES
 	static constexpr uint16_t EndOfTaskList = 0xFFFF;
-	// Region layout: TOC, the scratch buffers (Linux smu_buffer), then the images, 4 KB aligned.
-	static constexpr uint32_t TocOffset = 0, ScratchOffset = 0x1000, UcodeOffset = 0x5000, RegionSize = 0x60000;
+	// Region layout: TOC, the scratch buffers (Linux smu_buffer), then the images, 4 KB aligned; then the IH ring and its
+	// write-back word (see moveIhRing).
+	static constexpr uint32_t TocOffset = 0, ScratchOffset = 0x1000, UcodeOffset = 0x5000, IhOffset = 0x60000,
+	                          IhMaxSize = 0x40000, RegionSize = IhOffset + IhMaxSize + 0x1000;
 	struct Task {  // SMU_Task
 		uint8_t type, arg;
 		uint16_t next;
@@ -1866,7 +1868,7 @@ static void smuLoadFirmware(void *cail) {
 		ucodeAt[i] = offset;
 		ucodeSize[i] = ucode[i]->dwords * 4;
 		offset = (offset + ucodeSize[i] + 0xFFF) & ~0xFFFU;
-		fits = offset <= RegionSize;
+		fits = offset <= IhOffset;
 		if (fits)
 			memcpy(region + ucodeAt[i], ucode[i]->data, ucodeSize[i]);
 	}
@@ -1874,7 +1876,7 @@ static void smuLoadFirmware(void *cail) {
 	if (fits && mec->jtSize && mec->jtOffset + mec->jtSize <= mec->dwords) {
 		jtAt = offset;
 		jtSize = mec->jtSize * 4;
-		fits = jtAt + jtSize <= RegionSize;
+		fits = jtAt + jtSize <= IhOffset;
 		if (fits)
 			memcpy(region + jtAt, mec->data + mec->jtOffset, jtSize);
 	}
@@ -2308,6 +2310,8 @@ void CRDriver::patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_add
 	}
 	ihGetWptrWbAddress = patcher.solveSymbol(index, "__ZN22BaffinInterruptManager23getWPTRWriteBackAddressEv", slide, size);
 	ihIsUsingVram = patcher.solveSymbol(index, "__ZN22BaffinInterruptManager24isUsingVRAMForRingBufferEv", slide, size);
+	ihSetRingBufferLocation = patcher.solveSymbol(index, "__ZN22BaffinInterruptManager21setRingBufferLocationEP8SRAMInfo",
+		slide, size);
 	patcher.clearError();
 }
 
@@ -2467,7 +2471,55 @@ static uint32_t ihEnableCalls, ihLastEnable = 0xFF;  // BaffinInterruptManager::
 // state into IH_CNTL after it runs. -crnoihfix disables.
 static constexpr uint32_t IhCntlEnableIntr = 0x1, IhCntlRptrRearm = 0x10;
 
+// The IH ring. AMD9500Controller allocates it in system memory and gives the IH its physical address, which the GPU
+// reached through the system aperture (MC addresses below the FB/GART map straight to RAM). relocateFb puts the FB at
+// MC 0 for the accelerator, over that same range, so the IH's writes land in the carve-out or the GART instead
+// (nvram91/92: IH WPTR 0x10/0x20, but the CPU saw an empty ring and a zero write-back; a ring at physical 0x26F20000 sat
+// past the 512 MB FB, in the GART). Every handler call then found nothing, wrote RPTR 0, and the IH fired again: the
+// storm that left the accelerator's submissions waiting forever. Move the ring into our VRAM region (after the SMU
+// data) with Apple's own BaffinInterruptManager::setRingBufferLocation({cpu, gpu, size}), as the accelerator does on a
+// discrete card; the CPU reads it through an uncached mapping of the carve-out. -crnoihmove disables it.
+static IOMemoryMap *ihRingMap;
+static const char *ihMoveResult;
+static uint64_t ihMovedGpu;
+
+static void moveIhRing(void *manager) {
+	using namespace Smu8;
+	if (ihMoveResult)
+		return;
+	if (!ihSetRingBufferLocation || checkKernelArgument("-crnoihmove")) {
+		ihMoveResult = "off";
+		return;
+	}
+	if (!smuLoad.result || !smuLoad.phys || !smuLoad.mc) {
+		ihMoveResult = "no VRAM region";
+		return;
+	}
+	uint32_t size = *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(manager) + 0x3C);
+	if (!size || size > IhMaxSize) {
+		ihMoveResult = "ring size doesn't fit";
+		return;
+	}
+	auto *desc = IOMemoryDescriptor::withPhysicalAddress(smuLoad.phys + IhOffset, size + 0x1000, kIODirectionInOut);
+	ihRingMap = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+	OSSafeReleaseNULL(desc);
+	if (!ihRingMap) {
+		ihMoveResult = "can't map the ring";
+		return;
+	}
+	memset(reinterpret_cast<void *>(ihRingMap->getVirtualAddress()), 0, size + 0x1000);
+	struct {
+		uint64_t cpu, gpu, size;
+	} info {static_cast<uint64_t>(ihRingMap->getVirtualAddress()), smuLoad.mc + IhOffset, size};
+	ihMovedGpu = info.gpu;
+	reinterpret_cast<uint32_t (*)(void *, void *)>(ihSetRingBufferLocation)(manager, &info);
+	ihMoveResult = "moved";
+	traceNote("ihring=%llx ", info.gpu);
+}
+
 void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
+	if (enable)
+		moveIhRing(that);
 	bool off = enable && checkKernelArgument("-crnoih");
 	ihEnableCalls++;
 	ihLastEnable = enable && !off;
@@ -3621,6 +3673,15 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		} else {
 			add("ih: rptr writes %u last %x\n", ihReadPointerWrites, ihLastReadPointer);
 		}
+		add("ih ring move: %s, gpu %llx", ihMoveResult ? ihMoveResult : "not tried", ihMovedGpu);
+		if (ihRingMap) {
+			auto *ring = reinterpret_cast<volatile uint32_t *>(ihRingMap->getVirtualAddress());
+			uint32_t size = static_cast<uint32_t>(ihRingMap->getLength()) - 0x1000;
+			add("; wb %x; entries:", ring[size / 4]);
+			for (uint32_t i = 0; i < 4; i++)
+				add(" %x/%x/%x", ring[i * 4], ring[i * 4 + 1], ring[i * 4 + 2]);
+		}
+		add("\n");
 		if (auto *gpu = iGPU) {
 			uint16_t command = gpu->configRead16(0x04), status = gpu->configRead16(0x06);
 			uint8_t cap = gpu->configRead8(0x34) & 0xFC;
