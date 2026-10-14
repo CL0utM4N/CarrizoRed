@@ -124,6 +124,14 @@ static void kickStalledFlip() {
 	reinterpret_cast<void (*)(void *, void *, void *)>(flipProcessIrq)(flipPipe, nullptr, nullptr);
 }
 
+// Start order. The graphics policy sets LoadController and LoadAccelerator together, so the display controller and the
+// accelerator stack match in parallel. When HWServices/the accelerator start first (nvram109/113/124), CAIL's early
+// initialisation (AmdCailServices::earlyInitialize) is never called at all: no registry settings, no SMU load, no
+// PowerPlay, no GUI. Until AMD9500Controller has finished its hardware set-up (initializeProjectDependentResources),
+// their probes report no match; the watcher then re-registers the iGPU so they match again. -crnoacceldefer disables it.
+static bool controllerReady, accelDeferred, accelDeferOff;
+static uint32_t accelDeferrals, accelRematches;
+
 // Defined with the SMU loader / black box below; called from the stage wrappers.
 static void smuReloadCp();
 static void snapshotHang(uint32_t arg);
@@ -430,6 +438,7 @@ void CRDriver::processPatcher(KernelPatcher &) {
 	restoreOn = checkKernelArgument("-crrestore");
 	assrOff = checkKernelArgument("-crnoassr");
 	parseStopAt();
+	accelDeferOff = checkKernelArgument("-crnoacceldefer") || checkKernelArgument("-crnoaccel");
 
 	logPCIInfo();
 	if (checkKernelArgument("-crmacgpu"))
@@ -876,6 +885,12 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (panicAt && t >= panicAt)
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
 		kickStalledFlip();
+		if (accelDeferred && controllerReady) {
+			accelDeferred = false;
+			accelRematches++;
+			self->iGPU->registerService();
+			traceNote("accel.rematch@%us ", t);
+		}
 		// A failed accelerator start (nvram109/113/123: HWLibs ran unpatched, so no SMU load and no GUI) leaves no
 		// report on an EFI without crpanicat. If the accelerator kexts loaded but the microcode still isn't loaded at
 		// 120 s, panic with the report. -crnoautopanic disables it.
@@ -1364,7 +1379,17 @@ namespace {
 			IOLog("CarrizoRed: => %s\n", stages[N].name);
 			IOSleep(30);
 		}
+		if (!controllerReady && !accelDeferOff &&
+			(!strcmp(stages[N].name, "hws.probe") || !strcmp(stages[N].name, "accel.probe"))) {
+			accelDeferred = true;
+			accelDeferrals++;
+			traceNote("%s=deferred ", stages[N].name);
+			__atomic_fetch_sub(&stageOpen[N], 1, __ATOMIC_RELAXED);
+			return 0;
+		}
 		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(a, b, c, d, e, f);
+		if (!strcmp(stages[N].name, "initializeProjectDependentResources"))
+			controllerReady = true;
 		traceEvent(stages[N].name, true, static_cast<uint32_t>(ret));
 		// Mode 5: d points at a status buffer the call fills (DP training: per-lane status read from the DPCD).
 		if (stages[N].arg == 5 && d)
@@ -3895,6 +3920,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("kexts: X4000 %u(+%u)@%llx HWServices %u(+%u)@%llx HWLibs %u(+%u)@%llx\n", accelKextLoads[0], accelKextRepeats[0],
 		accelKextSlide[0], accelKextLoads[1], accelKextRepeats[1], accelKextSlide[1], accelKextLoads[2],
 		accelKextRepeats[2], accelKextSlide[2]);
+	add("start order: controller ready %d, accel probes deferred %u, rematches %u\n", controllerReady,
+		accelDeferrals, accelRematches);
 	add("flips: performed %u, completed %u, kicked %u, last @%llu\n", flipPerforms, flipIrqs, flipKicks,
 		flipPerformMs / 100);
 	add("pg: blocked %u, RLC_PG_CNTL %x\n", pgBlocked, gpuMmio ? gpuMmio[0xEC43] : 0);

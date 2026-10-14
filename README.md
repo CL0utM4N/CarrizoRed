@@ -153,6 +153,8 @@ and the list of affected machines.
 | `-crnohwinfospoof` | Let the Metal driver's hardware info carry the real device ID (read from config space) instead of the spoofed Polaris one |
 | `-crnosmureload` | Don't have the SMU reload the CP microcode when Apple's GPU hang recovery re-initialises the graphics engine (the reset wipes it, and direct loading doesn't work on Stoney) |
 | `-crnoflipkick` | Don't deliver a display flip's completion when it has been missing for 250 ms (otherwise a lost completion freezes the screen while macOS keeps running) |
+| `-crnoacceldefer` | Let the accelerator stack start before the display controller has finished setting up (otherwise its probes are deferred until it has; started first, CAIL skips its early initialisation and acceleration fails) |
+| `-crnoautopanic` | Don't panic with the black-box report when the accelerator hasn't loaded the GPU microcode by 120 s |
 | `-crats` | Let CAIL turn on the iGPU's PCIe ATS, PRI and PASID capabilities (IOMMUv2 features; macOS has no AMD IOMMU driver to answer them), which CarrizoRed otherwise leaves off |
 | `-crnoarbfix` | Leave Apple's Polaris memory-arbiter tweak (`MC_ARB_MISC2` `SEQ_RDY_POP_IDLE` / `POP_IDLE_REPLAY`) in `AMDBaffinHardware::powerUp`; on the APU the arbiter is shared with the CPU |
 | `-crnorlcreset`, `-crrlcreset` | With direct microcode loading: when CAIL halts the RLC to load its microcode, `-crnorlcreset` leaves coarse-grain clock gating and power gating alone (otherwise both are turned off); `-crrlcreset` also soft-resets the RLC again (CAIL already does, before its RLC set-up) |
