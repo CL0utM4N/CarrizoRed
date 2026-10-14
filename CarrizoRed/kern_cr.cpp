@@ -42,6 +42,14 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 				SYSLOG("cr", "route: REFUSED %s: cannot decode +0x%lx", request.symbol, copied);
 				return false;
 			}
+			// A function shorter than the patch (nvram115/116: the 6-byte AMDSWScheduler::signalTimeout) would have
+			// the jump spill into the next one.
+			bool ends = hs.opcode == 0xC3 || hs.opcode == 0xC2 || (hs.opcode == 0xFF && (hs.flags & F_MODRM) &&
+				(hs.modrm_reg == 4 || hs.modrm_reg == 5));
+			if (ends && copied + len < 14) {
+				SYSLOG("cr", "route: REFUSED %s: function ends at +0x%lx, inside the patch", request.symbol, copied + len);
+				return false;
+			}
 			bool ripRelative = (hs.flags & F_MODRM) && hs.modrm_mod == 0 && hs.modrm_rm == 5;
 			if (ripRelative || (hs.flags & F_RELATIVE)) {
 				SYSLOG("cr", "route: REFUSED %s: %s instruction at +0x%lx would be copied unrelocated", request.symbol,
@@ -305,12 +313,13 @@ static uint32_t accelKextLoads[3], accelKextRepeats[3];  // X4000, HWServices, H
 static mach_vm_address_t accelKextSlide[3];  // and where the last load was
 
 static KernelPatcher::KextInfo kexts[KextCount] {
-	// Reloadable (Lilu otherwise patches only the first load): nvram72/109/113 ran an unpatched HWLibs while every hook
-	// "installed" into an earlier copy, as if the library was unloaded and loaded again; patch every load.
-	[KextRadeonX4000] = {"com.apple.kext.AMDRadeonX4000", pathRadeonX4000, arrsize(pathRadeonX4000), {false, true}, {},
+	// HWLibs is reloadable (Lilu otherwise patches only the first load): nvram72/109/113 ran an unpatched HWLibs while
+	// every hook "installed" into an earlier copy, as if the library was unloaded and loaded again. Not X4000 and
+	// HWServices: with them reloadable, boots 115/116 crashed in AMDSWScheduler::advance at ~58 s.
+	[KextRadeonX4000] = {"com.apple.kext.AMDRadeonX4000", pathRadeonX4000, arrsize(pathRadeonX4000), {}, {},
 		KernelPatcher::KextInfo::Unloaded},
 	[KextRadeonX4000HWServices] = {"com.apple.kext.AMDRadeonX4000HWServices", pathRadeonX4000HWServices,
-		arrsize(pathRadeonX4000HWServices), {false, true}, {}, KernelPatcher::KextInfo::Unloaded},
+		arrsize(pathRadeonX4000HWServices), {}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextRadeonX4000HWLibs] = {"com.apple.kext.AMDRadeonX4000HWLibs", pathRadeonX4000HWLibs,
 		arrsize(pathRadeonX4000HWLibs), {false, true}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextPolarisController] = {"com.apple.kext.AMD9500Controller", pathPolarisController,
@@ -1269,9 +1278,9 @@ namespace {
 		{"__ZN14AMDFramebuffer26deferredTransactionHandlerEP8OSObjectP22IOInterruptEventSourcei", "uc.fbDeferred", InFramebuffer, false, false, 0},
 		{"__ZN14AMDFramebuffer36finishDeferredDisplayPipeTransactionEv", "uc.fbFinishDeferred", InFramebuffer, false, false, 0},
 		// nvram112: ~96 s in, the graphics engine was re-initialised twice (Apple's hang recovery) and came back with
-		// CE/PFP microcode wiped; flips stopped. The timeout, hang check and reset path (counted; the first timeout
-		// also snapshots the GPU, see snapshotHang).
-		{"__ZN29AMDRadeonX4000_AMDSWScheduler13signalTimeoutEmj", "uc.timeout", InAccel, false, false, 1},
+		// CE/PFP microcode wiped; flips stopped. The hang check and reset path (counted; the first resetHardware also
+		// snapshots the GPU, see snapshotHang). Not AMDSWScheduler::signalTimeout: it's 6 bytes long, and the route's
+		// 14-byte jump overwrote the start of AMDSWScheduler::advance (nvram115/116: crash there at ~58 s).
 		{"__ZN28AMDRadeonX4000_AMDVIHardware18checkASICHangStateEb", "uc.checkHang", InAccel, false, false, 1},
 		{"__ZN26AMDRadeonX4000_AMDHardware13resetHardwareEjPj", "uc.resetHW", InAccel, false, false, 1},
 		{"__ZN29AMDRadeonX4000_AMDVIPM4Engine5resetE18_eAMD_HW_RING_TYPEPj", "uc.pm4Reset", InAccel, false, false, 1},
@@ -1301,7 +1310,7 @@ namespace {
 		}
 		stageLastArg[N] = arg;
 		uint32_t calls = stageCalls[N];
-		if (calls == 1 && !strcmp(stages[N].name, "uc.timeout"))
+		if (calls == 1 && !strcmp(stages[N].name, "uc.resetHW"))
 			snapshotHang(arg);
 		// After a reset the CP microcode is gone and only the SMU can reload it (see smuReloadCp).
 		if (calls > 1 && !strcmp(stages[N].name, "pm4.initializeMicroEngine"))
@@ -1330,7 +1339,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 158, "one wrapper per stage");
+		static_assert(arrsize(stages) == 157, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -1352,7 +1361,7 @@ namespace {
 			CR_WRAP(130), CR_WRAP(131), CR_WRAP(132), CR_WRAP(133), CR_WRAP(134), CR_WRAP(135), CR_WRAP(136), CR_WRAP(137),
 			CR_WRAP(138), CR_WRAP(139), CR_WRAP(140), CR_WRAP(141), CR_WRAP(142), CR_WRAP(143), CR_WRAP(144),
 			CR_WRAP(145), CR_WRAP(146), CR_WRAP(147), CR_WRAP(148), CR_WRAP(149), CR_WRAP(150), CR_WRAP(151), CR_WRAP(152),
-			CR_WRAP(153), CR_WRAP(154), CR_WRAP(155), CR_WRAP(156), CR_WRAP(157),
+			CR_WRAP(153), CR_WRAP(154), CR_WRAP(155), CR_WRAP(156),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -1395,7 +1404,7 @@ void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_add
 static bool accelSdma1Dropped, accelCapsFixed, vmFixOn, vmFixReady;
 static void *accelHardware;  // AMDBaffinHardware, from allocateHWEngines (for the black box's ring dump)
 
-// The GPU at the first AMDSWScheduler::signalTimeout, before Apple's reset changes it: GRBM/SRBM status, CP status and
+// The GPU at the first AMDHardware::resetHardware, before Apple's reset changes it: GRBM/SRBM status, CP status and
 // stall state, the PM4 and SDMA ring pointers, CP_ME_CNTL, RLC, VM fault status/address; and the PM4 ring before RPTR.
 static const uint16_t hangRegs[] {0x2004, 0x2002, 0x2005, 0x0394, 0x0393, 0x21A0, 0x219C, 0x219D, 0x219E, 0x219F,
 	0x21A1, 0x21A2, 0x21C0, 0x3045, 0x21B6, 0xEC00, 0xEC04, 0x340D, 0x3483, 0x3484, 0x0536, 0x0537, 0x053E, 0x053F};
