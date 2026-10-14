@@ -2362,6 +2362,20 @@ static IOReturn hwlibsWireResult = kIOReturnNotReady;
 static mach_vm_address_t hwlibsTextStart;
 static uint64_t hwlibsTextSize;
 static uint8_t hwlibsAfterBytes[8];  // earlyInitialize's first bytes right after re-patching
+// Physical page behind earlyInitialize when we patched it and at setupCAIL (pmap_find_phys on the kernel pmap, solved at
+// run time), and a test write: did a byte written there read back? (nvram133: re-patch reported success but the bytes
+// read back unchanged.)
+static mach_vm_address_t kernelPmapFindPhys, kernelPmap;
+static uint64_t hwlibsPhysAtPatch, hwlibsPhysAtCheck;
+static int hwlibsProbeWrite = -1;  // -1 not tried; else the byte read back after writing 0xCC
+
+static uint64_t physPageOf(mach_vm_address_t va) {
+	if (!kernelPmapFindPhys || !kernelPmap)
+		return 0;
+	auto pmap = *reinterpret_cast<void **>(kernelPmap);
+	auto ppn = reinterpret_cast<uint32_t (*)(void *, uint64_t)>(kernelPmapFindPhys)(pmap, va);
+	return static_cast<uint64_t>(ppn) << 12;
+}
 static uint8_t hwlibsEntryBytes[8];  // earlyInitialize's first bytes at setupCAIL (a Lilu route starts with a jump)
 static bool hwlibsUnpatched;
 static void (*hwlibsRepatch)(KernelPatcher &, size_t, mach_vm_address_t, size_t);
@@ -2378,6 +2392,21 @@ static void checkLiveHwlibs(void *hardware) {
 		return;
 	hwlibsLiveEarlyInit = vtable[2];
 	memcpy(hwlibsEntryBytes, reinterpret_cast<const void *>(hwlibsLiveEarlyInit), sizeof(hwlibsEntryBytes));
+	hwlibsPhysAtCheck = physPageOf(hwlibsLiveEarlyInit);
+	// Probe: write 0xCC over the first byte with write protection off, read it back, restore it. Nothing runs this
+	// function concurrently: setupCAIL (this thread) calls it next.
+	if (hwlibsLiveEarlyInit == hwlibsEarlyInit && !checkKernelArgument("-crnohwlibsprobe")) {
+		auto *entry = reinterpret_cast<volatile uint8_t *>(hwlibsLiveEarlyInit);
+		uint8_t original = entry[0];
+		if (MachInfo::setKernelWriting(true, nullptr) == KERN_SUCCESS) {
+			entry[0] = 0xCC;
+			hwlibsProbeWrite = entry[0];
+			entry[0] = original;
+			MachInfo::setKernelWriting(false, nullptr);
+		} else {
+			hwlibsProbeWrite = 0x100;
+		}
+	}
 	// Still Apple's prologue (push rbp; mov rbp, rsp) where our route's jump should be: the patches are gone. Apply
 	// them again at the same address.
 	if (hwlibsLiveEarlyInit == hwlibsEarlyInit) {
@@ -2501,6 +2530,13 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		hwlibsEarlyInit = patcher.solveSymbol(index,
 			"__ZN15AmdCailServices15earlyInitializeEP23_MCIL_SERVICE_CALLBACKSP15_CailInitialize", slide, size);
 		patcher.clearError();
+		if (!kernelPmapFindPhys) {
+			kernelPmapFindPhys = patcher.solveSymbol(KernelPatcher::KernelID, "_pmap_find_phys");
+			kernelPmap = patcher.solveSymbol(KernelPatcher::KernelID, "_kernel_pmap");
+			patcher.clearError();
+		}
+		if (hwlibsEarlyInit && !hwlibsPhysAtPatch)
+			hwlibsPhysAtPatch = physPageOf(hwlibsEarlyInit);
 		if (!hwlibsRepatch)
 			hwlibsRepatch = [](KernelPatcher &p, size_t i, mach_vm_address_t sl, size_t sz) {
 				callback->traceKext(p, i, sl, sz, KextRadeonX4000HWLibs);
@@ -4060,13 +4096,14 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		accelKextSlide[0], accelKextLoads[1], accelKextRepeats[1], accelKextSlide[1], accelKextLoads[2],
 		accelKextRepeats[2], accelKextSlide[2]);
 	add("hwlibs: patched @%llx earlyInit %llx, live earlyInit %llx (checks %u) bytes %02x %02x %02x %02x %02x%s, "
-		"repatched %u -> %02x %02x %02x %02x %02x; wired %d (%x, text %llx+%llx)\n",
+		"repatched %u -> %02x %02x %02x %02x %02x; wired %d (%x, text %llx+%llx); phys at patch %llx at check %llx; "
+		"probe write cc -> %x\n",
 		static_cast<uint64_t>(hwlibsSlide), static_cast<uint64_t>(hwlibsEarlyInit),
 		static_cast<uint64_t>(hwlibsLiveEarlyInit), hwlibsLiveChecks, hwlibsEntryBytes[0], hwlibsEntryBytes[1],
 		hwlibsEntryBytes[2], hwlibsEntryBytes[3], hwlibsEntryBytes[4], hwlibsUnpatched ? " (UNPATCHED)" : "",
 		hwlibsRepatches, hwlibsAfterBytes[0], hwlibsAfterBytes[1], hwlibsAfterBytes[2], hwlibsAfterBytes[3],
 		hwlibsAfterBytes[4], hwlibsWired != nullptr, hwlibsWireResult, static_cast<uint64_t>(hwlibsTextStart),
-		hwlibsTextSize);
+		hwlibsTextSize, hwlibsPhysAtPatch, hwlibsPhysAtCheck, hwlibsProbeWrite);
 	add("start order: controller ready %d, accel probes deferred %u, rematches %u\n", controllerReady,
 		accelDeferrals, accelRematches);
 	add("flips: performed %u, completed %u, kicked %u, last @%llu\n", flipPerforms, flipIrqs, flipKicks,
