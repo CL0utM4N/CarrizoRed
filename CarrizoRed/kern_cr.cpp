@@ -93,6 +93,10 @@ static char stopAtName[64];
 static uint32_t stopAtCount = 1, stopAtHits;
 static const char *stoppedStage;
 
+// Defined with the SMU loader / black box below; called from the stage wrappers.
+static void smuReloadCp();
+static void snapshotHang(uint32_t arg);
+
 static void parseStopAt() {
 	if (!PE_parse_boot_argn("crstopat", stopAtName, sizeof(stopAtName)))
 		stopAtName[0] = '\0';
@@ -1248,6 +1252,16 @@ namespace {
 		{"__ZN14AMDFramebuffer27scheduledTransactionHandlerEP8OSObjectP22IOInterruptEventSourcei", "uc.fbScheduled", InFramebuffer, false, false, 0},
 		{"__ZN14AMDFramebuffer26deferredTransactionHandlerEP8OSObjectP22IOInterruptEventSourcei", "uc.fbDeferred", InFramebuffer, false, false, 0},
 		{"__ZN14AMDFramebuffer36finishDeferredDisplayPipeTransactionEv", "uc.fbFinishDeferred", InFramebuffer, false, false, 0},
+		// nvram112: ~96 s in, the graphics engine was re-initialised twice (Apple's hang recovery) and came back with
+		// CE/PFP microcode wiped; flips stopped. The timeout, hang check and reset path (counted; the first timeout
+		// also snapshots the GPU, see snapshotHang).
+		{"__ZN29AMDRadeonX4000_AMDSWScheduler13signalTimeoutEmj", "uc.timeout", InAccel, false, false, 1},
+		{"__ZN28AMDRadeonX4000_AMDVIHardware18checkASICHangStateEb", "uc.checkHang", InAccel, false, false, 1},
+		{"__ZN26AMDRadeonX4000_AMDHardware13resetHardwareEjPj", "uc.resetHW", InAccel, false, false, 1},
+		{"__ZN29AMDRadeonX4000_AMDVIPM4Engine5resetE18_eAMD_HW_RING_TYPEPj", "uc.pm4Reset", InAccel, false, false, 1},
+		{"__ZN29AMDRadeonX4000_AMDVIPM4Engine14gfxEngineResetEv", "uc.gfxReset", InAccel, false, false, 0},
+		{"__ZN29AMDRadeonX4000_AMDVIPM4Engine11cpSoftResetEPj", "uc.cpSoftReset", InAccel, false, false, 0},
+		{"__ZN30AMDRadeonX4000_AMDAccelChannel22resetHardwareAndReplayEv", "uc.replay", InAccel, false, false, 0},
 	};
 
 	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
@@ -1270,6 +1284,12 @@ namespace {
 			case 5: arg = static_cast<uint32_t>(ac); break;
 		}
 		stageLastArg[N] = arg;
+		uint32_t calls = stageCalls[N];
+		if (calls == 1 && !strcmp(stages[N].name, "uc.timeout"))
+			snapshotHang(arg);
+		// After a reset the CP microcode is gone and only the SMU can reload it (see smuReloadCp).
+		if (calls > 1 && !strcmp(stages[N].name, "pm4.initializeMicroEngine"))
+			smuReloadCp();
 		traceEvent(stages[N].name, false, arg);
 		if (stopAtName[0] && !strcmp(stopAtName, stages[N].name) &&
 			__atomic_add_fetch(&stopAtHits, 1, __ATOMIC_RELAXED) == stopAtCount) {
@@ -1294,7 +1314,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 151, "one wrapper per stage");
+		static_assert(arrsize(stages) == 158, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -1315,7 +1335,8 @@ namespace {
 			CR_WRAP(123), CR_WRAP(124), CR_WRAP(125), CR_WRAP(126), CR_WRAP(127), CR_WRAP(128), CR_WRAP(129),
 			CR_WRAP(130), CR_WRAP(131), CR_WRAP(132), CR_WRAP(133), CR_WRAP(134), CR_WRAP(135), CR_WRAP(136), CR_WRAP(137),
 			CR_WRAP(138), CR_WRAP(139), CR_WRAP(140), CR_WRAP(141), CR_WRAP(142), CR_WRAP(143), CR_WRAP(144),
-			CR_WRAP(145), CR_WRAP(146), CR_WRAP(147), CR_WRAP(148), CR_WRAP(149), CR_WRAP(150),
+			CR_WRAP(145), CR_WRAP(146), CR_WRAP(147), CR_WRAP(148), CR_WRAP(149), CR_WRAP(150), CR_WRAP(151), CR_WRAP(152),
+			CR_WRAP(153), CR_WRAP(154), CR_WRAP(155), CR_WRAP(156), CR_WRAP(157),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -1357,6 +1378,37 @@ void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_add
 // the 15.4 recovery) and stays off if they differ.
 static bool accelSdma1Dropped, accelCapsFixed, vmFixOn, vmFixReady;
 static void *accelHardware;  // AMDBaffinHardware, from allocateHWEngines (for the black box's ring dump)
+
+// The GPU at the first AMDSWScheduler::signalTimeout, before Apple's reset changes it: GRBM/SRBM status, CP status and
+// stall state, the PM4 and SDMA ring pointers, CP_ME_CNTL, RLC, VM fault status/address; and the PM4 ring before RPTR.
+static const uint16_t hangRegs[] {0x2004, 0x2002, 0x2005, 0x0394, 0x0393, 0x21A0, 0x219C, 0x219D, 0x219E, 0x219F,
+	0x21A1, 0x21A2, 0x21C0, 0x3045, 0x21B6, 0xEC00, 0xEC04, 0x340D, 0x3483, 0x3484, 0x0536, 0x0537, 0x053E, 0x053F};
+static struct {
+	uint64_t ms;
+	uint32_t arg, regs[arrsize(hangRegs)], rptr, ring[48];
+	bool taken;
+} hangSnap;
+
+static void snapshotHang(uint32_t arg) {
+	auto *mmio = gpuMmio;
+	if (hangSnap.taken || !mmio)
+		return;
+	hangSnap.taken = true;
+	hangSnap.ms = uptimeMs();
+	hangSnap.arg = arg;
+	for (size_t i = 0; i < arrsize(hangRegs); i++)
+		hangSnap.regs[i] = mmio[hangRegs[i]];
+	hangSnap.rptr = mmio[0x21C0];
+	if (auto *hw = static_cast<uint8_t *>(accelHardware))
+		if (auto *pm4 = *reinterpret_cast<uint8_t **>(hw + 0x3B0))
+			if (auto *ring = *reinterpret_cast<uint8_t **>(pm4 + 0x50)) {
+				auto *cpu = *reinterpret_cast<uint32_t **>(ring + 0x40);
+				uint32_t dwords = *reinterpret_cast<uint32_t *>(ring + 0x30);
+				if (cpu && dwords)
+					for (uint32_t i = 0; i < 48; i++)
+						hangSnap.ring[i] = cpu[(hangSnap.rptr + dwords - 40 + i) % dwords];
+			}
+}
 static uint32_t accelMmDropped, accelArbPatched;
 static uint32_t accelStartPatched, accelCapsCu, accelSdma1Aliased;
 static uint64_t vmFbStart, vmFbEnd, vmCarveout;
@@ -1805,6 +1857,11 @@ namespace Smu8 {
 static mach_vm_address_t orgStoneyFormatSmuDram, orgStoneyLoadRlcUcode;
 static Smu8::CailUcode **stoneyUcodeInfo;  // RLC, SDMA0, SDMA1 (skipped), CE, PFP, ME, MEC1, MEC2 (skipped)
 static uint32_t smuFormatCalls, smuCailSize, smuRegionStart;
+static uint16_t smuCpReloadTask = 0xFFFF;
+static struct {
+	uint32_t count, before, after, ms, resp;
+	uint64_t at;
+} smuReload;
 static struct {
 	const char *result;
 	uint64_t blockOffset, mc, phys;
@@ -1981,6 +2038,12 @@ static void smuLoadFirmware(void *cail) {
 	load(MEC_JT1, Mec, false);
 	load(RLC_G, Rlc, true);
 	scratch(TaskInitialize, ArgInitClkTable, ClkTable, true);
+	// Not in Linux's TOC: the CP alone (CE, PFP, ME, MEC jump table), for reloading after Apple's GPU reset.
+	smuCpReloadTask = used;
+	load(CE, Ce, false);
+	load(PFP, Pfp, false);
+	load(ME, Me, false);
+	load(MEC_JT1, Mec, true);
 	smuLoad.tasks = used;
 	__sync_synchronize();
 	(void)*reinterpret_cast<volatile uint32_t *>(region + TocOffset);
@@ -2029,6 +2092,38 @@ static void smuLoadFirmware(void *cail) {
 	OSSafeReleaseNULL(desc);
 	smuLoad.result = (status & StoneyLoadMask) == StoneyLoadMask ? "loaded" : "timed out";
 	traceNote("smuload=%x->%x ", smuLoad.before, smuLoad.after);
+}
+
+// Apple's hang recovery (AMDVIPM4Engine reset, then pm4.initializeMicroEngine again) soft-resets the CP, which wipes
+// the microcode the SMU loaded (nvram112: CE reads 0, PFP only its first word), and CAIL's direct reload does nothing
+// on Stoney. On every re-initialisation after the first, halt the CP and have the SMU run the CP-only job.
+// -crnosmureload disables it.
+static void smuReloadCp() {
+	using namespace Smu8;
+	auto *mmio = gpuMmio;
+	if (!mmio || !smuLoad.result || strcmp(smuLoad.result, "loaded") || smuCpReloadTask == 0xFFFF ||
+		checkKernelArgument("-crnosmureload"))
+		return;
+	constexpr uint32_t CP_ME_CNTL = 0x21B6, mask = 1U << CE | 1U << PFP | 1U << ME | 1U << MEC_JT1;
+	mmio[CP_ME_CNTL] = mmio[CP_ME_CNTL] | 0x15000000;  // CE, PFP, ME halted
+	uint64_t start = uptimeMs();
+	uint32_t before = smuReadSram(UcodeLoadStatus);
+	smuReload.before = before;
+	mmio[MP0PUB_IND_INDEX] = SramBase + UcodeLoadStatus;
+	mmio[MP0PUB_IND_DATA] = before & ~mask;
+	smuReload.resp = smuSendMessage(ExecuteJob, smuCpReloadTask);
+	uint32_t status = 0;
+	for (uint32_t i = 0; i < 100000; i++) {
+		status = smuReadSram(UcodeLoadStatus);
+		if ((status & mask) == mask)
+			break;
+		IODelay(10);
+	}
+	smuReload.after = status;
+	smuReload.ms = static_cast<uint32_t>(uptimeMs() - start);
+	smuReload.at = start;
+	smuReload.count++;
+	traceNote("smureload=%x ", status);
 }
 
 static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
@@ -3676,6 +3771,17 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("hwinfo: calls %u ret %x fixed %u spoofed %u; ref %llx sys %llx mem %llx d8 %llx; device %llx raster %llx shader %llx\n",
 		hwInfoCalls, hwInfoRet, hwInfoFixed, hwInfoSpoofed, hwInfoValues[0], hwInfoValues[1], hwInfoValues[2], hwInfoValues[3],
 		hwInfoValues[4], hwInfoValues[5], hwInfoValues[6]);
+	if (hangSnap.taken) {
+		add("hang @%llu arg %x:", hangSnap.ms / 100, hangSnap.arg);
+		for (size_t i = 0; i < arrsize(hangRegs); i++)
+			add(" %x=%x", hangRegs[i], hangSnap.regs[i]);
+		add("; ring @rptr-40:");
+		for (uint32_t i = 0; i < 48; i++)
+			add(i == 40 ? " | %x" : " %x", hangSnap.ring[i]);
+		add("\n");
+	}
+	add("smu reload: %u, last @%llu status %x -> %x resp %x in %u ms\n", smuReload.count, smuReload.at / 100,
+		smuReload.before, smuReload.after, smuReload.resp, smuReload.ms);
 	add("uc (now @%llu):", uptimeMs() / 100);
 	for (size_t i = 0; i < MaxTraceStages; i++)
 		if (stageNames[i] && !strncmp(stageNames[i], "uc.", 3)) {
