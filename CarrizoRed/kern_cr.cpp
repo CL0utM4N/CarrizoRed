@@ -2028,7 +2028,7 @@ static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
 // end reports none either. Record what it returns, and fill zero clocks with Stoney's (10 kHz units, as the VBIOS):
 // 100 MHz reference, 847 MHz engine, 1066 MHz memory (DDR4-2133). -crnohwinfofix only records.
 static mach_vm_address_t orgGetHardwareInfo;
-static uint32_t hwInfoCalls, hwInfoFixed, hwInfoRet = 0xFFFFFFFF;
+static uint32_t hwInfoCalls, hwInfoFixed, hwInfoSpoofed, hwInfoRet = 0xFFFFFFFF;
 static uint64_t hwInfoValues[7];  // ref, sys, mem, +0xD8 clocks; device ID, raster pipes, shader pipes (as returned)
 
 static uint32_t wrapGetHardwareInfo(void *that, uint8_t *info) {
@@ -2043,6 +2043,23 @@ static uint32_t wrapGetHardwareInfo(void *that, uint8_t *info) {
 	hwInfoValues[5] = *reinterpret_cast<uint64_t *>(info + 0x18);
 	hwInfoValues[6] = *reinterpret_cast<uint64_t *>(info + 0x20);
 	hwInfoRet = ret;
+	// nvram103: the call succeeds (clocks 48/933/400 MHz), but reports device ID 0x98E4: AMDHardware reads it from
+	// config space, so the Polaris Metal driver sees an ID it doesn't know while everything else sees the spoofed one.
+	// Report the spoofed ID (the iGPU's device-id property). -crnohwinfospoof leaves the real one.
+	if (vbiosOwner && !checkKernelArgument("-crnohwinfospoof"))
+		if (auto *prop = OSDynamicCast(OSData, vbiosOwner->getProperty("device-id")))
+			if (prop->getLength() >= 2) {
+				uint16_t spoof = *static_cast<const uint16_t *>(prop->getBytesNoCopy());
+				auto &device = *reinterpret_cast<uint16_t *>(info);
+				if (spoof && device != spoof) {
+					device = spoof;
+					hwInfoSpoofed++;
+					// +2 is config word 8 (revision ID, class prog-if): take a spoofed revision-id too, if there is one.
+					if (auto *rev = OSDynamicCast(OSData, vbiosOwner->getProperty("revision-id")))
+						if (rev->getLength() >= 1)
+							info[2] = *static_cast<const uint8_t *>(rev->getBytesNoCopy());
+				}
+			}
 	if (ret == 0xE00002BC && hwInfoValues[4] && hwInfoValues[5] && hwInfoValues[6] &&
 		!checkKernelArgument("-crnohwinfofix")) {
 		static const uint64_t stoney[4] {10000, 84700, 106600, 84700};
@@ -4144,8 +4161,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
 		breadcrumbNoOptions ? ", no /options" : "");
-	add("hwinfo: calls %u ret %x fixed %u; ref %llx sys %llx mem %llx d8 %llx; device %llx raster %llx shader %llx\n",
-		hwInfoCalls, hwInfoRet, hwInfoFixed, hwInfoValues[0], hwInfoValues[1], hwInfoValues[2], hwInfoValues[3],
+	add("hwinfo: calls %u ret %x fixed %u spoofed %u; ref %llx sys %llx mem %llx d8 %llx; device %llx raster %llx shader %llx\n",
+		hwInfoCalls, hwInfoRet, hwInfoFixed, hwInfoSpoofed, hwInfoValues[0], hwInfoValues[1], hwInfoValues[2], hwInfoValues[3],
 		hwInfoValues[4], hwInfoValues[5], hwInfoValues[6]);
 	add("uc:");
 	for (size_t i = 0; i < MaxTraceStages; i++)
