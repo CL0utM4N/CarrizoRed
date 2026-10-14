@@ -3653,6 +3653,18 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			restoreWrites, restoreHolds);
 	add("assr: DPCD 0x00D cap 0x%02x, 0x10A before Apple 0x%02x, %u writes%s, readback 0x%02x\n", assrCap, assrBoot,
 		assrWrites, assrOff ? " (off)" : "", assrReadback);
+	// Metal and the flip chain first: with real GPU traffic the report fills the 8 KB buffer and drops its tail.
+	add("hwinfo: calls %u ret %x fixed %u spoofed %u; ref %llx sys %llx mem %llx d8 %llx; device %llx raster %llx shader %llx\n",
+		hwInfoCalls, hwInfoRet, hwInfoFixed, hwInfoSpoofed, hwInfoValues[0], hwInfoValues[1], hwInfoValues[2], hwInfoValues[3],
+		hwInfoValues[4], hwInfoValues[5], hwInfoValues[6]);
+	add("uc:");
+	for (size_t i = 0; i < MaxTraceStages; i++)
+		if (stageNames[i] && !strncmp(stageNames[i], "uc.", 3)) {
+			add(" %s=%u%s", stageNames[i] + 3, stageCalls[i], stageOpen[i] ? "(open)" : "");
+			if (stageCalls[i] && stageLastArg[i])
+				add("(last %x)", stageLastArg[i]);
+		}
+	add("\n");
 	if (!checkKernelArgument("-crnoaccel")) {
 		auto flag = [&](const char *name) {
 			auto *value = OSDynamicCast(OSBoolean, iGPU->getProperty(name));
@@ -3977,8 +3989,12 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			// with runs of the GFX8 NOP filler (PACKET3(NOP, 0x3FFF) = 0xFFFF1000) collapsed to "*n".
 			if (cpu && dwords >= 0x100) {
 				add("ring %llx (%u dw):", ring ? *reinterpret_cast<uint64_t *>(ring + 0x48) : 0, dwords);
-				uint32_t end = rptr + 8 < 0x200 ? rptr + 8 : 0x200;
-				for (uint32_t i = 0; i < end && i < dwords;) {
+				// Past the start-up packets (nvram104: RPTR 0x14980), show the 64 dwords before the read pointer instead.
+				uint32_t begin = rptr > 0x180 ? rptr - 64 : 0;
+				uint32_t end = rptr > 0x180 ? rptr + 16 : (rptr + 8 < 0x200 ? rptr + 8 : 0x200);
+				if (begin)
+					add(" @%x:", begin);
+				for (uint32_t i = begin; i < end && i < dwords;) {
 					if (i == rptr)
 						add(" |");
 					uint32_t run = 0;
@@ -4161,17 +4177,6 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("soft pptable: %u bytes rev %x\n", softPPTableSize, softPPTableRev);
 	add("breadcrumb: %u writes, %u refused%s\n", breadcrumbWrites, breadcrumbRefused,
 		breadcrumbNoOptions ? ", no /options" : "");
-	add("hwinfo: calls %u ret %x fixed %u spoofed %u; ref %llx sys %llx mem %llx d8 %llx; device %llx raster %llx shader %llx\n",
-		hwInfoCalls, hwInfoRet, hwInfoFixed, hwInfoSpoofed, hwInfoValues[0], hwInfoValues[1], hwInfoValues[2], hwInfoValues[3],
-		hwInfoValues[4], hwInfoValues[5], hwInfoValues[6]);
-	add("uc:");
-	for (size_t i = 0; i < MaxTraceStages; i++)
-		if (stageNames[i] && !strncmp(stageNames[i], "uc.", 3)) {
-			add(" %s=%u%s", stageNames[i] + 3, stageCalls[i], stageOpen[i] ? "(open)" : "");
-			if (stageCalls[i] && stageLastArg[i])
-				add("(last %x)", stageLastArg[i]);
-		}
-	add("\n");
 	add("trace: %s\nlast events:", traceSummary);
 	// Newest 16 events, oldest first, without the repetitive attribute and vblank-wait calls.
 	uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
