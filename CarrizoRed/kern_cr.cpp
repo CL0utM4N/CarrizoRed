@@ -84,7 +84,7 @@ static TraceEvent traceRing[TraceRingSize];
 static uint32_t traceHead;
 static uint32_t stageOpen[MaxTraceStages];
 static uint64_t stageEnterMs[MaxTraceStages];
-static uint32_t stageCalls[MaxTraceStages];
+static uint32_t stageCalls[MaxTraceStages], stageLastArg[MaxTraceStages];
 static const char *stageNames[MaxTraceStages];
 // crstopat=<stage>[#n]: on entering that traced stage (the n-th time, default 1st), block the calling thread and have the
 // watcher panic with the report. nvram81/82: with real microcode the machine froze somewhere after
@@ -1213,6 +1213,23 @@ namespace {
 		// The PM4/DMA channels' own versions tail-call this through the vtable (RIP-relative, not routable).
 		{"__ZN27AMDRadeonX4000_AMDHWChannel19submitCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO", "uc.hwsubmit",
 			InAccel, false, false, 0},
+		// Flips (nvram101: SDMA ran WindowServer's work, but the display still scanned out the boot framebuffer at VRAM
+		// offset 0, all black): the accelerator's display-pipe transactions and the controller's surface programming.
+		{"__ZN34AMDRadeonX4000_AMDAccelDisplayPipe16beginTransactionEP12IOAccelEvent", "uc.dpBegin", InAccel, false,
+			false, 0},
+		{"__ZN34AMDRadeonX4000_AMDAccelDisplayPipe19validateTransactionEP30IOAccelDisplayPipeTransaction2", "uc.dpValidate",
+			InAccel, false, false, 0},
+		{"__ZN34AMDRadeonX4000_AMDAccelDisplayPipe17submitTransactionEP30IOAccelDisplayPipeTransaction2", "uc.dpSubmit",
+			InAccel, false, false, 0},
+		{"__ZN34AMDRadeonX4000_AMDAccelDisplayPipe18executeTransactionEP30IOAccelDisplayPipeTransaction2b", "uc.dpExecute",
+			InAccel, false, false, 0},
+		{"__ZN34AMDRadeonX4000_AMDAccelDisplayPipe18performTransactionEP30IOAccelDisplayPipeTransaction2", "uc.dpPerform",
+			InAccel, false, false, 0},
+		{"__ZN34AMDRadeonX4000_AMDAccelDisplayPipe26enableTransactionInterruptEv", "uc.dpIrqOn", InAccel, false, false, 0},
+		{"__ZN34AMDRadeonX4000_AMDAccelDisplayPipe27processTransactionInterruptEP8OSObjectPv", "uc.dpIrq", InAccel, false,
+			false, 0},
+		{"__ZN17AMD9500Controller19hwSetDisplaySurfaceEP11CRTC_PARAMSjj", "uc.setSurface", InController, false, false, 2},
+		{"__ZN17AMD9500Controller26waitForSurfaceFlipCompleteEhb", "uc.flipWait", InController, false, false, 0},
 	};
 
 	// Six integer/pointer arguments cover every traced function. Events go to the ring (see traceEvent); the watcher
@@ -1234,6 +1251,7 @@ namespace {
 			case 4: arg = static_cast<uint32_t>((ac & 0xFF) | (ad & 0xFF) << 8); break;
 			case 5: arg = static_cast<uint32_t>(ac); break;
 		}
+		stageLastArg[N] = arg;
 		traceEvent(stages[N].name, false, arg);
 		if (stopAtName[0] && !strcmp(stopAtName, stages[N].name) &&
 			__atomic_add_fetch(&stopAtHits, 1, __ATOMIC_RELAXED) == stopAtCount) {
@@ -1258,7 +1276,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 130, "one wrapper per stage");
+		static_assert(arrsize(stages) == 139, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -1277,6 +1295,8 @@ namespace {
 			CR_WRAP(106), CR_WRAP(107), CR_WRAP(108), CR_WRAP(109), CR_WRAP(110), CR_WRAP(111), CR_WRAP(112), CR_WRAP(113),
 			CR_WRAP(114), CR_WRAP(115), CR_WRAP(116), CR_WRAP(117), CR_WRAP(118), CR_WRAP(119), CR_WRAP(120), CR_WRAP(121), CR_WRAP(122),
 			CR_WRAP(123), CR_WRAP(124), CR_WRAP(125), CR_WRAP(126), CR_WRAP(127), CR_WRAP(128), CR_WRAP(129),
+			CR_WRAP(130), CR_WRAP(131), CR_WRAP(132), CR_WRAP(133), CR_WRAP(134), CR_WRAP(135), CR_WRAP(136), CR_WRAP(137),
+			CR_WRAP(138),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -4083,8 +4103,11 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		breadcrumbNoOptions ? ", no /options" : "");
 	add("uc:");
 	for (size_t i = 0; i < MaxTraceStages; i++)
-		if (stageNames[i] && !strncmp(stageNames[i], "uc.", 3))
+		if (stageNames[i] && !strncmp(stageNames[i], "uc.", 3)) {
 			add(" %s=%u%s", stageNames[i] + 3, stageCalls[i], stageOpen[i] ? "(open)" : "");
+			if (stageCalls[i] && stageLastArg[i])
+				add("(last %x)", stageLastArg[i]);
+		}
 	add("\n");
 	add("trace: %s\nlast events:", traceSummary);
 	// Newest 16 events, oldest first, without the repetitive attribute and vblank-wait calls.
