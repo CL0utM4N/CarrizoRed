@@ -301,13 +301,18 @@ enum KextIndex : size_t {
 	KextCount,
 };
 
+static uint32_t accelKextLoads[3];         // X4000, HWServices, HWLibs: times Lilu handed us each
+static mach_vm_address_t accelKextSlide[3];  // and where the last load was
+
 static KernelPatcher::KextInfo kexts[KextCount] {
-	[KextRadeonX4000] = {"com.apple.kext.AMDRadeonX4000", pathRadeonX4000, arrsize(pathRadeonX4000), {}, {},
+	// Reloadable (Lilu otherwise patches only the first load): nvram72/109/113 ran an unpatched HWLibs while every hook
+	// "installed" into an earlier copy, as if the library was unloaded and loaded again; patch every load.
+	[KextRadeonX4000] = {"com.apple.kext.AMDRadeonX4000", pathRadeonX4000, arrsize(pathRadeonX4000), {false, true}, {},
 		KernelPatcher::KextInfo::Unloaded},
 	[KextRadeonX4000HWServices] = {"com.apple.kext.AMDRadeonX4000HWServices", pathRadeonX4000HWServices,
-		arrsize(pathRadeonX4000HWServices), {}, {}, KernelPatcher::KextInfo::Unloaded},
+		arrsize(pathRadeonX4000HWServices), {false, true}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextRadeonX4000HWLibs] = {"com.apple.kext.AMDRadeonX4000HWLibs", pathRadeonX4000HWLibs,
-		arrsize(pathRadeonX4000HWLibs), {}, {}, KernelPatcher::KextInfo::Unloaded},
+		arrsize(pathRadeonX4000HWLibs), {false, true}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextPolarisController] = {"com.apple.kext.AMD9500Controller", pathPolarisController,
 		arrsize(pathPolarisController), {}, {}, KernelPatcher::KextInfo::Unloaded},
 	[KextSupport] = {"com.apple.kext.AMDSupport", pathSupport, arrsize(pathSupport), {}, {},
@@ -467,8 +472,12 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 		SYSLOG("cr", "%s loaded: slide 0x%llX size 0x%lX", kexts[i].id, static_cast<uint64_t>(slide),
 			static_cast<unsigned long>(size));
 		// The acceleration kexts load late (IOKit matching), if at all: note it, for the black box.
-		if (i == KextRadeonX4000 || i == KextRadeonX4000HWServices || i == KextRadeonX4000HWLibs)
+		if (i == KextRadeonX4000 || i == KextRadeonX4000HWServices || i == KextRadeonX4000HWLibs) {
 			traceNote("kext:%s ", i == KextRadeonX4000 ? "X4000" : i == KextRadeonX4000HWServices ? "HWServices" : "HWLibs");
+			size_t k = i == KextRadeonX4000 ? 0 : i == KextRadeonX4000HWServices ? 1 : 2;
+			accelKextLoads[k]++;
+			accelKextSlide[k] = slide;
+		}
 		if (i == KextPolarisController)
 		{
 			patchPolarisController(patcher, index, slide, size);
@@ -3780,6 +3789,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			add(i == 40 ? " | %x" : " %x", hangSnap.ring[i]);
 		add("\n");
 	}
+	add("kexts: X4000 %ux@%llx HWServices %ux@%llx HWLibs %ux@%llx\n", accelKextLoads[0], accelKextSlide[0],
+		accelKextLoads[1], accelKextSlide[1], accelKextLoads[2], accelKextSlide[2]);
 	add("smu reload: %u, last @%llu status %x -> %x resp %x in %u ms\n", smuReload.count, smuReload.at / 100,
 		smuReload.before, smuReload.after, smuReload.resp, smuReload.ms);
 	add("uc (now @%llu):", uptimeMs() / 100);
