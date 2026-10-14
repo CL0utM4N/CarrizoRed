@@ -2355,6 +2355,10 @@ static size_t hwlibsIndex, hwlibsSize;
 static mach_vm_address_t hwlibsSlide, hwlibsEarlyInit, hwlibsLiveEarlyInit;
 static uint32_t hwlibsRepatches, hwlibsLiveChecks;
 static IOMemoryDescriptor *hwlibsWired;
+static IOReturn hwlibsWireResult = kIOReturnNotReady;
+static mach_vm_address_t hwlibsTextStart;
+static uint64_t hwlibsTextSize;
+static uint8_t hwlibsAfterBytes[8];  // earlyInitialize's first bytes right after re-patching
 static uint8_t hwlibsEntryBytes[8];  // earlyInitialize's first bytes at setupCAIL (a Lilu route starts with a jump)
 static bool hwlibsUnpatched;
 static void (*hwlibsRepatch)(KernelPatcher &, size_t, mach_vm_address_t, size_t);
@@ -2379,6 +2383,7 @@ static void checkLiveHwlibs(void *hardware) {
 			hwlibsRepatches++;
 			traceNote("hwlibs=repatch ");
 			hwlibsRepatch(*hwlibsPatcher, hwlibsIndex, hwlibsSlide, hwlibsSize);
+			memcpy(hwlibsAfterBytes, reinterpret_cast<const void *>(hwlibsLiveEarlyInit), sizeof(hwlibsAfterBytes));
 		}
 		return;
 	}
@@ -2443,10 +2448,47 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		// Wire the image before patching: nvram129 had the CAIL object call exactly the patched earlyInitialize, yet
 		// no HWLibs hook ever ran, as if its code pages had been dropped and re-read from the kext collection (losing
 		// every patch). Locked pages can't be.
+		// Only the executable segment (nvram130: wiring the whole image failed, it includes __LINKEDIT, which the
+		// kernel discards after linking).
 		if (!hwlibsWired && !checkKernelArgument("-crnohwlibswire")) {
-			hwlibsWired = IOMemoryDescriptor::withAddressRange(slide, size, kIODirectionInOut, kernel_task);
-			if (hwlibsWired && hwlibsWired->prepare() != kIOReturnSuccess)
-				OSSafeReleaseNULL(hwlibsWired);
+			mach_vm_address_t text = 0;
+			uint64_t textSize = 0;
+			auto *header = reinterpret_cast<const mach_header_64 *>(slide);
+			if (header->magic == MH_MAGIC_64) {
+				// Segment addresses relative to __TEXT (which starts at the header, i.e. at slide): the header's own
+				// vmaddr values may be unslid in a kernel collection.
+				uint64_t textBase = 0;
+				bool haveBase = false;
+				auto *cmd = reinterpret_cast<const load_command *>(header + 1);
+				for (uint32_t i = 0; i < header->ncmds; i++) {
+					if (cmd->cmd == LC_SEGMENT_64) {
+						auto *seg = reinterpret_cast<const segment_command_64 *>(cmd);
+						if (!haveBase && !strncmp(seg->segname, "__TEXT", sizeof(seg->segname))) {
+							textBase = seg->vmaddr;
+							haveBase = true;
+						}
+						if (haveBase && !strncmp(seg->segname, "__TEXT_EXEC", sizeof(seg->segname)) && seg->vmsize &&
+							seg->vmaddr >= textBase && seg->vmaddr - textBase + seg->vmsize <= size) {
+							text = slide + (seg->vmaddr - textBase);
+							textSize = seg->vmsize;
+						}
+					}
+					cmd = reinterpret_cast<const load_command *>(reinterpret_cast<const uint8_t *>(cmd) + cmd->cmdsize);
+				}
+			}
+			hwlibsTextStart = text;
+			hwlibsTextSize = textSize;
+			if (text && textSize) {
+				// Touch every page first, then wire.
+				volatile uint8_t sink = 0;
+				for (uint64_t off = 0; off < textSize; off += PAGE_SIZE)
+					sink = sink + *reinterpret_cast<volatile const uint8_t *>(text + off);
+				(void)sink;
+				hwlibsWired = IOMemoryDescriptor::withAddressRange(text, textSize, kIODirectionInOut, kernel_task);
+				hwlibsWireResult = hwlibsWired ? hwlibsWired->prepare() : kIOReturnNoMemory;
+				if (hwlibsWireResult != kIOReturnSuccess)
+					OSSafeReleaseNULL(hwlibsWired);
+			}
 			traceNote("hwlibs=%s ", hwlibsWired ? "wired" : "notwired");
 		}
 		hwlibsPatcher = &patcher;
@@ -4015,10 +4057,13 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		accelKextSlide[0], accelKextLoads[1], accelKextRepeats[1], accelKextSlide[1], accelKextLoads[2],
 		accelKextRepeats[2], accelKextSlide[2]);
 	add("hwlibs: patched @%llx earlyInit %llx, live earlyInit %llx (checks %u) bytes %02x %02x %02x %02x %02x%s, "
-		"repatched %u, wired %d\n", static_cast<uint64_t>(hwlibsSlide), static_cast<uint64_t>(hwlibsEarlyInit),
+		"repatched %u -> %02x %02x %02x %02x %02x; wired %d (%x, text %llx+%llx)\n",
+		static_cast<uint64_t>(hwlibsSlide), static_cast<uint64_t>(hwlibsEarlyInit),
 		static_cast<uint64_t>(hwlibsLiveEarlyInit), hwlibsLiveChecks, hwlibsEntryBytes[0], hwlibsEntryBytes[1],
 		hwlibsEntryBytes[2], hwlibsEntryBytes[3], hwlibsEntryBytes[4], hwlibsUnpatched ? " (UNPATCHED)" : "",
-		hwlibsRepatches, hwlibsWired != nullptr);
+		hwlibsRepatches, hwlibsAfterBytes[0], hwlibsAfterBytes[1], hwlibsAfterBytes[2], hwlibsAfterBytes[3],
+		hwlibsAfterBytes[4], hwlibsWired != nullptr, hwlibsWireResult, static_cast<uint64_t>(hwlibsTextStart),
+		hwlibsTextSize);
 	add("start order: controller ready %d, accel probes deferred %u, rematches %u\n", controllerReady,
 		accelDeferrals, accelRematches);
 	add("flips: performed %u, completed %u, kicked %u, last @%llu\n", flipPerforms, flipIrqs, flipKicks,
