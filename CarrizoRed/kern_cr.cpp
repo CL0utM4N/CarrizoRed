@@ -1753,7 +1753,7 @@ static uint32_t smuReadSram(uint32_t address) {
 }
 
 // Steps: 1 region written, 2 DriverDramAddrHi/Lo + InitJobs, 3 ARAM save job, 4 power-profiling job, 5 boot-up job
-// and the wait, 6 MEC base set.
+// and the wait, 6 MEC base set, 7 CAIL's Stoney_LoadRlcUcode done (RLC started).
 static void smuStep(uint32_t step) {
 	if (step < smuStepLimit)
 		return;
@@ -1943,7 +1943,10 @@ static void smuLoadFirmware(void *cail) {
 
 static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
 	smuLoadFirmware(cail);
-	return FunctionCast(wrapStoneyLoadRlcUcode, orgStoneyLoadRlcUcode)(cail);
+	auto ret = FunctionCast(wrapStoneyLoadRlcUcode, orgStoneyLoadRlcUcode)(cail);
+	if (smuLoad.result)
+		smuStep(7);  // CAIL has started the RLC, now with real microcode
+	return ret;
 }
 
 // Which of the HWLibs hooks below were installed (bit per hook, in HwlibsHook order) and which failed. nvram72 showed
