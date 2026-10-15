@@ -4438,8 +4438,17 @@ static bool carveInit() {
 	return true;
 }
 
+// Set while the submit hook runs: it must neither block nor allocate (it runs inside the accelerator's submission
+// path; a mapping made there can wait on memory the accelerator has to give back, which needs that same path: the two
+// boots with the first version of the hook froze). Only the carve-out mapping, made beforehand by the scan thread.
+static bool hookContext;
+
 static uint8_t *carvePtr(uint64_t phys, uint32_t bytes) {
-	if (!interpSubmit || !carveInit() || phys < carveBase || phys + bytes > carveBase + carveSize)
+	if (!interpSubmit)
+		return nullptr;
+	if (!__atomic_load_n(&carveMap, __ATOMIC_ACQUIRE) && (hookContext || !carveInit()))
+		return nullptr;
+	if (phys < carveBase || phys + bytes > carveBase + carveSize)
 		return nullptr;
 	return carveMap + (phys - carveBase);
 }
@@ -4452,6 +4461,8 @@ static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out) {
 		memcpy(out, fast, bytes);
 		return true;
 	}
+	if (hookContext)
+		return false;
 	auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, bytes, kIODirectionIn);
 	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
 	bool mapped = map != nullptr;
@@ -4610,6 +4621,8 @@ static bool ibWritePhys(uint64_t phys, uint32_t bytes, const void *in) {
 		memcpy(fast, in, bytes);
 		return true;
 	}
+	if (hookContext)
+		return false;
 	auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, bytes, kIODirectionOut);
 	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
 	bool mapped = map != nullptr;
@@ -4941,7 +4954,7 @@ struct SeenShader {
 };
 static SeenShader seenShaders[512];
 static uint32_t seenNum, seenNext;
-static uint32_t ibHookCalls, ibHookIbs, ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags;
+static uint32_t ibHookCalls, ibHookIbs, ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookBusy, ibHookNoMap;
 static uint64_t ibHookNs;
 
 static uint32_t codeHash(const uint32_t *code, uint32_t n) {
@@ -5088,6 +5101,8 @@ static void interpFixScan() {
 	uint32_t dwords = ring ? *reinterpret_cast<uint32_t *>(ring + 0x30) : 0;
 	if (!cpu || dwords < 0x100 || (dwords & (dwords - 1)))
 		return;
+	if (interpSubmit)
+		carveInit();
 	IOLockLock(interpLock);
 	interpFix.scans++;
 	uint32_t rptr = mmio[0x21C0] & (dwords - 1), found = 0;
@@ -5134,9 +5149,13 @@ static uint64_t wrapCommitIb(void *channel, uint8_t *info) {
 		ibHookCalls++;
 		ibHookLastVmid = vmid;
 		ibHookLastFlags = flags;
-		if (!(flags & 0x12) && vmid >= 1 && vmid <= 15) {
+		if (!(flags & 0x12) && vmid >= 1 && vmid <= 15 && !__atomic_load_n(&carveMap, __ATOMIC_ACQUIRE)) {
+			ibHookNoMap++;
+		} else if (!(flags & 0x12) && vmid >= 1 && vmid <= 15 && !IOLockTryLock(interpLock)) {
+			ibHookBusy++;
+		} else if (!(flags & 0x12) && vmid >= 1 && vmid <= 15) {
 			uint64_t start = mach_absolute_time();
-			IOLockLock(interpLock);
+			hookContext = true;
 			for (uint32_t i = 0; i < count && i < 8; i++) {
 				uint32_t dw = *reinterpret_cast<uint32_t *>(info + 0x44 + i * 0x28);
 				uint64_t va = *reinterpret_cast<uint64_t *>(info + 0x50 + i * 0x28);
@@ -5145,6 +5164,7 @@ static uint64_t wrapCommitIb(void *channel, uint8_t *info) {
 					processUserIb(vmid, va, dw, interpBump);
 				}
 			}
+			hookContext = false;
 			IOLockUnlock(interpLock);
 			uint64_t ns = 0;
 			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
@@ -5385,10 +5405,10 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
-	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu\n",
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u\n",
 		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
 		interpFix.writes, interpFix.writeFails, interpFix.deadRegs, interpFix.bumps, interpHooked, ibHookCalls, ibHookIbs,
-		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000);
+		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap);
 	if (!checkKernelArgument("-crnoibdump")) {
 		static char ibText[3600];
 		captureUserIbs(ibText, sizeof(ibText));
