@@ -4302,6 +4302,217 @@ void CRDriver::initDisplayRegs() {
 	}
 }
 
+// What the Metal driver programs: the most recent user command buffers (INDIRECT_BUFFER packets with a VMID on the
+// GFX ring), read through that VMID's page tables. GFX8 VM: one VM_CONTEXT1_CNTL for VMIDs 1-15 (PAGE_TABLE_DEPTH
+// [2:1], PAGE_TABLE_BLOCK_SIZE [27:24]: 2^(9 + size) entries per page table), page directory base per VMID
+// (VM_CONTEXT1-7_PAGE_TABLE_BASE_ADDR 0x550-0x556, VM_CONTEXT8-15 0x50E-0x515), start at
+// VM_CONTEXT1_PAGE_TABLE_START_ADDR (0x558). Entries: [0] valid, [1] system, [39:12] address; VRAM entries hold the
+// carve-out's physical address once the VM fix has converted them, else an FB offset. Packets: every context register
+// SET_CONTEXT_REG writes (last value; up to four distinct values for the ones that decide blending, colour formats,
+// pixel shader inputs and primitive set-up), the UCONFIG primitive and index types, and the draw packets by type.
+static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out) {
+	// Only RAM and the carve-out (below 8.5 GB here), never the PCI hole.
+	if (!phys || (phys >= 0xC0000000ULL && phys < 0x100000000ULL) || phys + bytes > 0x220000000ULL)
+		return false;
+	auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, bytes, kIODirectionIn);
+	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+	bool mapped = map != nullptr;
+	if (mapped)
+		memcpy(out, reinterpret_cast<const void *>(map->getVirtualAddress()), bytes);
+	OSSafeReleaseNULL(map);
+	OSSafeReleaseNULL(desc);
+	return mapped;
+}
+
+// GPU (MC) address of a page table structure or VRAM page -> system physical address.
+static uint64_t ibMcToPhys(uint64_t addr, bool system) {
+	auto *mmio = gpuMmio;
+	uint64_t fbBase = static_cast<uint64_t>(mmio[Reg::MC_VM_FB_LOCATION] & 0xFFFF) << 24;
+	uint64_t fbTop = (static_cast<uint64_t>(mmio[Reg::MC_VM_FB_LOCATION] >> 16) + 1) << 24;
+	uint64_t carveout = static_cast<uint64_t>(mmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22;
+	if (!system && addr >= fbBase && addr < fbTop)
+		return carveout + (addr - fbBase);
+	return addr;
+}
+
+static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va) {
+	auto *mmio = gpuMmio;
+	if (!vmid || vmid > 15)
+		return 0;
+	uint32_t cntl = mmio[0x505];
+	uint32_t depth = (cntl >> 1) & 3, block = (cntl >> 24) & 0xF;
+	uint64_t pdb = static_cast<uint64_t>(vmid < 8 ? mmio[0x550 + vmid - 1] : mmio[0x50E + vmid - 8]) << 12;
+	uint64_t pfn = (va >> 12) - mmio[0x558];
+	uint64_t entry = 0;
+	if (depth == 0) {
+		if (!ibReadPhys(ibMcToPhys(pdb, false) + pfn * 8, 8, &entry))
+			return 0;
+	} else {
+		uint32_t bits = 9 + block;
+		uint64_t pde = 0;
+		if (!ibReadPhys(ibMcToPhys(pdb, false) + (pfn >> bits) * 8, 8, &pde) || !(pde & 1))
+			return 0;
+		uint64_t pt = pde & 0xFFFFFFFFF000ULL;
+		if (!ibReadPhys(ibMcToPhys(pt, pde & 2) + (pfn & ((1ULL << bits) - 1)) * 8, 8, &entry))
+			return 0;
+	}
+	if (!(entry & 1))
+		return 0;
+	return ibMcToPhys(entry & 0xFFFFFFFFF000ULL, entry & 2) + (va & 0xFFF);
+}
+
+static void captureUserIbs(char *out, size_t size) {
+	size_t len = 0;
+	auto put = [&](const char *fmt, ...) {
+		if (len + 1 >= size)
+			return;
+		va_list va;
+		va_start(va, fmt);
+		int n = vsnprintf(out + len, size - len, fmt, va);
+		va_end(va);
+		if (n > 0)
+			len += static_cast<size_t>(n) < size - len ? static_cast<size_t>(n) : size - len - 1;
+	};
+	out[0] = 0;
+	auto *hw = static_cast<uint8_t *>(accelHardware);
+	auto *mmio = gpuMmio;
+	if (!hw || !mmio)
+		return;
+	auto *pm4 = *reinterpret_cast<uint8_t **>(hw + 0x3B0);
+	auto *ring = pm4 ? *reinterpret_cast<uint8_t **>(pm4 + 0x50) : nullptr;
+	auto *cpu = ring ? *reinterpret_cast<uint32_t **>(ring + 0x40) : nullptr;
+	uint32_t dwords = ring ? *reinterpret_cast<uint32_t *>(ring + 0x30) : 0;
+	if (!cpu || dwords < 0x100 || (dwords & (dwords - 1)))
+		return;
+	uint32_t rptr = mmio[0x21C0] & (dwords - 1);
+	// The largest of the last 16 user IBs before the read pointer.
+	uint64_t bestVa = 0;
+	uint32_t bestDw = 0, bestVmid = 0, found = 0;
+	for (uint32_t back = 4; back < dwords && found < 16; back++) {
+		uint32_t i = (rptr - back) & (dwords - 1);
+		if (cpu[i] != 0xC0023F00)
+			continue;
+		uint32_t ctl = cpu[(i + 3) & (dwords - 1)], vmid = (ctl >> 24) & 0xF, dw = ctl & 0xFFFFF;
+		if (!vmid || !dw)
+			continue;
+		found++;
+		if (dw > bestDw) {
+			bestDw = dw;
+			bestVmid = vmid;
+			bestVa = (static_cast<uint64_t>(cpu[(i + 2) & (dwords - 1)] & 0xFFFF) << 32) | (cpu[(i + 1) & (dwords - 1)] & ~3U);
+		}
+	}
+	put("userib: %u found, vm cntl %x", found, mmio[0x505]);
+	if (!bestDw) {
+		put("
+");
+		return;
+	}
+	static uint32_t buf[0x4000];
+	uint32_t want = bestDw < arrsize(buf) ? bestDw : arrsize(buf), got = 0;
+	while (got < want) {
+		uint64_t va = bestVa + got * 4ULL;
+		uint32_t chunk = static_cast<uint32_t>((0x1000 - (va & 0xFFF)) / 4);
+		if (chunk > want - got)
+			chunk = want - got;
+		uint64_t phys = ibVaToPhys(bestVmid, va);
+		if (!phys || !ibReadPhys(phys, chunk * 4, buf + got))
+			break;
+		got += chunk;
+	}
+	put("; vmid %u va %llx %u dw, read %u\n", bestVmid, bestVa, bestDw, got);
+	if (!got)
+		return;
+	// Context registers: last value and up to four distinct values for the key ones.
+	static uint32_t ctxLast[0x400], ctxSeen[0x400 / 32];
+	static const uint16_t keys[] {0x202, 0x1E0, 0x31C, 0x31D, 0x1C5, 0x1C4, 0x1B3, 0x1B4, 0x1B6, 0x191, 0x205, 0x203,
+		0x1B1, 0x1B8, 0x204, 0x206, 0x08E, 0x08F};
+	static uint32_t keyVals[arrsize(keys)][4];
+	static uint32_t keyNum[arrsize(keys)];
+	memset(ctxSeen, 0, sizeof(ctxSeen));
+	memset(keyNum, 0, sizeof(keyNum));
+	uint32_t primTypes[4] {}, primNum = 0, indexTypes[4] {}, indexNum = 0;
+	uint32_t draws[8] {}, ib2 = 0, packets = 0;
+	auto addDistinct = [](uint32_t *vals, uint32_t &num, uint32_t v) {
+		for (uint32_t k = 0; k < num; k++)
+			if (vals[k] == v)
+				return;
+		if (num < 4)
+			vals[num++] = v;
+	};
+	for (uint32_t j = 0; j < got;) {
+		uint32_t header = buf[j], type = header >> 30;
+		if (type == 2) {
+			j++;
+			continue;
+		}
+		uint32_t count = ((header >> 16) & 0x3FFF) + 1;
+		if (type != 3) {
+			j += 1 + count;
+			continue;
+		}
+		packets++;
+		uint32_t op = (header >> 8) & 0xFF;
+		if (op == 0x69 && j + 1 < got) {
+			uint32_t start = buf[j + 1] & 0xFFFF;
+			for (uint32_t k = 0; k + 1 < count && j + 2 + k < got; k++) {
+				uint32_t reg = start + k;
+				if (reg >= 0x400)
+					break;
+				uint32_t v = buf[j + 2 + k];
+				ctxLast[reg] = v;
+				ctxSeen[reg / 32] |= 1U << (reg % 32);
+				for (uint32_t q = 0; q < arrsize(keys); q++)
+					if (keys[q] == reg)
+						addDistinct(keyVals[q], keyNum[q], v);
+			}
+		} else if (op == 0x79 && j + 2 < got) {
+			uint32_t reg = buf[j + 1] & 0xFFFF;
+			if (reg == 0x242)
+				addDistinct(primTypes, primNum, buf[j + 2]);
+			else if (reg == 0x243)
+				addDistinct(indexTypes, indexNum, buf[j + 2]);
+		} else if (op == 0x2A && j + 1 < got) {
+			addDistinct(indexTypes, indexNum, 0x100 | buf[j + 1]);
+		} else if (op == 0x27) {
+			draws[0]++;
+		} else if (op == 0x2D) {
+			draws[1]++;
+		} else if (op == 0x35) {
+			draws[2]++;
+		} else if (op == 0x25 || op == 0x38) {
+			draws[3]++;
+		} else if (op == 0x15) {
+			draws[4]++;  // DISPATCH_DIRECT
+		} else if (op == 0x16) {
+			draws[5]++;  // DISPATCH_INDIRECT
+		} else if (op == 0x3F || op == 0x33) {
+			ib2++;
+		}
+		j += 1 + count;
+	}
+	put("userib: %u packets; draws idx2 %u auto %u offset %u indirect %u, dispatch %u/%u, ib2 %u; prim", packets, draws[0],
+		draws[1], draws[2], draws[3], draws[4], draws[5], ib2);
+	for (uint32_t k = 0; k < primNum; k++)
+		put(" %x", primTypes[k]);
+	put(", index");
+	for (uint32_t k = 0; k < indexNum; k++)
+		put(" %x", indexTypes[k]);
+	put("\nuserib keys:");
+	for (uint32_t q = 0; q < arrsize(keys); q++) {
+		if (!keyNum[q])
+			continue;
+		put(" %x=", keys[q]);
+		for (uint32_t k = 0; k < keyNum[q]; k++)
+			put(k ? "/%x" : "%x", keyVals[q][k]);
+	}
+	put("\nuserib ctx:");
+	for (uint32_t reg = 0; reg < 0x400; reg++)
+		if (ctxSeen[reg / 32] & (1U << (reg % 32)))
+			put(" %x=%x", reg, ctxLast[reg]);
+	put("\n");
+}
+
 // crpanicat=N black-box report. Spoof boot 21 went to a black panel with no panic in NVRAM, after IOFramebuffer saved a
 // 1366x768 / 76.30 MHz "saved-config", i.e. Apple's controller set a mode. With the screen black, the panic text in
 // NVRAM (AAPL,PanicInfo, read with OpenShell dmpstore) is the only way out: counters, the iGPU tree (framebuffers,
@@ -4332,6 +4543,20 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("hwinfo: calls %u ret %x fixed %u spoofed %u; ref %llx sys %llx mem %llx d8 %llx; device %llx raster %llx shader %llx\n",
 		hwInfoCalls, hwInfoRet, hwInfoFixed, hwInfoSpoofed, hwInfoValues[0], hwInfoValues[1], hwInfoValues[2], hwInfoValues[3],
 		hwInfoValues[4], hwInfoValues[5], hwInfoValues[6]);
+	if (hwInfoCalls) {
+		// What Metal's AddrLib is created with (amdMtlBronzeInitAddrLibInterface): globalGBReg1 (+0xA0) as GB_ADDR_CONFIG,
+		// backEndDisableField, numBanksField, numRanksField (+0xA8-0xB8); and the GPU's own GB_ADDR_CONFIG (0x263E),
+		// MC_ARB_RAMCFG (0x9D8).
+		auto *w = hwInfoCopy;
+		add("hwinfo addrlib: gb %x bedis %x banks %x ranks %x (reg GB_ADDR_CONFIG %x RAMCFG %x); rbmask %x se %u/%x sa %u "
+			"cus %u; chiprev %x\n", w[0xA0 / 4], w[0xA8 / 4], w[0xB0 / 4], w[0xB8 / 4], gpuMmio ? gpuMmio[0x263E] : 0,
+			gpuMmio ? gpuMmio[0x9D8] : 0, w[0x98 / 4], w[0x88 / 4], w[0x8C / 4], w[0x90 / 4], w[0x94 / 4], w[0x8 / 4]);
+	}
+	if (!checkKernelArgument("-crnoibdump")) {
+		static char ibText[3600];
+		captureUserIbs(ibText, sizeof(ibText));
+		add("%s", ibText);
+	}
 	if (hangSnap.taken) {
 		add("hang @%llu arg %x:", hangSnap.ms / 100, hangSnap.arg);
 		for (size_t i = 0; i < arrsize(hangRegs); i++)
@@ -4370,7 +4595,7 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		// AMDVIHardware::initHWInfo: +0x28 GB_ADDR_CONFIG, +0x30/+0x38 PA_SC_RASTER_CONFIG(_1), +0xB0/+0xB8 from
 		// MC_SHARED_CHMAP, +0x128 tile-mode count then the table, +0x1AC macro-tile count then the table.
 		auto *w = hwInfoCopy;
-		add("hwinfo layout: addrcfg %x raster %x %x chmap %x %x; tile modes %u:", w[0x28 / 4], w[0x30 / 4], w[0x38 / 4],
+		add("hwinfo layout: cu masks %x %x %x chmap %x %x; tile modes %u:", w[0x28 / 4], w[0x30 / 4], w[0x38 / 4],
 			w[0xB0 / 4], w[0xB8 / 4], w[0x128 / 4]);
 		for (uint32_t i = 0; i < 32 && i < w[0x128 / 4]; i++)
 			add(" %x", w[0x12C / 4 + i]);
