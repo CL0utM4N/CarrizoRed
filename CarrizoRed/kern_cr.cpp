@@ -4404,8 +4404,7 @@ static void captureUserIbs(char *out, size_t size) {
 	}
 	put("userib: %u found, vm cntl %x", found, mmio[0x505]);
 	if (!bestDw) {
-		put("
-");
+		put("\n");
 		return;
 	}
 	static uint32_t buf[0x4000];
