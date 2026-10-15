@@ -4883,22 +4883,41 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 			skip = SkipNoP2;
 			return fixedHere;
 		}
-		// Plan the renames after p2: reads of vI until it is written again. Any backward branch, or vI inside a
-		// multi-register range, and we leave the shader alone.
+		// Plan the renames after p2: reads of vI until it is written again, or vI inside a multi-register range and we
+		// leave the shader alone. Loops (backward branches) are fine if they all start after p2 and nothing writes vI
+		// after p2: then every later read is of this result (nvram165: the 11 hazards left were in shaders with loops).
+		bool loopAfter = false, writtenAfter = false;
+		for (uint32_t i = p2 + 1; i < end;) {
+			uint32_t x = code[i];
+			if ((x >> 23) == 0x17F) {  // SOPP
+				uint32_t op = (x >> 16) & 0x7F;
+				bool branch = op == 0x02 || (op >= 0x04 && op <= 0x09) || (op >= 0x17 && op <= 0x1A);
+				if (branch && (x & 0x8000)) {  // negative simm16: target = next instruction + simm16
+					int32_t target = static_cast<int32_t>(i) + 1 + static_cast<int16_t>(x & 0xFFFF);
+					if (target <= static_cast<int32_t>(p2)) {
+						skip = SkipBranch;
+						return fixedHere;
+					}
+					loopAfter = true;
+				}
+			}
+			gcn3VgprFields(code + i, end - i, f, n);
+			for (uint32_t k = 0; k < n; k++) {
+				uint32_t v = fieldValue(code + i, f[k]);
+				if (f[k].write && v <= vI && vI < v + f[k].count)
+					writtenAfter = true;
+			}
+			i += gcn3InstLength(code + i, end - i);
+		}
+		if (loopAfter && writtenAfter) {
+			skip = SkipBranch;
+			return fixedHere;
+		}
 		static uint32_t renameAt[64];
 		static VgprField renameField[64];
 		uint32_t renames = 0;
 		for (uint32_t i = p2 + 1; i < end;) {
-			uint32_t x = code[i];
 			uint32_t len = gcn3InstLength(code + i, end - i);
-			if ((x >> 23) == 0x17F) {  // SOPP
-				uint32_t op = (x >> 16) & 0x7F;
-				bool branch = op == 0x02 || (op >= 0x04 && op <= 0x09) || (op >= 0x17 && op <= 0x1A);
-				if (branch && (x & 0x8000)) {  // negative simm16
-					skip = SkipBranch;
-					return fixedHere;
-				}
-			}
 			gcn3VgprFields(code + i, end - i, f, n);
 			bool written = false;
 			for (uint32_t k = 0; k < n; k++) {
