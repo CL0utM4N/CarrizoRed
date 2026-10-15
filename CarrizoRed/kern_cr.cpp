@@ -4555,11 +4555,16 @@ static uint32_t gcn3InstLength(const uint32_t *code, uint32_t left) {
 	uint32_t w = code[0];
 	if (!(w >> 31)) {  // VOP2 / VOP1 / VOPC
 		uint32_t src0 = w & 0x1FF;
+		// v_madmk_f32/v_madak_f32/v_madmk_f16/v_madak_f16 (VOP2 0x17, 0x18, 0x24, 0x25) always carry a literal.
+		uint32_t op2 = (w >> 25) & 0x3F, enc7 = w >> 25;
+		bool vop2 = enc7 != 0x3E && enc7 != 0x3F;
+		if (vop2 && (op2 == 0x17 || op2 == 0x18 || op2 == 0x24 || op2 == 0x25))
+			return src0 == 0xF9 || src0 == 0xFA ? 3 : 2;
 		return src0 == 0xFF || src0 == 0xF9 || src0 == 0xFA ? 2 : 1;
 	}
 	if ((w >> 30) == 2) {  // scalar ALU
-		if ((w >> 28) == 0xB)  // SOPK
-			return 1;
+		if ((w >> 28) == 0xB)  // SOPK; s_setreg_imm32_b32 (op 0x14) carries a literal
+			return ((w >> 23) & 0x1F) == 0x14 ? 2 : 1;
 		uint32_t top9 = w >> 23;
 		if (top9 == 0x17F)  // SOPP
 			return 1;
