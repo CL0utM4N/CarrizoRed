@@ -4470,7 +4470,7 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 				break;
 			got += chunk;
 		}
-		uint32_t p1 = 0, p2 = 0, mov = 0, bad = 0, firstBad = 0, len = 0, shown[4] {}, shownNum = 0;
+		uint32_t p1 = 0, p2 = 0, mov = 0, bad = 0, firstBad = 0, len = 0, shown[6] {}, shownNum = 0;
 		for (uint32_t i = 0; i < got;) {
 			uint32_t w = code[i];
 			if (w == 0xBF810000) {  // s_endpgm
@@ -4493,11 +4493,12 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 			}
 			i += gcn3InstLength(code + i, got - i);
 		}
-		put(ctx, " ps%u %llx: %u dw, p1 %u p2 %u mov %u, p1 dst=src %u", k, va, len ? len : got, p1, p2, mov, bad);
+		put(ctx, " ps%u %llx: %u dw, p1 %u p2 %u mov %u bad %u", k, va, len ? len : got, p1, p2, mov, bad);
 		if (bad)
 			put(ctx, " (%08x)", firstBad);
 		for (uint32_t q = 0; q < shownNum; q++)
-			put(ctx, q ? ",v%u<-v%u" : " [v%u<-v%u", (shown[q] >> 18) & 0xFF, shown[q] & 0xFF);
+			put(ctx, q ? ",a%u%c:v%u<-v%u" : " [a%u%c:v%u<-v%u", (shown[q] >> 10) & 0x3F, "xyzw"[(shown[q] >> 8) & 3],
+				(shown[q] >> 18) & 0xFF, shown[q] & 0xFF);
 		if (shownNum)
 			put(ctx, "]");
 	}
@@ -4545,157 +4546,150 @@ static void captureUserIbs(char *out, size_t size) {
 	if (!cpu || dwords < 0x100 || (dwords & (dwords - 1)))
 		return;
 	uint32_t rptr = mmio[0x21C0] & (dwords - 1);
-	// The largest of the last 16 user IBs before the read pointer.
-	uint64_t bestVa = 0;
-	uint32_t bestDw = 0, bestVmid = 0, found = 0;
-	for (uint32_t back = 4; back < dwords && found < 16; back++) {
+	// The last 16 user IBs before the read pointer (newest first), parsed oldest first.
+	struct Ib {
+		uint64_t va;
+		uint32_t dw, vmid;
+	};
+	Ib ibs[16] {};
+	uint32_t found = 0;
+	for (uint32_t back = 4; back < dwords && found < arrsize(ibs); back++) {
 		uint32_t i = (rptr - back) & (dwords - 1);
 		if (cpu[i] != 0xC0023F00)
 			continue;
 		uint32_t ctl = cpu[(i + 3) & (dwords - 1)], vmid = (ctl >> 24) & 0xF, dw = ctl & 0xFFFFF;
 		if (!vmid || !dw)
 			continue;
-		found++;
-		if (dw > bestDw) {
-			bestDw = dw;
-			bestVmid = vmid;
-			bestVa = (static_cast<uint64_t>(cpu[(i + 2) & (dwords - 1)] & 0xFFFF) << 32) | (cpu[(i + 1) & (dwords - 1)] & ~3U);
-		}
+		ibs[found++] = {(static_cast<uint64_t>(cpu[(i + 2) & (dwords - 1)] & 0xFFFF) << 32) |
+			(cpu[(i + 1) & (dwords - 1)] & ~3U), dw, vmid};
 	}
-	put("userib: %u found, vm cntl %x", found, mmio[0x505]);
-	if (!bestDw) {
-		put("\n");
-		return;
-	}
-	static uint32_t buf[0x4000];
-	uint32_t want = bestDw < arrsize(buf) ? bestDw : arrsize(buf), got = 0;
-	while (got < want) {
-		uint64_t va = bestVa + got * 4ULL;
-		uint32_t chunk = static_cast<uint32_t>((0x1000 - (va & 0xFFF)) / 4);
-		if (chunk > want - got)
-			chunk = want - got;
-		uint64_t phys = ibVaToPhys(bestVmid, va);
-		if (!phys || !ibReadPhys(phys, chunk * 4, buf + got))
-			break;
-		got += chunk;
-	}
-	put("; vmid %u va %llx %u dw, read %u\n", bestVmid, bestVa, bestDw, got);
-	if (!got)
-		return;
-	// Context registers: last value and up to four distinct values for the key ones.
-	static uint32_t ctxLast[0x400], ctxSeen[0x400 / 32];
-	static const uint16_t keys[] {0x202, 0x1E0, 0x31C, 0x31D, 0x1C5, 0x1C4, 0x1B3, 0x1B4, 0x1B6, 0x191, 0x205, 0x203,
-		0x1B1, 0x1B8, 0x204, 0x206, 0x08E, 0x08F};
+	static uint32_t ctx[0x400];
+	memset(ctx, 0, sizeof(ctx));
+	static const uint16_t keys[] {0x202, 0x1E0, 0x31C, 0x1C5, 0x1B3, 0x1B6, 0x1B1, 0x191, 0x192, 0x193, 0x205, 0x203,
+		0x1B8, 0x206};
 	static uint32_t keyVals[arrsize(keys)][4];
 	static uint32_t keyNum[arrsize(keys)];
-	memset(ctxSeen, 0, sizeof(ctxSeen));
 	memset(keyNum, 0, sizeof(keyNum));
-	uint32_t primTypes[4] {}, primNum = 0, indexTypes[4] {}, indexNum = 0;
-	uint32_t draws[8] {}, ib2 = 0, packets = 0;
-	uint32_t psLo = 0, psHi = 0, psNum = 0;
-	uint64_t psAddrs[6] {};
-	auto addDistinct = [](uint32_t *vals, uint32_t &num, uint32_t v) {
+	auto addDistinct = [](uint32_t *vals, uint32_t &num, uint32_t v, uint32_t max) {
 		for (uint32_t k = 0; k < num; k++)
 			if (vals[k] == v)
 				return;
-		if (num < 4)
+		if (num < max)
 			vals[num++] = v;
 	};
-	for (uint32_t j = 0; j < got;) {
-		uint32_t header = buf[j], type = header >> 30;
-		if (type == 2) {
-			j++;
-			continue;
+	// Per draw: pixel shader, NUM_INTERP, VS export count, SPI_PS_INPUT_CNTL_0-2, PS input enables, CB0 info, blend 0.
+	struct Draw {
+		uint64_t ps;
+		uint32_t regs[8];
+	};
+	static const uint16_t drawRegs[8] {0x1B6, 0x1B1, 0x191, 0x192, 0x193, 0x1B3, 0x31C, 0x1E0};
+	static Draw drawSet[12];
+	uint32_t drawNum = 0, drawTotal = 0, parsed = 0, parsedDw = 0, packets = 0, loads[4] {}, vmidMask = 0;
+	uint64_t psCur = 0, psAddrs[8] {};
+	uint32_t psLo = 0, psHi = 0, psNum = 0, psVmid = 0;
+	static uint32_t buf[0x4000];
+	for (uint32_t q = found; q-- > 0;) {
+		vmidMask |= 1U << ibs[q].vmid;
+		uint32_t want = ibs[q].dw < arrsize(buf) ? ibs[q].dw : arrsize(buf), got = 0;
+		while (got < want) {
+			uint64_t va = ibs[q].va + got * 4ULL;
+			uint32_t chunk = static_cast<uint32_t>((0x1000 - (va & 0xFFF)) / 4);
+			if (chunk > want - got)
+				chunk = want - got;
+			uint64_t phys = ibVaToPhys(ibs[q].vmid, va);
+			if (!phys || !ibReadPhys(phys, chunk * 4, buf + got))
+				break;
+			got += chunk;
 		}
-		uint32_t count = ((header >> 16) & 0x3FFF) + 1;
-		if (type != 3) {
-			j += 1 + count;
+		if (!got)
 			continue;
-		}
-		packets++;
-		uint32_t op = (header >> 8) & 0xFF;
-		if (op == 0x69 && j + 1 < got) {
-			uint32_t start = buf[j + 1] & 0xFFFF;
-			for (uint32_t k = 0; k + 1 < count && j + 2 + k < got; k++) {
-				uint32_t reg = start + k;
-				if (reg >= 0x400)
-					break;
-				uint32_t v = buf[j + 2 + k];
-				ctxLast[reg] = v;
-				ctxSeen[reg / 32] |= 1U << (reg % 32);
-				for (uint32_t q = 0; q < arrsize(keys); q++)
-					if (keys[q] == reg)
-						addDistinct(keyVals[q], keyNum[q], v);
+		parsed++;
+		parsedDw += got;
+		for (uint32_t j = 0; j < got;) {
+			uint32_t header = buf[j], type = header >> 30;
+			if (type == 2) {
+				j++;
+				continue;
 			}
-		} else if (op == 0x76 && j + 1 < got) {
-			uint32_t start = buf[j + 1] & 0xFFFF;
-			for (uint32_t k = 0; k + 1 < count && j + 2 + k < got; k++) {
-				uint32_t reg = start + k, v = buf[j + 2 + k];
-				if (reg == 0x08)
-					psLo = v;
-				else if (reg == 0x09)
-					psHi = v;
+			uint32_t count = ((header >> 16) & 0x3FFF) + 1;
+			if (type != 3) {
+				j += 1 + count;
+				continue;
 			}
-			if (psLo) {
-				uint64_t va = (static_cast<uint64_t>(psHi & 0xFF) << 40) | (static_cast<uint64_t>(psLo) << 8);
+			packets++;
+			uint32_t op = (header >> 8) & 0xFF;
+			if (op == 0x69 && j + 1 < got) {
+				uint32_t start = buf[j + 1] & 0xFFFF;
+				for (uint32_t k = 0; k + 1 < count && j + 2 + k < got; k++) {
+					uint32_t reg = start + k;
+					if (reg >= 0x400)
+						break;
+					ctx[reg] = buf[j + 2 + k];
+					for (uint32_t r = 0; r < arrsize(keys); r++)
+						if (keys[r] == reg)
+							addDistinct(keyVals[r], keyNum[r], ctx[reg], 4);
+				}
+			} else if (op == 0x76 && j + 1 < got) {
+				uint32_t start = buf[j + 1] & 0xFFFF;
+				for (uint32_t k = 0; k + 1 < count && j + 2 + k < got; k++) {
+					uint32_t reg = start + k, v = buf[j + 2 + k];
+					if (reg == 0x08)
+						psLo = v;
+					else if (reg == 0x09)
+						psHi = v;
+				}
+				if (psLo) {
+					psCur = (static_cast<uint64_t>(psHi & 0xFF) << 40) | (static_cast<uint64_t>(psLo) << 8);
+					bool known = false;
+					for (uint32_t r = 0; r < psNum; r++)
+						known |= psAddrs[r] == psCur;
+					if (!known && psNum < arrsize(psAddrs)) {
+						psAddrs[psNum++] = psCur;
+						psVmid = ibs[q].vmid;
+					}
+				}
+			} else if (op == 0x5F || op == 0x60 || op == 0x61 || op == 0x73) {
+				loads[op == 0x5F ? 0 : op == 0x60 ? 1 : op == 0x61 ? 2 : 3]++;
+			} else if (op == 0x27 || op == 0x2D || op == 0x35 || op == 0x25 || op == 0x38) {
+				drawTotal++;
+				Draw d {psCur, {}};
+				for (uint32_t r = 0; r < 8; r++)
+					d.regs[r] = ctx[drawRegs[r]];
 				bool known = false;
-				for (uint32_t q = 0; q < psNum; q++)
-					known |= psAddrs[q] == va;
-				if (!known && psNum < arrsize(psAddrs))
-					psAddrs[psNum++] = va;
+				for (uint32_t r = 0; r < drawNum && !known; r++)
+					known = !memcmp(&drawSet[r], &d, sizeof(d));
+				if (!known && drawNum < arrsize(drawSet))
+					drawSet[drawNum++] = d;
 			}
-		} else if (op == 0x79 && j + 2 < got) {
-			uint32_t reg = buf[j + 1] & 0xFFFF;
-			if (reg == 0x242)
-				addDistinct(primTypes, primNum, buf[j + 2]);
-			else if (reg == 0x243)
-				addDistinct(indexTypes, indexNum, buf[j + 2]);
-		} else if (op == 0x2A && j + 1 < got) {
-			addDistinct(indexTypes, indexNum, 0x100 | buf[j + 1]);
-		} else if (op == 0x27) {
-			draws[0]++;
-		} else if (op == 0x2D) {
-			draws[1]++;
-		} else if (op == 0x35) {
-			draws[2]++;
-		} else if (op == 0x25 || op == 0x38) {
-			draws[3]++;
-		} else if (op == 0x15) {
-			draws[4]++;  // DISPATCH_DIRECT
-		} else if (op == 0x16) {
-			draws[5]++;  // DISPATCH_INDIRECT
-		} else if (op == 0x3F || op == 0x33) {
-			ib2++;
+			j += 1 + count;
 		}
-		j += 1 + count;
 	}
-	put("userib: %u packets; draws idx2 %u auto %u offset %u indirect %u, dispatch %u/%u, ib2 %u; prim", packets, draws[0],
-		draws[1], draws[2], draws[3], draws[4], draws[5], ib2);
-	for (uint32_t k = 0; k < primNum; k++)
-		put(" %x", primTypes[k]);
-	put(", index");
-	for (uint32_t k = 0; k < indexNum; k++)
-		put(" %x", indexTypes[k]);
-	put("\nuserib keys:");
-	for (uint32_t q = 0; q < arrsize(keys); q++) {
-		if (!keyNum[q])
+	put("userib: %u found (vmids %x), %u parsed, %u dw, %u packets, %u draws; loads sh %u cfg %u ctx %u ind %u\n", found,
+		vmidMask, parsed, parsedDw, packets, drawTotal, loads[0], loads[1], loads[2], loads[3]);
+	put("userib keys:");
+	for (uint32_t r = 0; r < arrsize(keys); r++) {
+		if (!keyNum[r])
 			continue;
-		put(" %x=", keys[q]);
-		for (uint32_t k = 0; k < keyNum[q]; k++)
-			put(k ? "/%x" : "%x", keyVals[q][k]);
+		put(" %x=", keys[r]);
+		for (uint32_t k = 0; k < keyNum[r]; k++)
+			put(k ? "/%x" : "%x", keyVals[r][k]);
+	}
+	put("\nuserib draws (ps ninterp vsout cntl0-2 ena cb0 blend0):");
+	for (uint32_t r = 0; r < drawNum; r++) {
+		uint32_t psIndex = 0;
+		for (uint32_t k = 0; k < psNum; k++)
+			if (psAddrs[k] == drawSet[r].ps)
+				psIndex = k;
+		put(" [ps%u", psIndex);
+		for (uint32_t k = 0; k < 8; k++)
+			put(" %x", drawSet[r].regs[k]);
+		put("]");
 	}
 	put("\nuserib ps (%u):", psNum);
 	PutState state {out, size, len};
-	reportPixelShaders(bestVmid, psAddrs, psNum, psPut, &state);
+	reportPixelShaders(psVmid, psAddrs, psNum, psPut, &state);
 	len = state.len;
 	put("\n");
-	if (checkKernelArgument("-crdumpctx")) {
-		put("userib ctx:");
-		for (uint32_t reg = 0; reg < 0x400; reg++)
-			if (ctxSeen[reg / 32] & (1U << (reg % 32)))
-				put(" %x=%x", reg, ctxLast[reg]);
-		put("\n");
-	}
 }
 
 // crpanicat=N black-box report. Spoof boot 21 went to a black panel with no panic in NVRAM, after IOFramebuffer saved a
