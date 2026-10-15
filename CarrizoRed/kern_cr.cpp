@@ -515,32 +515,53 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 
 CRDriver *CRDriver::callback = nullptr;
 
+// Stoney's shader instruction set. Apple's Metal compiler (AMDShared.bundle's libSC.dylib, run in MTLCompilerService)
+// picks its back end with SCGetInstructionSet(family, revision, device): family 0x82 (VI, what the Metal driver reports
+// for every GFX8 chip) with a revision outside Tonga's 0x14-0x27 gives the generic VI set 0x0E, which SCCreate turns into
+// SCIcelandInfo (baseline GFX 8.0); family 0x87 (CZ) with revision 0x61-0xFE, i.e. Stoney, gives 0x1E, which becomes
+// SCGfx81Info, AMD's own Stoney back end (16 LDS banks: v_interp_p1_f32 must not reuse its source register, which a GFX
+// 8.0 back end does, giving wrong texture coordinates; Carrizo itself gets 0x0E). The Metal driver only knows VI, so make
+// the VI branch return 0x1E.
+//
+// libSC exists only inside the dyld shared cache, and Lilu's user patcher locates its patches by reading the library
+// from disk, so a Lilu binary patch for it never applies (nvram141 and later: no change after clearing the shader
+// caches). Do what Lilu does underneath instead: wrap cs_validate_range, which the kernel calls on every page of signed
+// code it reads in, and after validation patch the page holding SCGetInstructionSet in place. The page is then shared
+// by every process that maps the cache. The match is 72 bytes of SCGetInstructionSet at its offset in the page
+// (macOS 15.8.1, 24H32); the patched byte is the VI branch's `mov eax, 0x0E`. -crnoscpatch disables it.
+static constexpr size_t ScPatchPageOffset = 0xD78, ScPatchByte = 0x25;
+static const uint8_t scPatchFind[] {
+	0x83, 0xC6, 0xD8, 0x83, 0xFE, 0x13, 0x77, 0x12, 0x83, 0xE2, 0xFE, 0xB8, 0x0D, 0x00, 0x00, 0x00, 0x81, 0xFA,
+	0xA0, 0x67, 0x00, 0x00, 0x75, 0x02, 0x5D, 0xC3, 0xB8, 0x0C, 0x00, 0x00, 0x00, 0x5D, 0xC3, 0x83, 0xC6, 0xEC,
+	0xB8, 0x0E, 0x00, 0x00, 0x00, 0x83, 0xFE, 0x13, 0x77, 0xEA, 0x81, 0xC2, 0xD7, 0x96, 0xFF, 0xFF, 0x83, 0xFA,
+	0x07, 0x73, 0xDF, 0x48, 0x63, 0xC2, 0x48, 0x8D, 0x0D, 0x41, 0x82, 0x0B, 0x00, 0x8B, 0x04, 0x81, 0x5D, 0xC3,
+};
+static_assert(ScPatchPageOffset + sizeof(scPatchFind) <= 0x1000, "pattern must fit in the page");
+static mach_vm_address_t orgCsValidateRange;
+static bool scPatchHooked;
+static uint32_t scPatchPages, scPatchCalls;
+
+static boolean_t wrapCsValidateRange(void *blobs, void *pager, uint64_t offset, const void *data, uint64_t size,
+	unsigned *tainted) {
+	auto res = FunctionCast(wrapCsValidateRange, orgCsValidateRange)(blobs, pager, offset, data, size, tainted);
+	__atomic_fetch_add(&scPatchCalls, 1, __ATOMIC_RELAXED);
+	if (res && data) {
+		// Each 4 KB page in the range: the range starts at a page boundary of the file (offset).
+		for (uint64_t pos = (0x1000 - (offset & 0xFFF)) & 0xFFF; pos + ScPatchPageOffset + sizeof(scPatchFind) <= size;
+			 pos += 0x1000) {
+			auto *at = const_cast<uint8_t *>(static_cast<const uint8_t *>(data)) + pos + ScPatchPageOffset;
+			if (at[0] == scPatchFind[0] && !memcmp(at, scPatchFind, sizeof(scPatchFind))) {
+				at[ScPatchByte] = 0x1E;
+				__atomic_fetch_add(&scPatchPages, 1, __ATOMIC_RELAXED);
+			}
+		}
+	}
+	return res;
+}
+
 void CRDriver::init() {
 	callback = this;
 	SYSLOG("cr", "CarrizoRed starting on kernel %d.%d", getKernelVersion(), getKernelMinorVersion());
-
-	// Stoney's shader instruction set. Apple's Metal compiler (AMDShared.bundle's libSC.dylib, run in MTLCompilerService)
-	// picks its back end with SCGetInstructionSet(family, revision, device): family 0x82 (VI, what the Metal driver
-	// reports for every GFX8 chip) with a revision outside Tonga's 0x14-0x27 gives the generic VI set 0x0E, which SCCreate
-	// turns into SCIcelandInfo (baseline GFX 8.0); family 0x87 (CZ) with revision 0x61-0xFE, i.e. Stoney, gives 0x1E,
-	// which becomes SCGfx81Info, AMD's own Stoney back end (16 LDS banks: v_interp_p1_f32 must not reuse its source
-	// register, which a GFX 8.0 back end does, giving wrong texture coordinates). The Metal driver only knows VI, so
-	// return 0x1E from the VI branch. One unique 12-byte pattern; -crnoscpatch disables it. CarrizoRed only runs on
-	// Carrizo/Bristol Ridge/Stoney, where no real VI dGPU shares the compiler.
-	if (!checkKernelArgument("-crnoscpatch")) {
-		static const uint8_t find[] {0x83, 0xC6, 0xEC, 0xB8, 0x0E, 0x00, 0x00, 0x00, 0x83, 0xFE, 0x13, 0x77};
-		static const uint8_t replace[] {0x83, 0xC6, 0xEC, 0xB8, 0x1E, 0x00, 0x00, 0x00, 0x83, 0xFE, 0x13, 0x77};
-		static UserPatcher::BinaryModPatch patch {CPU_TYPE_X86_64, 0, find, replace, sizeof(find), 0, 1,
-			UserPatcher::FileSegment::SegmentTextText, 1};
-		static UserPatcher::BinaryModInfo mod {"/System/Library/Extensions/AMDShared.bundle/Contents/PlugIns/libSC.dylib",
-			&patch, 1};
-		static UserPatcher::ProcInfo procs[] {
-			{"MTLCompilerService", sizeof("MTLCompilerService") - 1, 1, UserPatcher::ProcInfo::MatchAny},
-		};
-		auto err = lilu.onProcLoad(procs, arrsize(procs), nullptr, nullptr, &mod, 1);
-		if (err != LiluAPI::Error::NoError)
-			SYSLOG("cr", "failed to register the libSC Stoney instruction-set patch (%d)", err);
-	}
 
 	lilu.onPatcherLoadForce(
 		[](void *user, KernelPatcher &patcher) { static_cast<CRDriver *>(user)->processPatcher(patcher); }, this);
@@ -552,7 +573,19 @@ void CRDriver::init() {
 		this);
 }
 
-void CRDriver::processPatcher(KernelPatcher &) {
+void CRDriver::processPatcher(KernelPatcher &patcher) {
+	if (!checkKernelArgument("-crnoscpatch")) {
+		// Long route, chained with Lilu's own wrapper of the same function (its user patcher, used by RestrictEvents).
+		KernelPatcher::RouteRequest request {"_cs_validate_range", wrapCsValidateRange, orgCsValidateRange};
+		scPatchHooked = patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1) && orgCsValidateRange &&
+			orgCsValidateRange != EINVAL;
+		if (!scPatchHooked) {
+			SYSLOG("cr", "failed to hook cs_validate_range for the libSC Stoney patch (error %d)", patcher.getError());
+			orgCsValidateRange = 0;
+			patcher.clearError();
+		}
+	}
+
 	auto *devInfo = DeviceInfo::create();
 	if (!devInfo) {
 		SYSLOG("cr", "failed to create DeviceInfo");
@@ -4314,6 +4347,7 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	if (gpuDeadMs)
 		add("GPU NOT RESPONDING (registers read ffffffff) %s, first seen @%llu: power off fully before the next boot\n",
 			gpuDeadAtStart ? "from start-up" : "since", gpuDeadMs / 100);
+	add("scpatch: hooked %d, pages patched %u (of %u validated)\n", scPatchHooked, scPatchPages, scPatchCalls);
 	add("routes: %u ok, %u failed, %u not landed (last %s); pool %lu/%lu\n", routesOk, routesFailed, routesUnverified,
 		routeLastFailed ? routeLastFailed : "-", routePoolUsed, RoutePoolSize);
 	add("kexts: X4000 %u(+%u)@%llx HWServices %u(+%u)@%llx HWLibs %u(+%u)@%llx\n", accelKextLoads[0], accelKextRepeats[0],
