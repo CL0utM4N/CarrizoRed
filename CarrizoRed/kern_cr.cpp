@@ -2950,7 +2950,7 @@ void CRDriver::setGpuModel() {
 		}
 		auto *given = OSDynamicCast(OSData, iGPU->getProperty("model"));
 		if (given && given->getLength() > 1 && given->getLength() < sizeof(model) &&
-			!strnstr(static_cast<const char *>(given->getBytesNoCopy()), "Polaris", given->getLength())) {
+			!strnstr(static_cast<char *>(const_cast<void *>(given->getBytesNoCopy())), "Polaris", given->getLength())) {
 			lilu_os_strlcpy(model, static_cast<const char *>(given->getBytesNoCopy()), given->getLength());
 		} else {
 			uint32_t brand[13] {};
@@ -2962,7 +2962,7 @@ void CRDriver::setGpuModel() {
 				brand[i * 4 + 2] = c;
 				brand[i * 4 + 3] = d;
 			}
-			auto *name = reinterpret_cast<const char *>(brand);
+			auto *name = reinterpret_cast<char *>(brand);
 			auto *radeon = strnstr(name, "RADEON R", 48);
 			if (radeon && radeon[8] >= '0' && radeon[8] <= '9')
 				snprintf(model, sizeof(model), "AMD Radeon R%c Graphics", radeon[8]);
