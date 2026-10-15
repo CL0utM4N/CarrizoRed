@@ -616,6 +616,7 @@ void CRDriver::processPatcher(KernelPatcher &) {
 	logPCIInfo();
 	if (checkKernelArgument("-crmacgpu"))
 		setMacGpuProperties();
+	setGpuModel();
 	if (!checkKernelArgument("-crnommio"))
 		probeMMIO();
 
@@ -1058,6 +1059,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (panicAt && t >= panicAt)
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
 		kickStalledFlip();
+		self->setGpuModel();
 		checkGpuAlive(gpuMmio);
 		if (smuLoadOk())
 			fixRbPlus(gpuMmio, self->family == ChipFamily::Stoney);
@@ -2928,9 +2930,51 @@ void CRDriver::setMacGpuProperties() {
 	iGPU->setProperty("built-in", builtIn, sizeof(builtIn));
 	char slotName[] = "built-in";
 	iGPU->setProperty("AAPL,slot-name", slotName, sizeof(slotName));
-	const char *model = family == ChipFamily::Stoney ? "AMD Radeon R5 Graphics" : "AMD Radeon R7 Graphics";
-	iGPU->setProperty("model", const_cast<char *>(model), static_cast<unsigned>(strlen(model) + 1));
-	SYSLOG("cr", "-crmacgpu: built-in, AAPL,slot-name and model (%s) set", model);
+	SYSLOG("cr", "-crmacgpu: built-in and AAPL,slot-name set");
+}
+
+// The GPU's name in About This Mac and System Information: the iGPU's "model". With the Polaris device ID Apple's
+// controller names it "AMD Radeon Polaris". Use the APU's own name for its graphics, from the CPU brand string
+// ("AMD A9-9425 RADEON R5, 5 COMPUTE CORES 2C+3G" -> "AMD Radeon R5 Graphics"), or a "model" from DeviceProperties if
+// one was given. Set at start and re-checked by the watcher, since the controller may set its own later.
+// -crnomodel leaves it alone.
+void CRDriver::setGpuModel() {
+	static char model[64];
+	static bool disabled;
+	if (disabled || !iGPU)
+		return;
+	if (!model[0]) {
+		if (checkKernelArgument("-crnomodel")) {
+			disabled = true;
+			return;
+		}
+		auto *given = OSDynamicCast(OSData, iGPU->getProperty("model"));
+		if (given && given->getLength() > 1 && given->getLength() < sizeof(model) &&
+			!strnstr(static_cast<const char *>(given->getBytesNoCopy()), "Polaris", given->getLength())) {
+			lilu_os_strlcpy(model, static_cast<const char *>(given->getBytesNoCopy()), given->getLength());
+		} else {
+			uint32_t brand[13] {};
+			for (uint32_t i = 0; i < 3; i++) {
+				uint32_t a = 0x80000002 + i, b, c, d;
+				asm volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+				brand[i * 4] = a;
+				brand[i * 4 + 1] = b;
+				brand[i * 4 + 2] = c;
+				brand[i * 4 + 3] = d;
+			}
+			auto *name = reinterpret_cast<const char *>(brand);
+			auto *radeon = strnstr(name, "RADEON R", 48);
+			if (radeon && radeon[8] >= '0' && radeon[8] <= '9')
+				snprintf(model, sizeof(model), "AMD Radeon R%c Graphics", radeon[8]);
+			else
+				lilu_os_strlcpy(model, "AMD Radeon Graphics", sizeof(model));
+		}
+		SYSLOG("cr", "GPU model: %s", model);
+	}
+	auto *current = OSDynamicCast(OSData, iGPU->getProperty("model"));
+	size_t len = strlen(model) + 1;
+	if (!current || current->getLength() != len || memcmp(current->getBytesNoCopy(), model, len))
+		iGPU->setProperty("model", model, static_cast<unsigned>(len));
 }
 
 // Display interrupts go through the IH ring, managed by BaffinInterruptManager. Polaris (Tonga IH) can acknowledge

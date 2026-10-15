@@ -38,6 +38,7 @@ private:
 	static bool wrapStartFail(IOService *that, IOService *provider);
 	void patchAgdpBoardId(KernelPatcher &patcher, size_t kext);
 	void setMacGpuProperties();
+	void setGpuModel();
 	void setSoftPowerPlayTable();
 
 	void patchInterrupts(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size);

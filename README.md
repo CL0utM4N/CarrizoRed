@@ -206,7 +206,8 @@ and the list of affected machines.
 | `-crstutter`, `-crfeds`, `-crfbwrklp` | Keep Apple's `CFG_USE_STUTTER` / `CFG_USE_FEDS` / `CFG_USE_FBWRKLP` (forced off by default) |
 | `-crnoaudio`, `-crnotcon` | Force `CFG_NO_AUDIO` on / `CFG_USE_TCON` off |
 | `-crrestore` | Write the firmware's boot values back into pipe 0's processing chain and hold them (display bisect) |
-| `-crmacgpu` | Neutralise AGDP's board-id lookup; set `built-in`, `AAPL,slot-name` and `model` on the iGPU |
+| `-crmacgpu` | Neutralise AGDP's board-id lookup; set `built-in` and `AAPL,slot-name` on the iGPU |
+| `-crnomodel` | Leave the iGPU's `model` alone (by default it is named from the CPU brand string, e.g. "AMD Radeon R5 Graphics", or a `model` from DeviceProperties is kept) |
 
 ## Layout
 
