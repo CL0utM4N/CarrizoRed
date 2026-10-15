@@ -557,21 +557,35 @@ static const uint8_t walkFenceFind[] {
 	0x48, 0xB9, 0x02, 0x00, 0x00, 0x00, 0xB8, 0x01, 0x02, 0x06, 0x48, 0x89, 0x8F, 0xDC, 0x02, 0x00, 0x00, 0xC7, 0x87,
 	0xE4, 0x02, 0x00, 0x00, 0xE9, 0x01, 0x00, 0x00,
 };
+// The texture layout code (setSharedTextureParams' callee) computes DCC metadata, and so gives the texture delta colour
+// compression, only when a flag is set: `test byte [rbp - 0x2C], 1; je <no DCC>`. nvram146/147: WindowServer's render
+// targets have CB_COLOR_INFO.DCC_ENABLE. Make the je a jmp (90 E9, same displacement) so no texture gets DCC.
+// -crdcc keeps DCC.
+static const uint8_t dccFind[] {
+	0x41, 0x89, 0x45, 0x00, 0x4D, 0x89, 0xE1, 0x49, 0x8B, 0x04, 0x24, 0x4C, 0x8B, 0x45, 0xA0, 0x48, 0x8B, 0x55, 0xA8, 0xF6,
+	0x45, 0xD4, 0x01, 0x0F, 0x84, 0x78, 0x01, 0x00, 0x00, 0x4D, 0x89, 0xCC, 0x48, 0x8D, 0xB5, 0x40, 0xFE, 0xFF, 0xFF, 0x48,
+};
+static const uint8_t isaReplace[] {0x1E}, smallPrimReplace[] {0x00}, walkFenceReplace[] {0xA8}, dccReplace[] {0x90, 0xE9};
 struct PagePatch {
 	const char *name;
-	const char *offArg;
+	const char *arg;  // boot-arg that turns it off (on, for an opt-in patch)
+	bool optIn;
 	uint32_t pageOffset;
 	const uint8_t *find;
 	uint32_t size;
-	uint32_t byte;
-	uint8_t value;
+	uint32_t at;
+	const uint8_t *replace;
+	uint32_t replaceSize;
 	bool enabled;
 	uint32_t hits;
 };
 static PagePatch pagePatches[] {
-	{"isa", "-crnoscpatch", 0xD78, scPatchFind, sizeof(scPatchFind), 0x25, 0x1E},
-	{"smallprim", "-crnosmallprim", 0x215, smallPrimFind, sizeof(smallPrimFind), 14, 0x00},
-	{"walkfence", "-crnowalkfence", 0x4AA, walkFenceFind, sizeof(walkFenceFind), 6, 0xA8},
+	{"isa", "-crnoscpatch", false, 0xD78, scPatchFind, sizeof(scPatchFind), 0x25, isaReplace, sizeof(isaReplace)},
+	{"smallprim", "-crnosmallprim", false, 0x215, smallPrimFind, sizeof(smallPrimFind), 14, smallPrimReplace,
+		sizeof(smallPrimReplace)},
+	{"walkfence", "-crnowalkfence", false, 0x4AA, walkFenceFind, sizeof(walkFenceFind), 6, walkFenceReplace,
+		sizeof(walkFenceReplace)},
+	{"dcc", "-crdcc", false, 0xA2C, dccFind, sizeof(dccFind), 0x17, dccReplace, sizeof(dccReplace)},
 };
 static mach_vm_address_t orgCsValidatePage;
 static bool scPatchHooked;
@@ -589,7 +603,7 @@ static void wrapCsValidatePage(void *vnode, void *pager, uint64_t offset, const 
 			continue;
 		auto *at = page + patch.pageOffset;
 		if (at[0] == patch.find[0] && !memcmp(at, patch.find, patch.size)) {
-			at[patch.byte] = patch.value;
+			memcpy(at + patch.at, patch.replace, patch.replaceSize);
 			__atomic_fetch_add(&patch.hits, 1, __ATOMIC_RELAXED);
 		}
 	}
@@ -612,7 +626,8 @@ void CRDriver::init() {
 void CRDriver::processPatcher(KernelPatcher &patcher) {
 	bool anyPagePatch = false;
 	for (auto &patch : pagePatches) {
-		patch.enabled = !checkKernelArgument(patch.offArg) && patch.pageOffset + patch.size <= 0x1000;
+		patch.enabled = checkKernelArgument(patch.arg) == patch.optIn && patch.pageOffset + patch.size <= 0x1000 &&
+			patch.at + patch.replaceSize <= patch.size;
 		anyPagePatch |= patch.enabled;
 	}
 	if (anyPagePatch) {
