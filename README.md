@@ -11,23 +11,25 @@ used them), so on a hackintosh they've only had the firmware framebuffer.
 > don't run it on a machine you depend on. Everything below is from one test laptop.
 
 **What it does today:** on a Stoney Ridge laptop, macOS Sequoia boots to the desktop and drives the built-in panel
-through Apple's own Polaris display driver, instead of the firmware's fixed framebuffer. **Graphics acceleration
-(Metal) doesn't work yet;** it's the current work.
+through Apple's own Polaris display driver, instead of the firmware's fixed framebuffer. **Metal acceleration now
+works far enough for an accelerated desktop:** WindowServer draws the login screen and desktop through the GPU, and
+apps use Metal. It isn't stable yet: some boots don't bring the accelerator up, some textures (Dock and other icons)
+render wrong, and the desktop can still freeze after a while. That's the current work.
 
 | | Status |
 |---|---|
 | Built-in eDP panel | **Works** (1366×768) through Apple's `AMD9500Controller` / `AMDFramebuffer`: Recovery, the installer and an installed Sequoia 15.8.1 |
 | Display interrupts (vblank) | **Works** |
-| Acceleration / Metal (`AMDRadeonX4000`) | **In progress, not usable.** Apple's accelerator attaches; PowerPlay starts (Dummy back end); the GPU's microcode loads and its command processor starts, but stalls on its first commands. Boot with `-crnoaccel` for a working display without it |
+| Acceleration / Metal (`AMDRadeonX4000`) | **Partly working, unstable.** The SMU loads the GPU microcode, the command processor and SDMA run, interrupts work, and WindowServer composites the login screen and desktop with Metal (several apps' command queues, tens of thousands of submissions). Open problems: some boots the accelerator doesn't start (CarrizoRed's HWLibs patches don't take; a black-box report says why), icons and the Dock render wrong (texture layout, see below), and the desktop can still freeze. Boot with `-crnoaccel` for a stable, unaccelerated desktop |
 | Brightness, external displays (HDMI), sleep/wake, HDMI audio | Not done or untested |
-| Video decode/encode (UVD/VCE) | Not supported (needs the APU's SMU, which isn't driven yet) |
+| Video decode/encode (UVD/VCE) | Not supported yet (the engines need SMU power messages; CarrizoRed only uses the SMU for microcode so far) |
 | Carrizo / Bristol Ridge | Same display engine and code paths, **untested** (no hardware) |
 
 **Tested on:**
 
 | Machine | APU | macOS | Result |
 |---|---|---|---|
-| ASUS VivoBook 15 D509BA | A9-9425 (Stoney Ridge, Radeon R5) | Sequoia 15.4 (Recovery, installer), 15.8.1 (installed) | Display works; acceleration in progress |
+| ASUS VivoBook 15 D509BA | A9-9425 (Stoney Ridge, Radeon R5) | Sequoia 15.4 (Recovery, installer), 15.8.1 (installed) | Display works; accelerated desktop reached, not yet reliable |
 
 Reports from other Carrizo, Bristol Ridge or Stoney machines are welcome once it's further along; open an issue with
 the model and the black-box report (see *Installing*).
@@ -43,13 +45,21 @@ The display needed fixes for the differences between DCE 11.0 (these APUs) and D
 - the interrupt handler's enable bit, which sits in a different register on Carrizo/Stoney than on Polaris.
 
 The accelerator so far needed:
-- one sDMA engine instead of two;
-- one shader engine;
+- one sDMA engine instead of two, and one shader engine;
 - PowerPlay's Dummy back end, with the VBIOS PowerPlay table;
-- direct microcode loading;
-- the APU's VRAM window moved to GPU address 0;
-- APU page-table addresses;
+- **an SMU microcode loader** (a port of Linux's `smu8_smumgr`): on these APUs only the SMU can load the RLC, CP and
+  SDMA microcode, and Apple's PowerPlay has no SMU8 code. It's reloaded after Apple's GPU hang recovery too;
+- the APU's VRAM window moved to GPU address 0, with APU page-table addresses;
+- the interrupt ring moved into VRAM (the display driver addressed it through a range the VRAM move covers);
+- the hardware description given to the Metal driver: the spoofed device ID instead of Stoney's real one;
+- graphics power gating kept off (nothing drives the SMU's save/restore jobs under the Dummy back end, and the GPU
+  hung on its next command after powering down);
+- lost display-flip completions delivered by CarrizoRed (otherwise one lost completion freezes the screen);
 - the video engines left off.
+
+Still open: texture layout (Apple's Metal driver assumes Polaris 11's 4 memory pipes, Stoney has 2 and one render
+backend, which fits the broken icons and Dock); CarrizoRed's patches to Apple's HWLibs sometimes not taking at boot;
+the GPU occasionally not responding after a warm restart (power off fully); and stability over longer sessions.
 
 Each fix is documented in the code, in [docs/TEST_MACHINES.md](docs/TEST_MACHINES.md) and in
 [docs/APPLE_KEXTS.md](docs/APPLE_KEXTS.md).
@@ -145,7 +155,7 @@ and the list of affected machines.
 | `-crnosdmafix` | Stoney: releasing Apple's second sDMA engine and starting sDMA0 alone |
 | `-crnoppdummy` | Stoney/Carrizo: don't set `PP_PhmUseDummyBackEnd` (PowerPlay has no back end for these APUs; without the Dummy one, `initializePowerPlay` fails and the accelerator never powers up); also turns PowerPlay off |
 | `-crnosoftpptable` | Stoney/Carrizo: don't hand PowerPlay the VBIOS's PowerPlayInfo table as `PP_PhmSoftPowerPlayTable` (HWLibs' own VBIOS lookup appears to fail on the APU, and PowerPlay then fails to initialise) |
-| `-crnodirectucode` | Stoney/Carrizo: leave CAIL's `DisableCailLoadUcode` on (the default), so the RLC/CP/SDMA microcode is left to the SMU. With the Dummy PowerPlay back end nothing asks the SMU to load it, and the accelerator's power-up waits forever |
+| `-crnodirectucode` | Stoney/Carrizo: leave CAIL's `DisableCailLoadUcode` on (the default). CarrizoRed clears it so CAIL reserves its micro-engine VRAM block, which the SMU microcode loader extends and uses; with the flag on, nothing loads the microcode and the accelerator's power-up waits forever |
 | `-crmm` | Also power up the accelerator's UVD, VCE and SAMU engines. On the APU those blocks stay power-gated without a real PowerPlay back end, and programming them can hang the bus, so by default their power-up is skipped (the engines themselves stay) |
 | `-crnosmuload` | Stoney: don't have the SMU load the RLC/CP/SDMA microcode (CarrizoRed builds the SMU's task table in VRAM from the images in HWLibs, as Linux `smu8_smumgr` does); direct register loading alone doesn't work on these APUs |
 | `-crnoihmove` | With the accelerator: leave the interrupt ring in system memory, where the GPU can no longer reach it once VRAM is moved to GPU address 0 (an interrupt storm, and the accelerator's work never completes) |
@@ -155,10 +165,12 @@ and the list of affected machines.
 | `-crnoflipkick` | Don't deliver a display flip's completion when it has been missing for 250 ms (otherwise a lost completion freezes the screen while macOS keeps running) |
 | `-cracceldefer` | Hold the accelerator stack back until the display controller has finished setting up, then re-match it (experimental; off by default) |
 | `-crnoautopanic` | Don't panic with the black-box report when the accelerator hasn't loaded the GPU microcode by 120 s |
+| `-crnohwlibswire` | Don't lock HWLibs' code in memory before patching it (some boots its patched code reverted to Apple's original before CAIL ran) |
+| `-crnohwlibsrepatch` | Don't re-apply the HWLibs patches when they're found missing at `AMDHardware::setupCAIL` (only report it) |
 | `-crats` | Let CAIL turn on the iGPU's PCIe ATS, PRI and PASID capabilities (IOMMUv2 features; macOS has no AMD IOMMU driver to answer them), which CarrizoRed otherwise leaves off |
 | `-crnoarbfix` | Leave Apple's Polaris memory-arbiter tweak (`MC_ARB_MISC2` `SEQ_RDY_POP_IDLE` / `POP_IDLE_REPLAY`) in `AMDBaffinHardware::powerUp`; on the APU the arbiter is shared with the CPU |
 | `-crnorlcreset`, `-crrlcreset` | With direct microcode loading: when CAIL halts the RLC to load its microcode, `-crnorlcreset` leaves coarse-grain clock gating and power gating alone (otherwise both are turned off); `-crrlcreset` also soft-resets the RLC again (CAIL already does, before its RLC set-up) |
-| `-crgating` | With direct microcode loading: keep CAIL's clock/power-gating settings when the RLC starts instead of forcing the MGCG overrides, CP/RLC memory light sleep off and CP power gating off (the RLC that would manage them doesn't answer yet) |
+| `-crgating` | Keep CAIL's clock/power-gating settings: when the RLC starts (otherwise MGCG overrides forced, CP/RLC memory light sleep and CP power gating off) and after start-up (otherwise `Cail_Stoney_EnablePowerGating`, `Stoney_UpdateGfxPowerGating` and `Stoney_EnableCpPowerGating` do nothing). With CAIL's power gating the GPU hangs after idling |
 | `-crnofbreloc` | With acceleration: leave the carve-out's GPU address window where the firmware put it (`0xF4_0000_0000` on the D509BA) instead of moving it to 0. Apple's accelerator assumes VRAM at GPU address 0; elsewhere its "VRAM" accesses land in physical RAM |
 | `-crnopp`, `-crpp` | Force PowerPlay off / on. By default it is on with acceleration and the Dummy back end, and off otherwise (`CFG_NO_PP`; without PowerPlay the accelerator never powers up its engines) |
 | `-crnocapsfix` | Stoney: 1 shader engine and the CAIL-reported CU count instead of Polaris 11's 2 SE / 8 CUs |
@@ -173,6 +185,9 @@ and the list of affected machines.
 | `-crbeta` | Allow loading on macOS versions newer than Tahoe |
 | `crpanicat=N` | Panic on purpose N s after the controller loads, with the black-box report (see Installing) |
 | `-crdisplaydiag` | Keep the display sections (VBIOS calls, DPCD, register diff, pixels) in the black box on accelerated boots |
+| `crsmustep=N` | Stop the SMU microcode load after step N (1 region written … 7 RLC started) and panic with the report |
+| `crstopat=<stage>[#n]` | Stop on entering a traced stage (its n-th call) and panic with the report, e.g. `crstopat=pm4.start` |
+| `-crnohwlibsprobe` | Skip the test write into HWLibs' code at `setupCAIL` (used to check whether patches can land) |
 | `-crnotrace` | No bring-up stage tracing |
 | `-crnowatch`, `-crnowatchdog` | No periodic watcher output / no watchdog panic for a traced call that hangs |
 | `-crnobreadcrumb` | Don't write the latest trace progress to the NVRAM variable `CR-progress` (kept for boots that end in a hard reset, where no panic report is written) |

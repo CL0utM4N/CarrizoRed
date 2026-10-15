@@ -402,7 +402,50 @@ init_enable_ats), the same order as Linux `gfx_v8_0_rlc_resume` / `init_pg`; the
 context 0, 1 GB GART); the CP ring set-up and its start-up stream (CSB IB, EOP fence, CE partition `SET_BASE`); compute
 rings on MEC1 only. Apple's accelerator itself writes almost no GFX registers; the chip-specific work is CAIL's.
 
-Still open at the time of writing: the CP's second ring fetch never returning (RLC not answering is the lead);
+Still open at the time of writing (all resolved in part 2 below): the CP's second ring fetch never returning (RLC not
+answering is the lead);
 `stoney_init_enable_ats` (→ `Cail_Spectre_EnableAts`) turns on the iGPU's ATS/PRI/PASID capabilities, which belong to
 an IOMMUv2 driver macOS doesn't have; CAIL applies SDMA golden settings to a second instance (`SDMA1_POWER_CNTL` read
 error).
+
+### Bring-up, part 2: microcode, interrupts, Metal (2026-10-14/15, boots nvram67–137)
+
+From a stalled command processor to an accelerated desktop. Same format: each fix has a boot-arg (README).
+
+| Step | Problem | CarrizoRed |
+|---|---|---|
+| Microcode | The GPU's microcode RAMs ignore direct writes (the RLC and PFP word 0 read back random values after a write), and the SMU had loaded nothing (`UcodeLoadStatus` 0). On Carrizo/Stoney only the SMU can load the RLC, CP and SDMA microcode; Windows does it in PowerPlay's SMU8 manager, which Apple's HWLibs lacks (`SMUM_RequestSMULoadFW` covers Tonga/Fiji/Iceland/Polaris only) | A port of Linux `smu8_smumgr.c` (MIT): the TOC of SMU tasks, the RLC save areas and copies of CAIL's own images (`Stoney_UcodeInfo`, what `Stoney_GetFirmwareInfoTable` hands PowerPlay on Windows) in VRAM, then `DriverDramAddrHi/Lo`, `InitJobs`, `ExecuteJob` × 3 and the MEC's `CP_CPC_IC_BASE`. VRAM: an extension of CAIL's micro-engine block (`Stoney_FormatSmuDramDataBuffer`'s size), run from `Stoney_LoadRlcUcode`. Result: `UcodeLoadStatus` 0 → 0x53D in ~27 ms, real code in the RAMs |
+| Interrupts | `AMD9500Controller`'s IH ring is system RAM given to the IH by *physical* address, reached through the system aperture. With VRAM moved to MC 0 that range is FB or GART: the IH's writes never reached the CPU's ring (WPTR advanced, ring and write-back empty), every handler call wrote RPTR 0, and the storm breaker turned interrupts off, so nothing ever completed | The ring moved into our VRAM region with Apple's own `BaffinInterruptManager::setRingBufferLocation({cpu, gpu, size})` before the IH is enabled |
+| First commands | (with the above) the CP runs its start-up ring: clear-state IB, EOP fence written to GART, both rings drained, SDMA running | — |
+| Metal device | WindowServer opened the accelerator, but no process ever created a command queue: `AMDAccelDevice::getHardwareInfo` (the Metal driver's first call) reported device 0x98E4, read from config space (`AMDHardware::init`, `+0x2FC`), not the spoofed Polaris ID | The spoofed `device-id` (and `revision-id` if set) put into the returned info. First accelerated login screen right after |
+| GPU hang | After ~100 s of desktop the CP hung in a context's `CLEAR_STATE` / `PREAMBLE_CNTL` (only CP/CPF busy, no VM fault). CAIL's `Cail_Stoney_EnablePowerGating` had turned on CP and GFX power gating after start-up (`RLC_PG_CNTL` 0x60015); powering the block back up needs the SMU's save/restore jobs, which nothing drives under the Dummy back end | Those three CAIL functions are no-ops; `RLC_PG_CNTL` stays `CP_PG_DISABLE`. No more hangs or resets in the following sessions |
+| Hang recovery | Apple's recovery (`AMDVIPM4Engine::reset`, `pm4.initializeMicroEngine` again) soft-resets the CP, wiping the SMU-loaded CE/PFP microcode, and CAIL's direct reload does nothing on Stoney | A CP-only job (CE, PFP, ME, MEC jump table) added to the SMU's TOC and run whenever the engine is re-initialised |
+| Frozen screen | Occasionally a display-pipe transaction (flip) never gets its completion (`'txni'`, `AMDAccelDisplayPipe::processTransactionInterrupt`) while vblank interrupts keep arriving; WindowServer then never presents again | The watcher delivers it after 250 ms (`processTransactionInterrupt` only acts if a transaction is pending). One such rescue in a 5-minute desktop session |
+
+**Start-up reliability.** On some boots none of CarrizoRed's HWLibs hooks run (no PowerPlay keys, no SMU load, black
+screen). The cause, worked out over boots 109–137: CAIL's `AmdCailServices::earlyInitialize` is called normally, at
+the patched address, but its first bytes are Apple's original code again (`55 48 89 e5`, read at
+`AMDHardware::setupCAIL`), and a re-applied route didn't land either. The rate went from occasional to almost every
+boot without a code change, which suggests memory pressure at boot (kexts in the pageable kext collections can have
+code pages dropped and re-read from disk). Countermeasures now: HWLibs' code locked in memory before patching,
+patches checked and re-applied at `setupCAIL`, and the physical page plus a test write recorded in the report; a
+failed start panics with the report after 120 s. Theories ruled out on the way: a second HWLibs copy (the vtable
+calls the patched address), start order (the controller was always ready first), `ATY,bin_image` missing at
+`setupCAIL` (it was present). Also seen: after a warm restart the GPU can stop responding entirely (every register
+reads 0xFFFFFFFF); only a full power-off fixes it, and CarrizoRed now says so in the report.
+
+**Rendering.** Large surfaces the GPU both writes and reads (wallpaper, windows, text) are right. The Dock shows its
+background but no icons, and some icons are flat colour blocks; Reduce Transparency changes nothing. Leading theory:
+texture layout. Linux configures Polaris 11 with 4 tile pipes (`ADDR_SURF_P4_16x16`, `GB_ADDR_CONFIG` 0x22011002)
+and Stoney with 2 (`ADDR_SURF_P2`, 0x22010001) and one render backend; CAIL programs the hardware for Stoney, while
+Apple's Metal driver (user space, `AMDMTLBronzeDriver`, not in the KDK) presumably lays textures out for the Polaris
+it's told it runs on. Next: extract the Metal driver from the dyld shared cache and see what hardware information
+its layout code uses. Stoney is also the only GFX8 chip with RB+ (Mesa programs `SX_PS_DOWNCONVERT` /
+`SX_BLEND_OPT_*` only for it), a second candidate for blending errors.
+
+**Lessons from crashes CarrizoRed caused itself.** A Lilu route writes a 14-byte jump: hooking a function shorter
+than that overwrote the next one (the 6-byte `AMDSWScheduler::signalTimeout` broke `AMDSWScheduler::advance`);
+`routeChecked` now refuses functions that end inside the patch. Marking X4000/HWServices reloadable made Lilu hand
+over an already-patched image again (now skipped by load address). Re-registering the iGPU to re-match the
+accelerator (a start-order experiment, now opt-in) is the suspect for a WindowServer crash on a torn-down VM manager
+(`AMDHWVMM::endVMPTUpdate`, `+0x28` freed by `acceleratorWillStop`).
