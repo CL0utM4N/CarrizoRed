@@ -1892,7 +1892,7 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 	// Raising a shader's VGPR allocation in the command buffer is opt-in: a command buffer that binds the shader without
 	// passing through the hook would then run it with registers it doesn't own (the suspected cause of the freeze in
 	// the boot after nvram156).
-	interpBump = checkKernelArgument("-crinterpbump");
+	interpBump = checkKernelArgument("-crinterpbump") && checkKernelArgument("-crinterpsubmit");
 	if (!interpFixOff && !interpLock) {
 		interpLock = IOLockAlloc();
 		// The submit-time hook and the one-off carve-out mapping are opt-in (-crinterpsubmit): the two boots after they
@@ -4446,12 +4446,15 @@ static bool carveInit() {
 // Set while the submit hook runs: it must neither block nor allocate (it runs inside the accelerator's submission
 // path; a mapping made there can wait on memory the accelerator has to give back, which needs that same path: the two
 // boots with the first version of the hook froze). Only the carve-out mapping, made beforehand by the scan thread.
-static bool hookContext;
+static uint32_t hookDepth;
+static inline bool inHook() {
+	return __atomic_load_n(&hookDepth, __ATOMIC_ACQUIRE) != 0;
+}
 
 static uint8_t *carvePtr(uint64_t phys, uint32_t bytes) {
 	if (!interpSubmit)
 		return nullptr;
-	if (!__atomic_load_n(&carveMap, __ATOMIC_ACQUIRE) && (hookContext || !carveInit()))
+	if (!__atomic_load_n(&carveMap, __ATOMIC_ACQUIRE) && (inHook() || !carveInit()))
 		return nullptr;
 	if (phys < carveBase || phys + bytes > carveBase + carveSize)
 		return nullptr;
@@ -4466,7 +4469,7 @@ static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out) {
 		memcpy(out, fast, bytes);
 		return true;
 	}
-	if (hookContext)
+	if (inHook())
 		return false;
 	auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, bytes, kIODirectionIn);
 	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
@@ -4626,7 +4629,7 @@ static bool ibWritePhys(uint64_t phys, uint32_t bytes, const void *in) {
 		memcpy(fast, in, bytes);
 		return true;
 	}
-	if (hookContext)
+	if (inHook())
 		return false;
 	auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, bytes, kIODirectionOut);
 	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
@@ -4959,8 +4962,41 @@ struct SeenShader {
 };
 static SeenShader seenShaders[512];
 static uint32_t seenNum, seenNext;
-static uint32_t ibHookCalls, ibHookIbs, ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookBusy, ibHookNoMap;
+static uint32_t ibHookCalls, ibHookIbs, ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookBusy, ibHookNoMap,
+	ibHookRaiseOnly;
 static uint64_t ibHookNs;
+
+// Shaders given more VGPRs: every command buffer that binds one must raise RSRC1_PS, even after the seen table has
+// forgotten it or the code has changed (more VGPRs than needed is always safe). Append-only, readable without the lock.
+struct RaisedShader {
+	uint64_t va;
+	uint32_t vmid, vgprs;
+};
+static RaisedShader raisedShaders[1024];
+static uint32_t raisedNum;
+
+static uint32_t raisedVgprs(uint32_t vmid, uint64_t va) {
+	uint32_t n = __atomic_load_n(&raisedNum, __ATOMIC_ACQUIRE), best = 0;
+	for (uint32_t i = 0; i < n; i++)
+		if (raisedShaders[i].va == va && raisedShaders[i].vmid == vmid && raisedShaders[i].vgprs > best)
+			best = raisedShaders[i].vgprs;
+	return best;
+}
+
+static void addRaised(uint32_t vmid, uint64_t va, uint32_t vgprs) {
+	if (raisedVgprs(vmid, va) >= vgprs)
+		return;
+	uint32_t n = raisedNum;
+	if (n >= arrsize(raisedShaders))
+		return;
+	raisedShaders[n] = {va, vmid, vgprs};
+	__atomic_store_n(&raisedNum, n + 1, __ATOMIC_RELEASE);
+}
+
+static uint32_t withRaise(uint32_t vmid, uint64_t va, uint32_t rsrc1) {
+	uint32_t need = raisedVgprs(vmid, va);
+	return need && (rsrc1 & 0x3F) < need ? (rsrc1 & ~0x3FU) | need : rsrc1;
+}
 
 static uint32_t codeHash(const uint32_t *code, uint32_t n) {
 	uint32_t h = 2166136261U;
@@ -5004,7 +5040,7 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 		if (seenShaders[q].va == psVa && seenShaders[q].vmid == vmid)
 			entry = &seenShaders[q];
 	if (entry && entry->hash == hash && !(entry->pending && allowBump))
-		return entry->vgprs && (rsrc1 & 0x3F) < entry->vgprs ? (rsrc1 & ~0x3FU) | entry->vgprs : rsrc1;
+		return withRaise(vmid, psVa, rsrc1);
 	interpFix.shaders++;
 	memcpy(original, code, have * 4);
 	uint32_t hazards = 0, newVgprs = 0;
@@ -5032,8 +5068,10 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 		else
 			interpFix.writeFails++;
 	}
-	if (newVgprs && ok)
+	if (newVgprs && ok) {
 		interpFix.bumps++;
+		addRaised(vmid, psVa, newVgprs);
+	}
 	SeenShader fresh {psVa, vmid, codeHash(code, have < 64 ? have : 64), ok ? newVgprs : 0,
 		skip == SkipNoFreeVgpr && !allowBump};
 	if (entry) {
@@ -5044,7 +5082,7 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 		seenShaders[seenNext] = fresh;
 		seenNext = (seenNext + 1) % arrsize(seenShaders);
 	}
-	return fresh.vgprs && (rsrc1 & 0x3F) < fresh.vgprs ? (rsrc1 & ~0x3FU) | fresh.vgprs : rsrc1;
+	return withRaise(vmid, psVa, rsrc1);
 }
 
 // Walk one user command buffer: every pixel shader it binds (SET_SH_REG SPI_SHADER_PGM_LO/HI_PS, RSRC1_PS) gets
@@ -5094,6 +5132,62 @@ static void processUserIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords, bool al
 	}
 }
 
+// Without the lock (another submission holds it): only raise RSRC1_PS for shaders already given more VGPRs.
+static void raiseOnlyIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords) {
+	if (!__atomic_load_n(&raisedNum, __ATOMIC_ACQUIRE))
+		return;
+	uint32_t psLo = 0, psHi = 0, rsrc1 = 0;
+	uint64_t rsrc1Va = 0;
+	for (uint32_t j = 0; j < dwords;) {
+		uint32_t header = 0;
+		uint64_t phys = ibVaToPhys(vmid, ibVa + j * 4ULL);
+		if (!phys || !ibReadPhys(phys, 4, &header))
+			return;
+		uint32_t type = header >> 30;
+		if (type == 2) {
+			j++;
+			continue;
+		}
+		uint32_t count = ((header >> 16) & 0x3FFF) + 1;
+		if (type == 3 && ((header >> 8) & 0xFF) == 0x76 && count >= 2 && j + 1 + count <= dwords) {
+			uint32_t pkt[16];
+			uint32_t n = count < arrsize(pkt) ? count : arrsize(pkt);
+			for (uint32_t k = 0; k < n; k++) {
+				uint64_t a = ibVa + (j + 1 + k) * 4ULL;
+				uint64_t ph = ibVaToPhys(vmid, a);
+				if (!ph || !ibReadPhys(ph, 4, &pkt[k]))
+					return;
+			}
+			uint32_t start = pkt[0] & 0xFFFF;
+			bool touched = false;
+			for (uint32_t k = 1; k < n; k++) {
+				uint32_t reg = start + k - 1;
+				if (reg == 0x08) {
+					psLo = pkt[k];
+					touched = true;
+				} else if (reg == 0x09) {
+					psHi = pkt[k];
+					touched = true;
+				} else if (reg == 0x0A) {
+					rsrc1 = pkt[k];
+					rsrc1Va = ibVa + (j + 1 + k) * 4ULL;
+					touched = true;
+				}
+			}
+			if (touched && psLo && rsrc1 && rsrc1Va) {
+				uint64_t psVa = (static_cast<uint64_t>(psHi & 0xFF) << 40) | (static_cast<uint64_t>(psLo) << 8);
+				uint32_t want = withRaise(vmid, psVa, rsrc1);
+				uint64_t ph = want != rsrc1 ? ibVaToPhys(vmid, rsrc1Va) : 0;
+				if (ph && ibWritePhys(ph, 4, &want)) {
+					rsrc1 = want;
+					ibHookRaiseOnly++;
+				}
+			}
+		}
+		j += 1 + count;
+	}
+}
+
 // Fallback: the last 16 user command buffers on the GFX ring, every second (already submitted, so no RSRC1 changes).
 static void interpFixScan() {
 	auto *hw = static_cast<uint8_t *>(accelHardware);
@@ -5108,6 +5202,8 @@ static void interpFixScan() {
 		return;
 	if (interpSubmit)
 		carveInit();
+	if (interpHooked && __atomic_load_n(&ibHookCalls, __ATOMIC_RELAXED))
+		return;  // the submit hook sees everything; don't compete for the lock
 	IOLockLock(interpLock);
 	interpFix.scans++;
 	uint32_t rptr = mmio[0x21C0] & (dwords - 1), found = 0;
@@ -5158,11 +5254,24 @@ static void interpHookBody(uint8_t *info) {
 		ibHookLastFlags = flags;
 		if (!(flags & 0x12) && vmid >= 1 && vmid <= 15 && !__atomic_load_n(&carveMap, __ATOMIC_ACQUIRE)) {
 			ibHookNoMap++;
-		} else if (!(flags & 0x12) && vmid >= 1 && vmid <= 15 && !IOLockTryLock(interpLock)) {
-			ibHookBusy++;
 		} else if (!(flags & 0x12) && vmid >= 1 && vmid <= 15) {
 			uint64_t start = mach_absolute_time();
-			hookContext = true;
+			__atomic_fetch_add(&hookDepth, 1, __ATOMIC_ACQ_REL);
+			// Another submission may hold the lock; it never blocks or allocates, so wait a little for it.
+			bool locked = false;
+			for (uint32_t spin = 0; spin < 20000 && !(locked = IOLockTryLock(interpLock)); spin++)
+				__builtin_ia32_pause();
+			if (!locked) {
+				ibHookBusy++;
+				for (uint32_t i = 0; i < count && i < 8; i++) {
+					uint32_t dw = *reinterpret_cast<uint32_t *>(info + 0x44 + i * 0x28);
+					uint64_t va = *reinterpret_cast<uint64_t *>(info + 0x50 + i * 0x28);
+					if (dw && va)
+						raiseOnlyIb(vmid, va, dw);
+				}
+				__atomic_fetch_sub(&hookDepth, 1, __ATOMIC_ACQ_REL);
+				return;
+			}
 			for (uint32_t i = 0; i < count && i < 8; i++) {
 				uint32_t dw = *reinterpret_cast<uint32_t *>(info + 0x44 + i * 0x28);
 				uint64_t va = *reinterpret_cast<uint64_t *>(info + 0x50 + i * 0x28);
@@ -5171,8 +5280,8 @@ static void interpHookBody(uint8_t *info) {
 					processUserIb(vmid, va, dw, interpBump);
 				}
 			}
-			hookContext = false;
 			IOLockUnlock(interpLock);
+			__atomic_fetch_sub(&hookDepth, 1, __ATOMIC_ACQ_REL);
 			uint64_t ns = 0;
 			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
 			ibHookNs += ns;
@@ -5421,10 +5530,11 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
-	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u\n",
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u\n",
 		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
 		interpFix.writes, interpFix.writeFails, interpFix.deadRegs, interpFix.bumps, interpHooked, ibHookCalls, ibHookIbs,
-		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap);
+		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap, ibHookRaiseOnly,
+		raisedNum);
 	if (!checkKernelArgument("-crnoibdump")) {
 		static char ibText[3600];
 		captureUserIbs(ibText, sizeof(ibText));
