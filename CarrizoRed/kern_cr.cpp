@@ -27,6 +27,20 @@
 // took a general-protection fault, which never reached the screen. ATIController::start and initializeProjectInfo have
 // the same prologue. Every wrapper with an original therefore goes through routeChecked, which refuses (and logs) any
 // function with a RIP-relative operand or a relative branch in its first 14 bytes, whatever the jump size.
+//
+// Trampolines: Lilu builds every plugin's in one shared 4 KB buffer (KernelPatcher::tempExecutableMemory). Once it is
+// full, createTrampoline returns 0, routeFunctionInternal returns EINVAL, and routeMultiple takes that non-zero value for
+// the trampoline's address and reports success: the function is left untouched and nothing is logged as failed. With
+// ~150 traced stages CarrizoRed alone needs more than 4 KB, so whichever kext loaded last lost its hooks; HWLibs, loaded
+// last on most boots, lost CAIL's (nvram133/40: earlyInitialize still Apple's prologue at setupCAIL, the "re-patch"
+// reported success and changed nothing, yet a direct write landed). So routeChecked builds the trampoline itself, in
+// its own pool, has Lilu write only the jump (no wrapper, so no trampoline), and reads the jump back.
+static constexpr size_t RoutePoolSize = 16384;
+static uint8_t routePool[RoutePoolSize] __attribute__((section("__TEXT,__text"), aligned(16)));
+static size_t routePoolUsed;
+static uint32_t routesOk, routesFailed, routesUnverified;
+static const char *routeLastFailed;
+
 static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::RouteRequest &request,
 	mach_vm_address_t slide, size_t size) {
 	if (request.org) {
@@ -58,6 +72,48 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 			}
 			copied += len;
 		}
+		// Trampoline: the copied instructions (safe to move, checked above), then jmp [rip+0] back to func + copied.
+		if (routePoolUsed + copied + 14 > RoutePoolSize) {
+			SYSLOG("cr", "route: %s: trampoline pool full (%lu bytes used)", request.symbol, routePoolUsed);
+			routesFailed++;
+			routeLastFailed = request.symbol;
+			return false;
+		}
+		auto *tramp = routePool + routePoolUsed;
+		if (MachInfo::setKernelWriting(true, nullptr) != KERN_SUCCESS) {
+			SYSLOG("cr", "route: %s: cannot write the trampoline", request.symbol);
+			routesFailed++;
+			routeLastFailed = request.symbol;
+			return false;
+		}
+		memcpy(tramp, reinterpret_cast<const void *>(func), copied);
+		static const uint8_t jumpBack[6] {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+		memcpy(tramp + copied, jumpBack, sizeof(jumpBack));
+		mach_vm_address_t back = func + copied;
+		memcpy(tramp + copied + sizeof(jumpBack), &back, sizeof(back));
+		MachInfo::setKernelWriting(false, nullptr);
+		routePoolUsed += (copied + 14 + 15) & ~static_cast<size_t>(15);
+		*request.org = reinterpret_cast<mach_vm_address_t>(tramp);
+		KernelPatcher::RouteRequest jump {request.symbol, request.to};
+		if (!patcher.routeMultipleLong(index, &jump, 1, slide, size)) {
+			SYSLOG("cr", "route: %s: failed to write the jump (error %d)", request.symbol, patcher.getError());
+			*request.org = 0;
+			routesFailed++;
+			routeLastFailed = request.symbol;
+			return false;
+		}
+		// Lilu's long route: jmp [rip+0] (FF 25 00000000) followed by the destination.
+		auto *entry = reinterpret_cast<const uint8_t *>(func);
+		mach_vm_address_t dest;
+		memcpy(&dest, entry + 6, sizeof(dest));
+		if (entry[0] != 0xFF || entry[1] != 0x25 || dest != request.to) {
+			SYSLOG("cr", "route: %s: the jump didn't land (%02x %02x)", request.symbol, entry[0], entry[1]);
+			routesUnverified++;
+			routeLastFailed = request.symbol;
+			return false;
+		}
+		routesOk++;
+		return true;
 	}
 	return patcher.routeMultiple(index, &request, 1, slide, size);
 }
@@ -4213,6 +4269,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	if (gpuDeadMs)
 		add("GPU NOT RESPONDING (registers read ffffffff) %s, first seen @%llu: power off fully before the next boot\n",
 			gpuDeadAtStart ? "from start-up" : "since", gpuDeadMs / 100);
+	add("routes: %u ok, %u failed, %u not landed (last %s); pool %lu/%lu\n", routesOk, routesFailed, routesUnverified,
+		routeLastFailed ? routeLastFailed : "-", routePoolUsed, RoutePoolSize);
 	add("kexts: X4000 %u(+%u)@%llx HWServices %u(+%u)@%llx HWLibs %u(+%u)@%llx\n", accelKextLoads[0], accelKextRepeats[0],
 		accelKextSlide[0], accelKextLoads[1], accelKextRepeats[1], accelKextSlide[1], accelKextLoads[2],
 		accelKextRepeats[2], accelKextSlide[2]);
