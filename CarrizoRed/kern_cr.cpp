@@ -1060,6 +1060,8 @@ static void writeBreadcrumb(uint32_t t) {
 	writes++;
 }
 
+static void startInterpFix();  // defined with the black box below
+
 void CRDriver::watcherThread(void *arg, wait_result_t) {
 	auto *self = static_cast<CRDriver *>(arg);
 	static char last[1536], now[1536];
@@ -1152,6 +1154,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		checkGpuAlive(gpuMmio);
 		if (smuLoadOk())
 			fixRbPlus(gpuMmio, self->family == ChipFamily::Stoney);
+		if (smuLoadOk() && self->family == ChipFamily::Stoney)
+			startInterpFix();
 		if (accelDeferred && controllerReady) {
 			accelDeferred = false;
 			accelRematches++;
@@ -4504,6 +4508,457 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 	}
 }
 
+// Stoney's 16-bank LDS interpolation hazard, fixed in the compiled pixel shaders. On chips with 16 LDS banks (Kabini,
+// Stoney) v_interp_p1_f32 must not write the VGPR it reads (its I barycentric): LLVM marks the 16-bank variant's vdst
+// early-clobber. Apple's shader compiler doesn't, for its Stoney back end either, and reuses the I register for the last
+// component once I is otherwise dead (nvram153: three of eight WindowServer pixel shaders end their vec4 with
+// `v_interp_p1_f32 v0, v0, attr0.w`). The result is a wrong value on part of each wave: vibrant text drawn as bars,
+// broken highlights and window shadows, Dock icons cut on a diagonal. Plain text and the login screen use shaders
+// without the pattern.
+//
+// So rewrite those shaders in GPU memory: give the bad p1 and its p2 a VGPR the shader never touches but has allocated
+// (SPI_SHADER_PGM_RSRC1_PS.VGPRS, granules of 4), and rename the result's later reads. Every change replaces one dword
+// in place; nothing moves. A shader whose later code we can't fully account for (an encoding whose VGPR operands we
+// don't decode touching the register, a backward branch, a register range containing it) is left alone and counted.
+// A thread scans the recent user command buffers every second for pixel shaders (SPI_SHADER_PGM_LO/HI_PS, RSRC1_PS)
+// and remembers what it has seen (VMID, address and a hash of the code). -crnointerpfix disables it.
+
+struct InterpFixStats {
+	uint32_t scans, shaders, hazards, fixed, skipped, lastSkip, writes, writeFails;
+};
+static InterpFixStats interpFix;
+
+static bool ibWritePhys(uint64_t phys, uint32_t bytes, const void *in) {
+	if (!phys || (phys >= 0xC0000000ULL && phys < 0x100000000ULL) || phys + bytes > 0x220000000ULL)
+		return false;
+	auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, bytes, kIODirectionOut);
+	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+	bool mapped = map != nullptr;
+	if (mapped)
+		memcpy(reinterpret_cast<void *>(map->getVirtualAddress()), in, bytes);
+	OSSafeReleaseNULL(map);
+	OSSafeReleaseNULL(desc);
+	return mapped;
+}
+
+// A VGPR operand field of an instruction: dword (0 or 1 within the instruction), bit position, width (8, or 9 for a
+// "src" field where VGPRs are 256-511), how many consecutive VGPRs it names, and whether it is read and/or written.
+struct VgprField {
+	uint8_t dword, shift, width, count;
+	bool read, write;
+};
+
+// GCN3 (GFX8) VGPR operands of the instruction at code[0]. Returns false for an encoding whose operands we don't model.
+static bool gcn3VgprFields(const uint32_t *code, uint32_t len, VgprField *f, uint32_t &n) {
+	n = 0;
+	uint32_t w = code[0];
+	auto add = [&](uint8_t dword, uint8_t shift, uint8_t width, uint8_t count, bool read, bool write) {
+		f[n++] = {dword, shift, width, count, read, write};
+	};
+	if (!(w >> 31)) {
+		uint32_t enc7 = w >> 25;
+		uint32_t src0 = w & 0x1FF;
+		bool sdwaDpp = src0 == 0xF9 || src0 == 0xFA;
+		if (enc7 == 0x3F) {  // VOP1
+			uint32_t op = (w >> 9) & 0xFF;
+			if (op >= 0x36 && op <= 0x38)  // v_movrel*: M0-relative
+				return false;
+			if (sdwaDpp) {
+				if (len < 2)
+					return false;
+				add(1, 0, 8, 1, true, false);
+			} else {
+				add(0, 0, 9, 1, true, false);
+			}
+			if (op != 0x02)  // v_readfirstlane_b32 writes an SGPR
+				add(0, 17, 8, 1, false, true);
+			return true;
+		}
+		if (enc7 == 0x3E) {  // VOPC
+			if (sdwaDpp) {
+				if (len < 2)
+					return false;
+				add(1, 0, 8, 1, true, false);
+			} else {
+				add(0, 0, 9, 1, true, false);
+			}
+			add(0, 9, 8, 1, true, false);
+			return true;
+		}
+		// VOP2
+		uint32_t op = (w >> 25) & 0x3F;
+		if (sdwaDpp) {
+			if (len < 2)
+				return false;
+			add(1, 0, 8, 1, true, false);
+		} else {
+			add(0, 0, 9, 1, true, false);
+		}
+		add(0, 9, 8, 1, true, false);
+		bool macLike = op == 0x16 || op == 0x23;  // v_mac_f32 / v_mac_f16 also read vdst
+		add(0, 17, 8, 1, macLike, true);
+		return true;
+	}
+	if ((w >> 30) == 2)  // scalar ALU / SOPP: no VGPRs
+		return true;
+	if (len < 1)
+		return false;
+	switch (w >> 26) {
+		case 0x30:  // SMEM
+			return true;
+		case 0x35: {  // VINTRP
+			uint32_t op = (w >> 16) & 3;
+			add(0, 0, 8, 1, op != 2, false);
+			add(0, 18, 8, 1, op == 1, true);  // p2 accumulates into vdst
+			return true;
+		}
+		case 0x34: {  // VOP3
+			if (len < 2)
+				return false;
+			uint32_t op = (w >> 16) & 0x3FF;
+			add(1, 0, 9, 1, true, false);
+			add(1, 9, 9, 1, true, false);
+			add(1, 18, 9, 1, true, false);
+			if (op >= 0x100 && op != 0x289)  // VOPC as VOP3 and v_readlane write SGPRs
+				add(0, 0, 8, 1, false, true);
+			return true;
+		}
+		case 0x31:  // EXP
+			if (len < 2)
+				return false;
+			add(1, 0, 8, 1, true, false);
+			add(1, 8, 8, 1, true, false);
+			add(1, 16, 8, 1, true, false);
+			add(1, 24, 8, 1, true, false);
+			return true;
+		case 0x3C:  // MIMG: vaddr range read, vdata range written (or read by stores)
+			if (len < 2)
+				return false;
+			add(1, 0, 8, 4, true, false);
+			add(1, 8, 8, 4, true, true);
+			return true;
+		case 0x38:  // MUBUF
+		case 0x3A:  // MTBUF
+			if (len < 2)
+				return false;
+			add(1, 0, 8, 2, true, false);
+			add(1, 8, 8, 4, true, true);
+			return true;
+		case 0x36:  // DS
+			if (len < 2)
+				return false;
+			add(1, 0, 8, 1, true, false);
+			add(1, 8, 8, 4, true, false);
+			add(1, 16, 8, 4, true, false);
+			add(1, 24, 8, 4, false, true);
+			return true;
+		case 0x37:  // FLAT
+			if (len < 2)
+				return false;
+			add(1, 0, 8, 2, true, false);
+			add(1, 8, 8, 4, true, false);
+			add(1, 24, 8, 4, false, true);
+			return true;
+		default:
+			return false;
+	}
+}
+
+static uint32_t fieldValue(const uint32_t *code, const VgprField &f) {
+	uint32_t v = (code[f.dword] >> f.shift) & ((1U << f.width) - 1);
+	if (f.width == 9)
+		return v >= 256 ? v - 256 : 0x1000;  // not a VGPR
+	return v;
+}
+
+static void setField(uint32_t *code, const VgprField &f, uint32_t vgpr) {
+	uint32_t mask = ((1U << f.width) - 1) << f.shift;
+	uint32_t v = f.width == 9 ? vgpr + 256 : vgpr;
+	code[f.dword] = (code[f.dword] & ~mask) | (v << f.shift);
+}
+
+enum InterpSkip {
+	SkipNone, SkipNoEnd, SkipUnknownEncoding, SkipNoFreeVgpr, SkipNoP2, SkipBranch, SkipRange, SkipWriteBetween
+};
+
+// Returns the number of hazards fixed in code[0..len) (0 if none or skipped; skip reason in *skip).
+static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, uint32_t &hazards, InterpSkip &skip) {
+	hazards = 0;
+	skip = SkipNone;
+	// Walk once: end, highest VGPR touched, and the hazards.
+	uint32_t end = 0, maxVgpr = 0, badAt[8], badNum = 0;
+	VgprField f[8];
+	uint32_t n;
+	for (uint32_t i = 0; i < got;) {
+		uint32_t w = code[i];
+		if (w == 0xBF810000) {
+			end = i + 1;
+			break;
+		}
+		uint32_t len = gcn3InstLength(code + i, got - i);
+		if (!gcn3VgprFields(code + i, got - i, f, n)) {
+			skip = SkipUnknownEncoding;
+			return 0;
+		}
+		for (uint32_t k = 0; k < n; k++) {
+			uint32_t v = fieldValue(code + i, f[k]);
+			if (v < 256 && v + f[k].count - 1 > maxVgpr)
+				maxVgpr = v + f[k].count - 1;
+		}
+		if ((w >> 26) == 0x35 && ((w >> 16) & 3) == 0 && ((w >> 18) & 0xFF) == (w & 0xFF)) {
+			hazards++;
+			if (badNum < arrsize(badAt))
+				badAt[badNum++] = i;
+		}
+		i += len;
+	}
+	if (!hazards)
+		return 0;
+	if (!end) {
+		skip = SkipNoEnd;
+		return 0;
+	}
+	uint32_t allocated = ((rsrc1 & 0x3F) + 1) * 4;
+	uint32_t fixedHere = 0;
+	for (uint32_t b = 0; b < badNum; b++) {
+		uint32_t at = badAt[b], w = code[at];
+		uint32_t vI = w & 0xFF, attrChan = (w >> 8) & 0xFF;
+		uint32_t vF = maxVgpr + 1;
+		if (vF >= allocated || vF > 255) {
+			skip = SkipNoFreeVgpr;
+			return fixedHere;
+		}
+		// The matching p2 (same attribute and channel, writing vI); nothing may touch vI in between.
+		uint32_t p2 = 0;
+		for (uint32_t i = at + gcn3InstLength(code + at, end - at); i < end;) {
+			uint32_t x = code[i];
+			if ((x >> 26) == 0x35 && ((x >> 16) & 3) == 1 && ((x >> 8) & 0xFF) == attrChan &&
+				((x >> 18) & 0xFF) == vI) {
+				p2 = i;
+				break;
+			}
+			gcn3VgprFields(code + i, end - i, f, n);
+			for (uint32_t k = 0; k < n; k++) {
+				uint32_t v = fieldValue(code + i, f[k]);
+				if (v <= vI && vI < v + f[k].count) {
+					skip = SkipWriteBetween;
+					return fixedHere;
+				}
+			}
+			i += gcn3InstLength(code + i, end - i);
+		}
+		if (!p2) {
+			skip = SkipNoP2;
+			return fixedHere;
+		}
+		// Plan the renames after p2: reads of vI until it is written again. Any backward branch, or vI inside a
+		// multi-register range, and we leave the shader alone.
+		static uint32_t renameAt[64];
+		static VgprField renameField[64];
+		uint32_t renames = 0;
+		for (uint32_t i = p2 + 1; i < end;) {
+			uint32_t x = code[i];
+			uint32_t len = gcn3InstLength(code + i, end - i);
+			if ((x >> 23) == 0x17F) {  // SOPP
+				uint32_t op = (x >> 16) & 0x7F;
+				bool branch = op == 0x02 || (op >= 0x04 && op <= 0x09) || (op >= 0x17 && op <= 0x1A);
+				if (branch && (x & 0x8000)) {  // negative simm16
+					skip = SkipBranch;
+					return fixedHere;
+				}
+			}
+			gcn3VgprFields(code + i, end - i, f, n);
+			bool written = false;
+			for (uint32_t k = 0; k < n; k++) {
+				uint32_t v = fieldValue(code + i, f[k]);
+				if (!(v <= vI && vI < v + f[k].count))
+					continue;
+				if (f[k].count > 1 && (f[k].read || v != vI)) {
+					skip = SkipRange;
+					return fixedHere;
+				}
+				if (f[k].read) {
+					if (renames == arrsize(renameAt)) {
+						skip = SkipRange;
+						return fixedHere;
+					}
+					renameAt[renames] = i;
+					renameField[renames++] = f[k];
+				}
+				if (f[k].write)
+					written = true;
+			}
+			if (written)
+				break;
+			i += len;
+		}
+		// Apply: the p1 and p2 write vF, the reads use vF.
+		code[at] = (code[at] & ~(0xFFU << 18)) | (vF << 18);
+		code[p2] = (code[p2] & ~(0xFFU << 18)) | (vF << 18);
+		for (uint32_t r = 0; r < renames; r++)
+			setField(code + renameAt[r], renameField[r], vF);
+		maxVgpr = vF;
+		fixedHere++;
+	}
+	return fixedHere;
+}
+
+// Seen pixel shaders: VMID, address, hash of the code as we last saw (or left) it.
+struct SeenShader {
+	uint64_t va;
+	uint32_t vmid, hash;
+};
+static SeenShader seenShaders[512];
+static uint32_t seenNum, seenNext;
+
+static uint32_t codeHash(const uint32_t *code, uint32_t n) {
+	uint32_t h = 2166136261U;
+	for (uint32_t i = 0; i < n; i++)
+		h = (h ^ code[i]) * 16777619U;
+	return h;
+}
+
+static void interpFixScan() {
+	auto *hw = static_cast<uint8_t *>(accelHardware);
+	auto *mmio = gpuMmio;
+	if (!hw || !mmio)
+		return;
+	auto *pm4 = *reinterpret_cast<uint8_t **>(hw + 0x3B0);
+	auto *ring = pm4 ? *reinterpret_cast<uint8_t **>(pm4 + 0x50) : nullptr;
+	auto *cpu = ring ? *reinterpret_cast<uint32_t **>(ring + 0x40) : nullptr;
+	uint32_t dwords = ring ? *reinterpret_cast<uint32_t *>(ring + 0x30) : 0;
+	if (!cpu || dwords < 0x100 || (dwords & (dwords - 1)))
+		return;
+	interpFix.scans++;
+	uint32_t rptr = mmio[0x21C0] & (dwords - 1);
+	static uint32_t buf[0x4000], code[0x800];
+	uint32_t found = 0;
+	for (uint32_t back = 4; back < dwords && found < 16; back++) {
+		uint32_t i = (rptr - back) & (dwords - 1);
+		if (cpu[i] != 0xC0023F00)
+			continue;
+		uint32_t ctl = cpu[(i + 3) & (dwords - 1)], vmid = (ctl >> 24) & 0xF, dw = ctl & 0xFFFFF;
+		if (!vmid || !dw)
+			continue;
+		found++;
+		uint64_t ibVa = (static_cast<uint64_t>(cpu[(i + 2) & (dwords - 1)] & 0xFFFF) << 32) |
+			(cpu[(i + 1) & (dwords - 1)] & ~3U);
+		uint32_t want = dw < arrsize(buf) ? dw : arrsize(buf), got = 0;
+		while (got < want) {
+			uint64_t va = ibVa + got * 4ULL;
+			uint32_t chunk = static_cast<uint32_t>((0x1000 - (va & 0xFFF)) / 4);
+			if (chunk > want - got)
+				chunk = want - got;
+			uint64_t phys = ibVaToPhys(vmid, va);
+			if (!phys || !ibReadPhys(phys, chunk * 4, buf + got))
+				break;
+			got += chunk;
+		}
+		uint32_t psLo = 0, psHi = 0, rsrc1 = 0;
+		for (uint32_t j = 0; j < got;) {
+			uint32_t header = buf[j], type = header >> 30;
+			if (type == 2) {
+				j++;
+				continue;
+			}
+			uint32_t count = ((header >> 16) & 0x3FFF) + 1;
+			if (type == 3 && ((header >> 8) & 0xFF) == 0x76 && j + 1 < got) {
+				uint32_t start = buf[j + 1] & 0xFFFF;
+				for (uint32_t k = 0; k + 1 < count && j + 2 + k < got; k++) {
+					uint32_t reg = start + k, v = buf[j + 2 + k];
+					if (reg == 0x08)
+						psLo = v;
+					else if (reg == 0x09)
+						psHi = v;
+					else if (reg == 0x0A)
+						rsrc1 = v;
+				}
+				if (psLo && rsrc1) {
+					uint64_t psVa = (static_cast<uint64_t>(psHi & 0xFF) << 40) | (static_cast<uint64_t>(psLo) << 8);
+					// Read the shader (up to 8 KB) and see whether we have handled this exact code here before.
+					uint32_t have = 0;
+					while (have < arrsize(code)) {
+						uint64_t va = psVa + have * 4ULL;
+						uint32_t chunk = static_cast<uint32_t>((0x1000 - (va & 0xFFF)) / 4);
+						if (chunk > arrsize(code) - have)
+							chunk = arrsize(code) - have;
+						uint64_t phys = ibVaToPhys(vmid, va);
+						if (!phys || !ibReadPhys(phys, chunk * 4, code + have))
+							break;
+						have += chunk;
+						bool ended = false;
+						for (uint32_t q = have - chunk; q < have && !ended; q++)
+							ended = code[q] == 0xBF810000;
+						if (ended)
+							break;
+					}
+					if (have) {
+						uint32_t hash = codeHash(code, have < 64 ? have : 64);
+						bool seen = false;
+						for (uint32_t q = 0; q < seenNum && !seen; q++)
+							seen = seenShaders[q].va == psVa && seenShaders[q].vmid == vmid && seenShaders[q].hash == hash;
+						if (!seen) {
+							interpFix.shaders++;
+							static uint32_t original[arrsize(code)];
+							memcpy(original, code, have * 4);
+							uint32_t hazards = 0;
+							InterpSkip skip = SkipNone;
+							uint32_t fixedHere = fixInterpInShader(code, have, rsrc1, hazards, skip);
+							interpFix.hazards += hazards;
+							if (skip != SkipNone) {
+								interpFix.skipped++;
+								interpFix.lastSkip = skip;
+							}
+							if (fixedHere) {
+								// Write back every changed dword.
+								bool ok = true;
+								for (uint32_t q = 0; q < have; q++) {
+									if (code[q] == original[q])
+										continue;
+									uint64_t phys = ibVaToPhys(vmid, psVa + q * 4ULL);
+									if (phys && ibWritePhys(phys, 4, &code[q]))
+										interpFix.writes++;
+									else
+										ok = false;
+								}
+								if (ok)
+									interpFix.fixed += fixedHere;
+								else
+									interpFix.writeFails++;
+							}
+							SeenShader entry {psVa, vmid, codeHash(code, have < 64 ? have : 64)};
+							if (seenNum < arrsize(seenShaders)) {
+								seenShaders[seenNum++] = entry;
+							} else {
+								seenShaders[seenNext] = entry;
+								seenNext = (seenNext + 1) % arrsize(seenShaders);
+							}
+						}
+					}
+				}
+			}
+			j += 1 + count;
+		}
+	}
+}
+
+static void interpFixThread(void *, wait_result_t) {
+	for (;;) {
+		interpFixScan();
+		IOSleep(1000);
+	}
+}
+
+static void startInterpFix() {
+	static bool started;
+	if (started || checkKernelArgument("-crnointerpfix"))
+		return;
+	started = true;
+	thread_t thread = nullptr;
+	if (kernel_thread_start(interpFixThread, nullptr, &thread) == KERN_SUCCESS)
+		thread_deallocate(thread);
+}
+
 struct PutState {
 	char *out;
 	size_t size;
@@ -4735,6 +5190,10 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u
+",
+		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
+		interpFix.writes, interpFix.writeFails);
 	if (!checkKernelArgument("-crnoibdump")) {
 		static char ibText[3600];
 		captureUserIbs(ibText, sizeof(ibText));
