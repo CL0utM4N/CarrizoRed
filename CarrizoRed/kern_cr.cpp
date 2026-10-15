@@ -462,6 +462,29 @@ void CRDriver::init() {
 	callback = this;
 	SYSLOG("cr", "CarrizoRed starting on kernel %d.%d", getKernelVersion(), getKernelMinorVersion());
 
+	// Stoney's shader instruction set. Apple's Metal compiler (AMDShared.bundle's libSC.dylib, run in MTLCompilerService)
+	// picks its back end with SCGetInstructionSet(family, revision, device): family 0x82 (VI, what the Metal driver
+	// reports for every GFX8 chip) with a revision outside Tonga's 0x14-0x27 gives the generic VI set 0x0E, which SCCreate
+	// turns into SCIcelandInfo (baseline GFX 8.0); family 0x87 (CZ) with revision 0x61-0xFE, i.e. Stoney, gives 0x1E,
+	// which becomes SCGfx81Info, AMD's own Stoney back end (16 LDS banks: v_interp_p1_f32 must not reuse its source
+	// register, which a GFX 8.0 back end does, giving wrong texture coordinates). The Metal driver only knows VI, so
+	// return 0x1E from the VI branch. One unique 12-byte pattern; -crnoscpatch disables it. CarrizoRed only runs on
+	// Carrizo/Bristol Ridge/Stoney, where no real VI dGPU shares the compiler.
+	if (!checkKernelArgument("-crnoscpatch")) {
+		static const uint8_t find[] {0x83, 0xC6, 0xEC, 0xB8, 0x0E, 0x00, 0x00, 0x00, 0x83, 0xFE, 0x13, 0x77};
+		static const uint8_t replace[] {0x83, 0xC6, 0xEC, 0xB8, 0x1E, 0x00, 0x00, 0x00, 0x83, 0xFE, 0x13, 0x77};
+		static UserPatcher::BinaryModPatch patch {CPU_TYPE_X86_64, 0, find, replace, sizeof(find), 0, 1,
+			UserPatcher::FileSegment::SegmentTextText, 1};
+		static UserPatcher::BinaryModInfo mod {"/System/Library/Extensions/AMDShared.bundle/Contents/PlugIns/libSC.dylib",
+			&patch, 1};
+		static UserPatcher::ProcInfo procs[] {
+			{"MTLCompilerService", sizeof("MTLCompilerService") - 1, 1, UserPatcher::ProcInfo::MatchAny},
+		};
+		auto err = lilu.onProcLoad(procs, arrsize(procs), nullptr, nullptr, &mod, 1);
+		if (err != LiluAPI::Error::NoError)
+			SYSLOG("cr", "failed to register the libSC Stoney instruction-set patch (%d)", err);
+	}
+
 	lilu.onPatcherLoadForce(
 		[](void *user, KernelPatcher &patcher) { static_cast<CRDriver *>(user)->processPatcher(patcher); }, this);
 	lilu.onKextLoadForce(
