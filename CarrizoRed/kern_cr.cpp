@@ -5109,16 +5109,20 @@ static uint32_t readGpuVa(uint32_t vmid, uint64_t va, uint32_t max, uint32_t *ou
 // A pixel shader bound with RSRC1_PS = rsrc1: fix it if we haven't, and return the RSRC1 value it needs.
 static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, bool allowBump) {
 	static uint32_t code[0x800], original[0x800];
-	uint32_t have = readGpuVa(vmid, psVa, arrsize(code), code, true);
-	if (!have)
+	// Every bind of a known shader only costs its first 16 dwords (a fingerprint taken after fixing it); the whole
+	// shader is read and fixed only when it is new here or its code changed.
+	if (readGpuVa(vmid, psVa, 16, code, false) != 16)
 		return rsrc1;
-	uint32_t hash = codeHash(code, have < 64 ? have : 64);
+	uint32_t hash = codeHash(code, 16);
 	SeenShader *entry = nullptr;
 	for (uint32_t q = 0; q < seenNum && !entry; q++)
 		if (seenShaders[q].va == psVa && seenShaders[q].vmid == vmid)
 			entry = &seenShaders[q];
 	if (entry && entry->hash == hash && !(entry->pending && allowBump))
 		return withRaise(vmid, psVa, rsrc1);
+	uint32_t have = readGpuVa(vmid, psVa, arrsize(code), code, true);
+	if (!have)
+		return rsrc1;
 	interpFix.shaders++;
 	memcpy(original, code, have * 4);
 	uint32_t hazards = 0, newVgprs = 0;
@@ -5150,7 +5154,9 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 		interpFix.bumps++;
 		addRaised(vmid, psVa, newVgprs);
 	}
-	SeenShader fresh {psVa, vmid, codeHash(code, have < 64 ? have : 64), ok ? newVgprs : 0,
+	uint32_t print[16] {};
+	readGpuVa(vmid, psVa, 16, print, false);
+	SeenShader fresh {psVa, vmid, codeHash(print, 16), ok ? newVgprs : 0,
 		skip == SkipNoFreeVgpr && !allowBump};
 	if (entry) {
 		*entry = fresh;
