@@ -11,16 +11,16 @@ used them), so on a hackintosh they've only had the firmware framebuffer.
 > don't run it on a machine you depend on. Everything below is from one test laptop.
 
 **What it does today:** on a Stoney Ridge laptop, macOS Sequoia boots to the desktop and drives the built-in panel
-through Apple's own Polaris display driver, instead of the firmware's fixed framebuffer. **Metal acceleration now
-works far enough for an accelerated desktop:** WindowServer draws the login screen and desktop through the GPU, and
-apps use Metal. It isn't stable yet: some boots don't bring the accelerator up, some textures (Dock and other icons)
-render wrong, and the desktop can still freeze after a while. That's the current work.
+through Apple's own Polaris display driver, instead of the firmware's fixed framebuffer. **Metal acceleration works
+and the desktop renders correctly:** WindowServer draws the login screen and desktop through the GPU, apps use Metal,
+and vibrancy, text, icons and the Dock draw properly. A few rarer shaders may still draw wrong, and it needs longer
+testing.
 
 | | Status |
 |---|---|
 | Built-in eDP panel | **Works** (1366×768) through Apple's `AMD9500Controller` / `AMDFramebuffer`: Recovery, the installer and an installed Sequoia 15.8.1 |
 | Display interrupts (vblank) | **Works** |
-| Acceleration / Metal (`AMDRadeonX4000`) | **Partly working, unstable.** The SMU loads the GPU microcode, the command processor and SDMA run, interrupts work, and WindowServer composites the login screen and desktop with Metal (several apps' command queues, tens of thousands of submissions). Open problems: some boots the accelerator doesn't start (CarrizoRed's HWLibs patches don't take; a black-box report says why), icons and the Dock render wrong (texture layout, see below), and the desktop can still freeze. Boot with `-crnoaccel` for a stable, unaccelerated desktop |
+| Acceleration / Metal (`AMDRadeonX4000`) | **Works.** The SMU loads the GPU microcode, the command processor and SDMA run, interrupts work, and WindowServer and apps render with Metal. Apple's shader compiler emits an interpolation pattern Stoney's 16-bank LDS gets wrong; CarrizoRed fixes the compiled pixel shaders before the GPU runs them (about 2–3% of one CPU core). Boot with `-crnoaccel` for an unaccelerated desktop |
 | Brightness, external displays (HDMI), sleep/wake, HDMI audio | Not done or untested |
 | Video decode/encode (UVD/VCE) | Not supported yet (the engines need SMU power messages; CarrizoRed only uses the SMU for microcode so far) |
 | Carrizo / Bristol Ridge | Same display engine and code paths, **untested** (no hardware) |
@@ -29,7 +29,7 @@ render wrong, and the desktop can still freeze after a while. That's the current
 
 | Machine | APU | macOS | Result |
 |---|---|---|---|
-| ASUS VivoBook 15 D509BA | A9-9425 (Stoney Ridge, Radeon R5) | Sequoia 15.4 (Recovery, installer), 15.8.1 (installed) | Display works; accelerated desktop reached, not yet reliable |
+| ASUS VivoBook 15 D509BA | A9-9425 (Stoney Ridge, Radeon R5) | Sequoia 15.4 (Recovery, installer), 15.8.1 (installed) | Display and Metal acceleration work; desktop renders correctly |
 
 Reports from other Carrizo, Bristol Ridge or Stoney machines are welcome once it's further along; open an issue with
 the model and the black-box report (see *Installing*).
@@ -57,9 +57,17 @@ The accelerator so far needed:
 - lost display-flip completions delivered by CarrizoRed (otherwise one lost completion freezes the screen);
 - the video engines left off.
 
-Still open: texture layout (Apple's Metal driver assumes Polaris 11's 4 memory pipes, Stoney has 2 and one render
-backend, which fits the broken icons and Dock); CarrizoRed's patches to Apple's HWLibs sometimes not taking at boot;
-the GPU occasionally not responding after a warm restart (power off fully); and stability over longer sessions.
+And Metal needed:
+- the compiled pixel shaders fixed for Stoney's 16-bank LDS: `v_interp_p1_f32` must not write the VGPR it reads, and
+  Apple's shader compiler (even its own Stoney back end) does that for the last component of an attribute. CarrizoRed
+  rewrites those shaders in GPU memory as each command buffer is submitted, before the GPU runs them;
+- the small-primitive filter off, the 2-pipe walk fence and no delta colour compression (Polaris settings Mesa doesn't
+  use on Stoney), and the Metal compiler switched to its Stoney back end (patched in the dyld shared cache);
+- the GPU and CPU named after the APU in About This Mac.
+
+Still open: a few shaders the fix has to leave alone (rare); the GPU occasionally not responding after a warm restart
+(power off fully); and stability over longer sessions. HWLibs patches not taking at boot turned out to be Lilu's
+trampoline buffer running out; CarrizoRed now builds its own trampolines.
 
 Each fix is documented in the code, in [docs/TEST_MACHINES.md](docs/TEST_MACHINES.md) and in
 [docs/APPLE_KEXTS.md](docs/APPLE_KEXTS.md).
@@ -173,8 +181,8 @@ and the list of affected machines.
 | `-crnowalkfence` | Keep the Metal driver's `PA_SC_MODE_CNTL_1` walk fence size 3 (Mesa uses 2 on 2-pipe chips such as Stoney) |
 | `-crdcc` | Let Apple's Metal driver give textures delta colour compression (DCC); by default CarrizoRed turns it off |
 | `-crnointerpfix` | Don't rewrite pixel shaders whose `v_interp_p1_f32` writes the VGPR it reads (wrong on Stoney's 16-bank LDS; Apple's compiler emits it) |
-| `-crinterpsubmit` | Run the interpolation fix on every submission (and map the carve-out once) instead of once a second; experimental, the boots that had it froze |
-| `-crinterpbump` | Let the interpolation fix raise a shader's VGPR allocation in the command buffer when it has no free register (experimental) |
+| `-crnointerpsubmit` | Run the interpolation fix once a second from a thread instead of at every submission (content drawn before it gets to a shader stays wrong; no VGPR raises) |
+| `-crnointerpbump` | Don't give a shader more VGPRs when it has no free register for the fix (those hazards are left alone) |
 | `-crnostallpanic` | Don't panic with the black-box report when the GPU stops executing commands for 10 s |
 | `-crats` | Let CAIL turn on the iGPU's PCIe ATS, PRI and PASID capabilities (IOMMUv2 features; macOS has no AMD IOMMU driver to answer them), which CarrizoRed otherwise leaves off |
 | `-crnoarbfix` | Leave Apple's Polaris memory-arbiter tweak (`MC_ARB_MISC2` `SEQ_RDY_POP_IDLE` / `POP_IDLE_REPLAY`) in `AMDBaffinHardware::powerUp`; on the APU the arbiter is shared with the CPU |

@@ -1894,15 +1894,17 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 
 	// The 16-bank LDS interpolation fix, at submission (see wrapCommitIb).
 	interpFixOff = checkKernelArgument("-crnointerpfix") || family != ChipFamily::Stoney;
-	// Raising a shader's VGPR allocation in the command buffer is opt-in: a command buffer that binds the shader without
-	// passing through the hook would then run it with registers it doesn't own (the suspected cause of the freeze in
-	// the boot after nvram156).
-	interpBump = checkKernelArgument("-crinterpbump") && checkKernelArgument("-crinterpsubmit");
+	// Raising a shader's VGPR allocation is safe only when the submit hook sees every command buffer that binds it
+	// (else the shader runs with registers it doesn't own): the hook raises RSRC1_PS from an append-only table, even
+	// when it can't take the lock. -crnointerpbump disables raising.
+	interpBump = !checkKernelArgument("-crnointerpbump") && !checkKernelArgument("-crnointerpsubmit");
 	if (!interpFixOff && !interpLock) {
 		interpLock = IOLockAlloc();
-		// The submit-time hook and the one-off carve-out mapping are opt-in (-crinterpsubmit): the two boots after they
-		// were added froze (~109 s, nothing in NVRAM), while the once-a-second scan alone (nvram156) ran fine.
-		interpSubmit = checkKernelArgument("-crinterpsubmit");
+		// The submit-time hook (AMDFijiPM4Channel is the one Polaris uses) fixes shaders before the GPU runs them. It must
+		// never block or allocate: the first version made mappings inside the submission path and froze the machine
+		// twice. It reads through the carve-out mapping and the kernel physmap only. -crnointerpsubmit disables it
+		// (the once-a-second scan then does the fixing, without raises).
+		interpSubmit = !checkKernelArgument("-crnointerpsubmit");
 		interpHooked = interpLock && interpSubmit && route("__ZN30AMDRadeonX4000_AMDVIPM4Channel27commitIndirectCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
 			reinterpret_cast<mach_vm_address_t>(wrapCommitIb), orgCommitIb, nullptr, 0, "commitIndirectCommandBuffer");
 		if (interpLock && interpSubmit)
@@ -4687,14 +4689,16 @@ static bool ibWritePhys(uint64_t phys, uint32_t bytes, const void *in) {
 struct VgprField {
 	uint8_t dword, shift, width, count;
 	bool read, write;
+	bool exact;  // count is the instruction's real register count (else an upper bound)
 };
 
 // GCN3 (GFX8) VGPR operands of the instruction at code[0]. Returns false for an encoding whose operands we don't model.
 static bool gcn3VgprFields(const uint32_t *code, uint32_t len, VgprField *f, uint32_t &n) {
 	n = 0;
 	uint32_t w = code[0];
-	auto add = [&](uint8_t dword, uint8_t shift, uint8_t width, uint8_t count, bool read, bool write) {
-		f[n++] = {dword, shift, width, count, read, write};
+	auto add = [&](uint8_t dword, uint8_t shift, uint8_t width, uint8_t count, bool read, bool write,
+				   bool exact = false) {
+		f[n++] = {dword, shift, width, count, read, write, exact};
 	};
 	if (!(w >> 31)) {
 		uint32_t enc7 = w >> 25;
@@ -4772,19 +4776,59 @@ static bool gcn3VgprFields(const uint32_t *code, uint32_t len, VgprField *f, uin
 			add(1, 16, 8, 1, true, false);
 			add(1, 24, 8, 1, true, false);
 			return true;
-		case 0x3C:  // MIMG: vaddr range read, vdata range written (or read by stores)
+		case 0x3C: {  // MIMG: vaddr range read; vdata written by loads/samples, read by stores, both by atomics
 			if (len < 2)
 				return false;
+			uint32_t op = (w >> 18) & 0x7F, dmask = (w >> 8) & 0xF;
+			bool d16 = code[1] >> 31;
+			uint8_t count = static_cast<uint8_t>(__builtin_popcount(dmask) ? __builtin_popcount(dmask) : 1);
+			bool gather = op >= 0x40 && op <= 0x5F;
+			bool store = op >= 0x08 && op <= 0x0B, atomic = op >= 0x0F && op <= 0x1C;
 			add(1, 0, 8, 4, true, false);
-			add(1, 8, 8, 4, true, true);
+			if (store)
+				add(1, 8, 8, count, true, false, !d16);
+			else if (atomic)
+				add(1, 8, 8, 4, true, true);
+			else
+				add(1, 8, 8, gather ? 4 : count, false, true, !d16);
 			return true;
-		case 0x38:  // MUBUF
-		case 0x3A:  // MTBUF
+		}
+		case 0x38: {  // MUBUF: exact vdata sizes for the plain loads and stores; d16, lds and atomics are bounds
 			if (len < 2)
 				return false;
+			uint32_t op = (w >> 18) & 0x7F;
+			bool lds = (w >> 16) & 1;
 			add(1, 0, 8, 2, true, false);
-			add(1, 8, 8, 4, true, true);
+			static const uint8_t formatSize[4] {1, 2, 3, 4};
+			if (lds) {
+			} else if (op <= 0x03) {
+				add(1, 8, 8, formatSize[op], false, true, true);
+			} else if (op <= 0x07) {
+				add(1, 8, 8, formatSize[op - 4], true, false, true);
+			} else if (op >= 0x10 && op <= 0x17) {
+				static const uint8_t loadSize[8] {1, 1, 1, 1, 1, 2, 3, 4};
+				add(1, 8, 8, loadSize[op - 0x10], false, true, true);
+			} else if (op >= 0x18 && op <= 0x1F) {
+				static const uint8_t storeSize[8] {1, 1, 1, 1, 1, 2, 3, 4};
+				add(1, 8, 8, storeSize[op - 0x18], true, false, true);
+			} else {
+				add(1, 8, 8, 4, true, true);
+			}
 			return true;
+		}
+		case 0x3A: {  // MTBUF: tbuffer_load_format_x-xyzw 0-3, store 4-7, d16 8-15
+			if (len < 2)
+				return false;
+			uint32_t op = (w >> 15) & 0xF;
+			add(1, 0, 8, 2, true, false);
+			if (op <= 3)
+				add(1, 8, 8, static_cast<uint8_t>(op + 1), false, true, true);
+			else if (op <= 7)
+				add(1, 8, 8, static_cast<uint8_t>(op - 3), true, false, true);
+			else
+				add(1, 8, 8, 4, true, true);
+			return true;
+		}
 		case 0x36:  // DS
 			if (len < 2)
 				return false;
@@ -4953,7 +4997,7 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 				uint32_t v = fieldValue(code + i, f[k]);
 				if (!(v <= vI && vI < v + f[k].count))
 					continue;
-				if (f[k].count > 1 && (f[k].read || v != vI)) {
+				if (f[k].count > 1 && (f[k].read || (v != vI && !f[k].exact))) {
 					skip = SkipRange;
 					return fixedHere;
 				}

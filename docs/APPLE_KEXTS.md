@@ -449,3 +449,44 @@ than that overwrote the next one (the 6-byte `AMDSWScheduler::signalTimeout` bro
 over an already-patched image again (now skipped by load address). Re-registering the iGPU to re-match the
 accelerator (a start-order experiment, now opt-in) is the suspect for a WindowServer crash on a torn-down VM manager
 (`AMDHWVMM::endVMPTUpdate`, `+0x28` freed by `acceleratorWillStop`).
+
+### Bring-up, part 3: rendering (2026-10-15/16, boots nvram138–169)
+
+**Start-up reliability, solved.** Lilu builds every plugin's trampolines in one shared 4 KB buffer. With ~150 traced
+stages CarrizoRed alone needed more; once it was full, `createTrampoline` failed, `routeFunctionInternal` returned
+`EINVAL` and `routeMultiple` took that for a trampoline address and reported success. Whichever kext loaded last
+(usually HWLibs) silently lost its hooks: the "reverted" `earlyInitialize` bytes were never patched. `routeChecked`
+now builds trampolines in a pool of CarrizoRed's own and reads every jump back.
+
+**User-space patches.** Lilu's user patcher is switched off on Big Sur and later, and finds patch sites by reading the
+library from disk (cache-only dylibs aren't on disk). CarrizoRed wraps `cs_validate_page` and patches pages of the
+dyld shared cache (`dyld_shared_cache_x86_64h.03`, 15.8.1) as they are validated:
+- `libSC` `SCGetInstructionSet`: the VI branch returns 0x1E, Stoney's own back end (`SCGfx81Info`);
+- `AMDMTLBronzeDriver`: small-primitive filter off (`PA_SU_SMALL_PRIM_FILTER_CNTL` 0; Mesa never enables it on
+  Stoney), walk fence size 2 (`PA_SC_MODE_CNTL_1`, Mesa's value for 2-pipe chips), no DCC.
+
+None of these changed what was on screen; they match what Linux does, so they stay.
+
+**The rendering bug: 16-bank LDS interpolation.** A black-box capture of WindowServer's command buffers (user IBs read
+through the VMID's page tables) and of the pixel shaders they bind showed shaders ending a vec4 attribute with
+`v_interp_p1_f32 v0, v0, attr.w`: the last p1 writes the I barycentric it reads. On 16-bank LDS chips (Kabini,
+Stoney) that gives a wrong value (LLVM marks the 16-bank variant's destination early-clobber); Polaris has 32 banks.
+Everything drawn through those shaders broke: vibrant text as bars, highlights and window shadows, Dock icons cut on
+a diagonal, the lock screen's blurred wallpaper. Apple's compiler does it in its Stoney back end too.
+
+The fix rewrites compiled pixel shaders in GPU memory, one dword at a time, nothing moved: the bad p1 and its p2 get a
+register that is free (above the highest one used, within the allocation), dead at that point (straight-line code),
+or new (the shader's `SPI_SHADER_PGM_RSRC1_PS.VGPRS` raised by one granule), and the result's later reads follow it.
+Loops are handled when the result keeps its own register. It runs in a wrapper of
+`AMDFijiPM4Channel::commitIndirectCommandBuffer` (the class Polaris submits through), before the GPU sees each
+command buffer, so nothing is drawn with a broken shader. Lessons on the way:
+- the wrapper must never block or allocate: making physical mappings inside the submission path deadlocked the
+  machine twice. It reads the carve-out through one mapping made beforehand and system memory through the kernel's
+  physmap, flushing cache lines around each access;
+- a shader given more VGPRs must get the raised `RSRC1_PS` in *every* command buffer that binds it, or it runs with
+  registers it doesn't own: raised shaders go into an append-only table every pass consults, even without the lock;
+- most command buffers and shader code live in system memory, not the carve-out;
+- known shaders are recognised by a 16-dword fingerprint, which brought the cost from ~9% to ~2–3% of one core.
+
+Reasons a shader is still left alone (counted in the report's `interp fix` line): the result read inside a register
+range (e.g. image coordinates), and loops that write the result register again.
