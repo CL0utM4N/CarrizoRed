@@ -687,12 +687,18 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 
 	if (!iGPU) {
 		SYSLOG("cr", "no supported Carrizo-family iGPU found, disabling");
+		for (auto &patch : pagePatches)
+			patch.enabled = false;
 		disableKextCallbacks();
 		return;
 	}
 
 	gpuBus = iGPU->getBusNumber();
 	gpuDevice = iGPU->getDeviceNumber();
+	// The libSC patch selects AMD's Stoney back end (SCGfx81Info); libSC gives Carrizo (CZ revisions 1-0x20) the
+	// generic GFX 8.0 one, which is right for it (32 LDS banks), so only Stoney gets it.
+	if (family != ChipFamily::Stoney)
+		pagePatches[0].enabled = false;
 	pipeLimit = displayPipes(family);
 	pipeGuard = checkKernelArgument("-crpipeguard");
 	regLogIntsOff = checkKernelArgument("-crreglogintsoff");
