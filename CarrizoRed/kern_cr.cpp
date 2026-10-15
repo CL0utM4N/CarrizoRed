@@ -1063,7 +1063,7 @@ static void writeBreadcrumb(uint32_t t) {
 static void startInterpFix();  // defined with the black box below
 // The interpolation fix's submit hook and its shared state (see wrapCommitIb).
 static IOLock *interpLock;
-static bool interpFixOff, interpHooked, interpBump;
+static bool interpFixOff, interpHooked, interpBump, interpSubmit;
 static mach_vm_address_t orgCommitIb;
 static uint64_t wrapCommitIb(void *channel, uint8_t *info);
 
@@ -1894,7 +1894,10 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 	interpBump = checkKernelArgument("-crinterpbump");
 	if (!interpFixOff && !interpLock) {
 		interpLock = IOLockAlloc();
-		interpHooked = interpLock && route("__ZN30AMDRadeonX4000_AMDVIPM4Channel27commitIndirectCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
+		// The submit-time hook and the one-off carve-out mapping are opt-in (-crinterpsubmit): the two boots after they
+		// were added froze (~109 s, nothing in NVRAM), while the once-a-second scan alone (nvram156) ran fine.
+		interpSubmit = checkKernelArgument("-crinterpsubmit");
+		interpHooked = interpLock && interpSubmit && route("__ZN30AMDRadeonX4000_AMDVIPM4Channel27commitIndirectCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
 			reinterpret_cast<mach_vm_address_t>(wrapCommitIb), orgCommitIb, nullptr, 0, "commitIndirectCommandBuffer");
 	}
 
@@ -4436,7 +4439,7 @@ static bool carveInit() {
 }
 
 static uint8_t *carvePtr(uint64_t phys, uint32_t bytes) {
-	if (!carveInit() || phys < carveBase || phys + bytes > carveBase + carveSize)
+	if (!interpSubmit || !carveInit() || phys < carveBase || phys + bytes > carveBase + carveSize)
 		return nullptr;
 	return carveMap + (phys - carveBase);
 }

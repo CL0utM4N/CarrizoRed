@@ -173,6 +173,7 @@ and the list of affected machines.
 | `-crnowalkfence` | Keep the Metal driver's `PA_SC_MODE_CNTL_1` walk fence size 3 (Mesa uses 2 on 2-pipe chips such as Stoney) |
 | `-crdcc` | Let Apple's Metal driver give textures delta colour compression (DCC); by default CarrizoRed turns it off |
 | `-crnointerpfix` | Don't rewrite pixel shaders whose `v_interp_p1_f32` writes the VGPR it reads (wrong on Stoney's 16-bank LDS; Apple's compiler emits it) |
+| `-crinterpsubmit` | Run the interpolation fix on every submission (and map the carve-out once) instead of once a second; experimental, the boots that had it froze |
 | `-crinterpbump` | Let the interpolation fix raise a shader's VGPR allocation in the command buffer when it has no free register (experimental) |
 | `-crnostallpanic` | Don't panic with the black-box report when the GPU stops executing commands for 10 s |
 | `-crats` | Let CAIL turn on the iGPU's PCIe ATS, PRI and PASID capabilities (IOMMUv2 features; macOS has no AMD IOMMU driver to answer them), which CarrizoRed otherwise leaves off |
