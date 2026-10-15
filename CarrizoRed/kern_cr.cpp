@@ -1063,7 +1063,7 @@ static void writeBreadcrumb(uint32_t t) {
 static void startInterpFix();  // defined with the black box below
 // The interpolation fix's submit hook and its shared state (see wrapCommitIb).
 static IOLock *interpLock;
-static bool interpFixOff, interpHooked;
+static bool interpFixOff, interpHooked, interpBump;
 static mach_vm_address_t orgCommitIb;
 static uint64_t wrapCommitIb(void *channel, uint8_t *info);
 
@@ -1081,7 +1081,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 	// still running; no panic means a real hang.
 	bool autoPanicOff = checkKernelArgument("-crnoautopanic") || checkKernelArgument("-crnosmuload") ||
 		checkKernelArgument("-crnodirectucode") || self->family != ChipFamily::Stoney;
-	uint32_t panicAt = 0;
+	uint32_t panicAt = 0, stallRptr = 0, stallTicks = 0;
+	bool stallPanicOff = checkKernelArgument("-crnostallpanic");
 	if (!PE_parse_boot_argn("crpanicat", &panicAt, sizeof(panicAt)))
 		panicAt = 0;
 	uint32_t printed = 0;
@@ -1155,6 +1156,20 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (panicAt && t >= panicAt)
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
 		kickStalledFlip();
+		// GPU stopped: the GFX ring's read pointer (CP_RB0_RPTR) stuck behind its write pointer (CP_RB0_WPTR) for 10 s.
+		// The screen freezes with the kernel still running and nothing in NVRAM, so panic with the report instead.
+		// -crnostallpanic disables it.
+		if (gpuMmio && smuLoadOk() && !stallPanicOff) {
+			uint32_t rptr = gpuMmio[0x21C0], wptr = gpuMmio[0x3045];
+			if (rptr != wptr && rptr == stallRptr) {
+				if (++stallTicks == 20)
+					self->panicReport(t, now, "CarrizoRed: the GPU stopped executing commands (GFX ring read pointer stuck "
+						"for 10 s with work queued).");
+			} else {
+				stallTicks = 0;
+				stallRptr = rptr;
+			}
+		}
 		self->setGpuModel();
 		checkGpuAlive(gpuMmio);
 		if (smuLoadOk())
@@ -1873,6 +1888,10 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 
 	// The 16-bank LDS interpolation fix, at submission (see wrapCommitIb).
 	interpFixOff = checkKernelArgument("-crnointerpfix") || family != ChipFamily::Stoney;
+	// Raising a shader's VGPR allocation in the command buffer is opt-in: a command buffer that binds the shader without
+	// passing through the hook would then run it with registers it doesn't own (the suspected cause of the freeze in
+	// the boot after nvram156).
+	interpBump = checkKernelArgument("-crinterpbump");
 	if (!interpFixOff && !interpLock) {
 		interpLock = IOLockAlloc();
 		interpHooked = interpLock && route("__ZN30AMDRadeonX4000_AMDVIPM4Channel27commitIndirectCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
@@ -5120,7 +5139,7 @@ static uint64_t wrapCommitIb(void *channel, uint8_t *info) {
 				uint64_t va = *reinterpret_cast<uint64_t *>(info + 0x50 + i * 0x28);
 				if (dw && va) {
 					ibHookIbs++;
-					processUserIb(vmid, va, dw, true);
+					processUserIb(vmid, va, dw, interpBump);
 				}
 			}
 			IOLockUnlock(interpLock);
