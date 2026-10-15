@@ -142,6 +142,67 @@ static void restoreVbiosImageForSetup();
 // with ATY,bin_image present, yet none of the HWLibs hooks ran.
 static void checkLiveHwlibs(void *hardware);
 
+// RB+ (render backend plus). Stoney is the only GFX8 chip with it; Mesa (radeonsi, rbplus_allowed) programs
+// SX_PS_DOWNCONVERT, SX_BLEND_OPT_EPSILON, SX_BLEND_OPT_CONTROL and SX_MRT0-7_BLEND_OPT for every draw. Apple's Polaris
+// Metal driver has never heard of them (Polaris has no RB+), so on Stoney they keep the clear-state defaults, and
+// blend optimisations left on with arbitrary settings would break alpha-blended drawing (the icons and Dock render
+// wrong while opaque windows are fine). The clear-state buffer (RLC_CSIB_ADDR_LO/HI, RLC_CSIB_LENGTH = 0xECA2-0xECA4,
+// in VRAM) holds the context registers' defaults that CLEAR_STATE loads: record what it sets for 0x28750-0x2877C
+// (context register indices 0x1D4-0x1DF) and set SX_BLEND_OPT_CONTROL (0x1D6) to every MRT's colour and alpha
+// optimisation off plus PIXEN_ZERO_OPT_DISABLE (0xB3333333). -crnorbplusfix only records.
+static bool rbplusDone;
+static uint32_t rbplusValues[12], rbplusSeen, rbplusPatched, rbplusCsibDwords;
+static uint64_t rbplusCsib;
+
+static void fixRbPlus(volatile uint32_t *mmio, bool stoney) {
+	if (rbplusDone || !mmio || !stoney)
+		return;
+	uint64_t mc = static_cast<uint64_t>(mmio[0xECA3]) << 32 | mmio[0xECA2];
+	uint32_t dwords = mmio[0xECA4];
+	if (!mc || !dwords || dwords > 0x2000)
+		return;
+	rbplusDone = true;
+	rbplusCsib = mc;
+	rbplusCsibDwords = dwords;
+	uint64_t fbBase = static_cast<uint64_t>(mmio[Reg::MC_VM_FB_LOCATION] & 0xFFFF) << 24;
+	uint64_t fbTop = (static_cast<uint64_t>(mmio[Reg::MC_VM_FB_LOCATION] >> 16) + 1) << 24;
+	if (mc < fbBase || mc + dwords * 4 > fbTop)
+		return;
+	uint64_t phys = (static_cast<uint64_t>(mmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22) + (mc - fbBase);
+	auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, dwords * 4, kIODirectionInOut);
+	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+	if (map) {
+		auto *buf = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
+		bool patch = !checkKernelArgument("-crnorbplusfix");
+		for (uint32_t i = 0; i < dwords;) {
+			uint32_t header = buf[i];
+			if ((header >> 30) != 3) {
+				i++;
+				continue;
+			}
+			uint32_t count = ((header >> 16) & 0x3FFF) + 1, opcode = (header >> 8) & 0xFF;
+			if (opcode == 0x69 && count >= 2 && i + count < dwords) {  // SET_CONTEXT_REG: start index, values
+				uint32_t start = buf[i + 1];
+				for (uint32_t k = 0; k + 1 < count; k++) {
+					uint32_t reg = start + k;
+					if (reg >= 0x1D4 && reg <= 0x1DF) {
+						rbplusValues[reg - 0x1D4] = buf[i + 2 + k];
+						rbplusSeen |= 1U << (reg - 0x1D4);
+						if (reg == 0x1D6 && patch) {
+							buf[i + 2 + k] = 0xB3333333;
+							rbplusPatched++;
+						}
+					}
+				}
+			}
+			i += count + 1;
+		}
+		traceNote("rbplus=%x/%u ", rbplusSeen, rbplusPatched);
+	}
+	OSSafeReleaseNULL(map);
+	OSSafeReleaseNULL(desc);
+}
+
 // GPU not responding: every register reads 0xFFFFFFFF, the PCI "nobody home" value (nvram99/137: CAIL's waits read
 // RLC_SAFE_MODE as 0xFFFFFFFF and nothing after that could work; a full power-off fixed it). Checked at start-up
 // (probeMMIO) and by the watcher every tick: GRBM_STATUS and MC_VM_FB_LOCATION are never all-ones on a live GPU.
@@ -918,6 +979,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
 		kickStalledFlip();
 		checkGpuAlive(gpuMmio);
+		if (smuLoadOk())
+			fixRbPlus(gpuMmio, self->family == ChipFamily::Stoney);
 		if (accelDeferred && controllerReady) {
 			accelDeferred = false;
 			accelRematches++;
@@ -2277,6 +2340,7 @@ static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
 static mach_vm_address_t orgGetHardwareInfo;
 static uint32_t hwInfoCalls, hwInfoFixed, hwInfoSpoofed, hwInfoRet = 0xFFFFFFFF;
 static uint64_t hwInfoValues[7];  // ref, sys, mem, +0xD8 clocks; device ID, raster pipes, shader pipes (as returned)
+static uint32_t hwInfoCopy[0x204 / 4];  // the whole block as returned (after our changes), for the report
 
 static uint32_t wrapGetHardwareInfo(void *that, uint8_t *info) {
 	auto ret = FunctionCast(wrapGetHardwareInfo, orgGetHardwareInfo)(that, info);
@@ -2290,6 +2354,7 @@ static uint32_t wrapGetHardwareInfo(void *that, uint8_t *info) {
 	hwInfoValues[5] = *reinterpret_cast<uint64_t *>(info + 0x18);
 	hwInfoValues[6] = *reinterpret_cast<uint64_t *>(info + 0x20);
 	hwInfoRet = ret;
+	memcpy(hwInfoCopy, info, sizeof(hwInfoCopy));
 	// nvram103: the call succeeds (clocks 48/933/400 MHz), but reports device ID 0x98E4: AMDHardware reads it from
 	// config space, so the Polaris Metal driver sees an ID it doesn't know while everything else sees the spoofed one.
 	// Report the spoofed ID (the iGPU's device-id property). -crnohwinfospoof leaves the real one.
@@ -4144,6 +4209,24 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	add("pg: blocked %u, RLC_PG_CNTL %x\n", pgBlocked, gpuMmio ? gpuMmio[0xEC43] : 0);
 	add("smu reload: %u, last @%llu status %x -> %x resp %x in %u ms\n", smuReload.count, smuReload.at / 100,
 		smuReload.before, smuReload.after, smuReload.resp, smuReload.ms);
+	if (hwInfoCalls) {
+		// AMDVIHardware::initHWInfo: +0x28 GB_ADDR_CONFIG, +0x30/+0x38 PA_SC_RASTER_CONFIG(_1), +0xB0/+0xB8 from
+		// MC_SHARED_CHMAP, +0x128 tile-mode count then the table, +0x1AC macro-tile count then the table.
+		auto *w = hwInfoCopy;
+		add("hwinfo layout: addrcfg %x raster %x %x chmap %x %x; tile modes %u:", w[0x28 / 4], w[0x30 / 4], w[0x38 / 4],
+			w[0xB0 / 4], w[0xB8 / 4], w[0x128 / 4]);
+		for (uint32_t i = 0; i < 32 && i < w[0x128 / 4]; i++)
+			add(" %x", w[0x12C / 4 + i]);
+		add("; macro %u:", w[0x1AC / 4]);
+		for (uint32_t i = 0; i < 16 && i < w[0x1AC / 4]; i++)
+			add(" %x", w[0x1B0 / 4 + i]);
+		add("\n");
+	}
+	add("rbplus: csib %llx (%u dw), seen %x, SX_PS_DOWNCONVERT %x EPSILON %x CONTROL %x (patched %u) MRT0-7",
+		rbplusCsib, rbplusCsibDwords, rbplusSeen, rbplusValues[0], rbplusValues[1], rbplusValues[2], rbplusPatched);
+	for (uint32_t i = 4; i < 12; i++)
+		add(" %x", rbplusValues[i]);
+	add("\n");
 	add("uc (now @%llu):", uptimeMs() / 100);
 	for (size_t i = 0; i < MaxTraceStages; i++)
 		if (stageNames[i] && !strncmp(stageNames[i], "uc.", 3)) {

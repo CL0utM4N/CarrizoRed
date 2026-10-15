@@ -167,6 +167,7 @@ and the list of affected machines.
 | `-crnoautopanic` | Don't panic with the black-box report when the accelerator hasn't loaded the GPU microcode by 120 s |
 | `-crnohwlibswire` | Don't lock HWLibs' code in memory before patching it (some boots its patched code reverted to Apple's original before CAIL ran) |
 | `-crnohwlibsrepatch` | Don't re-apply the HWLibs patches when they're found missing at `AMDHardware::setupCAIL` (only report it) |
+| `-crnorbplusfix` | Stoney: don't turn RB+ blend optimisations off in the GPU's clear-state defaults (`SX_BLEND_OPT_CONTROL`). Stoney is the only GFX8 chip with RB+; Apple's Polaris Metal driver never programs its registers, so they keep whatever the clear state sets (only recorded then) |
 | `-crats` | Let CAIL turn on the iGPU's PCIe ATS, PRI and PASID capabilities (IOMMUv2 features; macOS has no AMD IOMMU driver to answer them), which CarrizoRed otherwise leaves off |
 | `-crnoarbfix` | Leave Apple's Polaris memory-arbiter tweak (`MC_ARB_MISC2` `SEQ_RDY_POP_IDLE` / `POP_IDLE_REPLAY`) in `AMDBaffinHardware::powerUp`; on the APU the arbiter is shared with the CPU |
 | `-crnorlcreset`, `-crrlcreset` | With direct microcode loading: when CAIL halts the RLC to load its microcode, `-crnorlcreset` leaves coarse-grain clock gating and power gating alone (otherwise both are turned off); `-crrlcreset` also soft-resets the RLC again (CAIL already does, before its RLC set-up) |
