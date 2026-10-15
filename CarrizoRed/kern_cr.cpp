@@ -1064,8 +1064,9 @@ static void startInterpFix();  // defined with the black box below
 // The interpolation fix's submit hook and its shared state (see wrapCommitIb).
 static IOLock *interpLock;
 static bool interpFixOff, interpHooked, interpBump, interpSubmit;
-static mach_vm_address_t orgCommitIb;
+static mach_vm_address_t orgCommitIb, orgCommitIbFiji;
 static uint64_t wrapCommitIb(void *channel, uint8_t *info);
+static uint64_t wrapCommitIbFiji(void *channel, uint8_t *info);
 
 void CRDriver::watcherThread(void *arg, wait_result_t) {
 	auto *self = static_cast<CRDriver *>(arg);
@@ -1899,6 +1900,10 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		interpSubmit = checkKernelArgument("-crinterpsubmit");
 		interpHooked = interpLock && interpSubmit && route("__ZN30AMDRadeonX4000_AMDVIPM4Channel27commitIndirectCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
 			reinterpret_cast<mach_vm_address_t>(wrapCommitIb), orgCommitIb, nullptr, 0, "commitIndirectCommandBuffer");
+		if (interpLock && interpSubmit)
+			interpHooked |= route("__ZN32AMDRadeonX4000_AMDFijiPM4Channel27commitIndirectCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
+				reinterpret_cast<mach_vm_address_t>(wrapCommitIbFiji), orgCommitIbFiji, nullptr, 0,
+				"Fiji commitIndirectCommandBuffer");
 	}
 
 	if (family == ChipFamily::Stoney && !checkKernelArgument("-crnosdmafix")) {
@@ -5142,7 +5147,9 @@ static void startInterpFix() {
 // a submission into the GFX ring. info: +0 flags (bits 1 and 4 select other paths), +4 VMID, +0xC number of command
 // buffers, then one entry per command buffer from +0x44, 0x28 bytes each: dwords at +0, GPU address at +0xC. Fix every
 // pixel shader the command buffers bind before the GPU sees them.
-static uint64_t wrapCommitIb(void *channel, uint8_t *info) {
+// Polaris (and so Stoney spoofed as Baffin) submits through AMDFijiPM4Channel's override, which has the same layout
+// (nvram161: the AMDVIPM4Channel hook alone saw 0 calls).
+static void interpHookBody(uint8_t *info) {
 	if (info && interpLock && !interpFixOff && gpuMmio) {
 		uint32_t flags = *reinterpret_cast<uint32_t *>(info), vmid = *reinterpret_cast<uint32_t *>(info + 4);
 		uint32_t count = *reinterpret_cast<uint32_t *>(info + 0xC);
@@ -5171,7 +5178,16 @@ static uint64_t wrapCommitIb(void *channel, uint8_t *info) {
 			ibHookNs += ns;
 		}
 	}
+}
+
+static uint64_t wrapCommitIb(void *channel, uint8_t *info) {
+	interpHookBody(info);
 	return FunctionCast(wrapCommitIb, orgCommitIb)(channel, info);
+}
+
+static uint64_t wrapCommitIbFiji(void *channel, uint8_t *info) {
+	interpHookBody(info);
+	return FunctionCast(wrapCommitIbFiji, orgCommitIbFiji)(channel, info);
 }
 
 struct PutState {
