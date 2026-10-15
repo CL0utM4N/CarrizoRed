@@ -524,44 +524,95 @@ CRDriver *CRDriver::callback = nullptr;
 // the VI branch return 0x1E.
 //
 // libSC exists only inside the dyld shared cache, and Lilu's user patcher locates its patches by reading the library
-// from disk, so a Lilu binary patch for it never applies (nvram141 and later: no change after clearing the shader
-// caches). Do what Lilu does underneath instead: wrap cs_validate_range, which the kernel calls on every page of signed
-// code it reads in, and after validation patch the page holding SCGetInstructionSet in place. The page is then shared
-// by every process that maps the cache. The match is 72 bytes of SCGetInstructionSet at its offset in the page
-// (macOS 15.8.1, 24H32); the patched byte is the VI branch's `mov eax, 0x0E`. -crnoscpatch disables it.
-static constexpr size_t ScPatchPageOffset = 0xD78, ScPatchByte = 0x25;
+// from disk, so a Lilu binary patch for it never applies; nor do the cache's pages pass through cs_validate_range
+// (nvram142: hooked, 0 of 2730 validated pages matched). So patch each MTLCompilerService's own copy as Lilu does for
+// cache patches it can locate: when the process starts (Lilu's process callback), find where the cache is mapped
+// (vm_shared_region_start_address: the first mapping, 0x7FF800000000 + slide), check 72 bytes of SCGetInstructionSet
+// there, make the page a private copy (VM_PROT_COPY), write the byte, and turn off code-signing page enforcement for
+// that process's map (what a debugger gets), since the copy no longer matches its signature. The patched byte is the VI
+// branch's `mov eax, 0x0E` (macOS 15.8.1, 24H32 x86_64h cache). -crnoscpatch disables it.
+static constexpr mach_vm_address_t ScCacheBase = 0x7FF800000000, ScPatchAddress = 0x7FFB00EAED78;
+static constexpr size_t ScPatchByte = 0x25;
 static const uint8_t scPatchFind[] {
 	0x83, 0xC6, 0xD8, 0x83, 0xFE, 0x13, 0x77, 0x12, 0x83, 0xE2, 0xFE, 0xB8, 0x0D, 0x00, 0x00, 0x00, 0x81, 0xFA,
 	0xA0, 0x67, 0x00, 0x00, 0x75, 0x02, 0x5D, 0xC3, 0xB8, 0x0C, 0x00, 0x00, 0x00, 0x5D, 0xC3, 0x83, 0xC6, 0xEC,
 	0xB8, 0x0E, 0x00, 0x00, 0x00, 0x83, 0xFE, 0x13, 0x77, 0xEA, 0x81, 0xC2, 0xD7, 0x96, 0xFF, 0xFF, 0x83, 0xFA,
 	0x07, 0x73, 0xDF, 0x48, 0x63, 0xC2, 0x48, 0x8D, 0x0D, 0x41, 0x82, 0x0B, 0x00, 0x8B, 0x04, 0x81, 0x5D, 0xC3,
 };
-static_assert(ScPatchPageOffset + sizeof(scPatchFind) <= 0x1000, "pattern must fit in the page");
-static mach_vm_address_t orgCsValidateRange;
-static bool scPatchHooked;
-static uint32_t scPatchPages, scPatchCalls;
+using t_srGet = void *(*)(task_t);
+using t_srStart = kern_return_t (*)(void *, mach_vm_offset_t *, task_t);
+using t_srRelease = void (*)(void *);
+using t_mapReadUser = kern_return_t (*)(vm_map_t, mach_vm_address_t, void *, vm_size_t);
+using t_mapWriteUser = kern_return_t (*)(vm_map_t, const void *, mach_vm_address_t, vm_size_t);
+using t_mapSetFlag = void (*)(vm_map_t, boolean_t);
+static t_srGet scSrGet;
+static t_srStart scSrStart;
+static t_srRelease scSrRelease;
+static t_mapReadUser scReadUser;
+static t_mapWriteUser scWriteUser;
+static t_mapSetFlag scCsEnforcementSet, scCsDebuggedSet, scSwitchProtect;
+// Processes seen, patched, already patched; the last failure (step << 16 | kern_return_t low bits) and cache address.
+static uint32_t scProcs, scPatched, scAlready, scLastError;
+static uint64_t scLastStart;
 
-static boolean_t wrapCsValidateRange(void *blobs, void *pager, uint64_t offset, const void *data, uint64_t size,
-	unsigned *tainted) {
-	auto res = FunctionCast(wrapCsValidateRange, orgCsValidateRange)(blobs, pager, offset, data, size, tainted);
-	__atomic_fetch_add(&scPatchCalls, 1, __ATOMIC_RELAXED);
-	if (res && data) {
-		// Each 4 KB page in the range: the range starts at a page boundary of the file (offset).
-		for (uint64_t pos = (0x1000 - (offset & 0xFFF)) & 0xFFF; pos + ScPatchPageOffset + sizeof(scPatchFind) <= size;
-			 pos += 0x1000) {
-			auto *at = const_cast<uint8_t *>(static_cast<const uint8_t *>(data)) + pos + ScPatchPageOffset;
-			if (at[0] == scPatchFind[0] && !memcmp(at, scPatchFind, sizeof(scPatchFind))) {
-				at[ScPatchByte] = 0x1E;
-				__atomic_fetch_add(&scPatchPages, 1, __ATOMIC_RELAXED);
-			}
-		}
+static void scFail(uint32_t step, kern_return_t kr) {
+	scLastError = step << 16 | (static_cast<uint32_t>(kr) & 0xFFFF);
+}
+
+static void scProcessStarted(void *, UserPatcher &, vm_map_t map, const char *, size_t) {
+	__atomic_fetch_add(&scProcs, 1, __ATOMIC_RELAXED);
+	if (!scSrGet || !scSrStart || !scSrRelease || !scReadUser || !scWriteUser || !scCsEnforcementSet ||
+		!scCsDebuggedSet || !map)
+		return scFail(1, 0);
+	task_t task = current_task();
+	void *region = scSrGet(task);
+	if (!region)
+		return scFail(2, 0);
+	mach_vm_offset_t start = 0;
+	kern_return_t kr = scSrStart(region, &start, task);
+	scSrRelease(region);
+	if (kr != KERN_SUCCESS || !start)
+		return scFail(3, kr);
+	scLastStart = start;
+	mach_vm_address_t at = start + (ScPatchAddress - ScCacheBase);
+	uint8_t code[sizeof(scPatchFind)];
+	if ((kr = scReadUser(map, at, code, sizeof(code))) != KERN_SUCCESS)
+		return scFail(4, kr);
+	if (code[ScPatchByte] == 0x1E && !memcmp(code, scPatchFind, ScPatchByte)) {
+		__atomic_fetch_add(&scAlready, 1, __ATOMIC_RELAXED);
+		return;
 	}
-	return res;
+	if (memcmp(code, scPatchFind, sizeof(code)))
+		return scFail(5, code[0]);
+	mach_vm_address_t page = (at + ScPatchByte) & ~static_cast<mach_vm_address_t>(PAGE_MASK);
+	scCsEnforcementSet(map, false);
+	scCsDebuggedSet(map, true);
+	if (scSwitchProtect)
+		scSwitchProtect(map, false);
+	if ((kr = vm_protect(map, page, PAGE_SIZE, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY)) != KERN_SUCCESS)
+		return scFail(6, kr);
+	static const uint8_t value = 0x1E;
+	kr = scWriteUser(map, &value, at + ScPatchByte, 1);
+	kern_return_t back = vm_protect(map, page, PAGE_SIZE, false, VM_PROT_READ | VM_PROT_EXECUTE);
+	if (kr != KERN_SUCCESS)
+		return scFail(7, kr);
+	if (back != KERN_SUCCESS)
+		scFail(8, back);
+	__atomic_fetch_add(&scPatched, 1, __ATOMIC_RELAXED);
 }
 
 void CRDriver::init() {
 	callback = this;
 	SYSLOG("cr", "CarrizoRed starting on kernel %d.%d", getKernelVersion(), getKernelMinorVersion());
+
+	if (!checkKernelArgument("-crnoscpatch")) {
+		static UserPatcher::ProcInfo procs[] {
+			{"MTLCompilerService", sizeof("MTLCompilerService") - 1, 1, UserPatcher::ProcInfo::MatchAny},
+		};
+		auto err = lilu.onProcLoad(procs, arrsize(procs), scProcessStarted, nullptr);
+		if (err != LiluAPI::Error::NoError)
+			SYSLOG("cr", "failed to register for MTLCompilerService starts (%d)", err);
+	}
 
 	lilu.onPatcherLoadForce(
 		[](void *user, KernelPatcher &patcher) { static_cast<CRDriver *>(user)->processPatcher(patcher); }, this);
@@ -575,15 +626,19 @@ void CRDriver::init() {
 
 void CRDriver::processPatcher(KernelPatcher &patcher) {
 	if (!checkKernelArgument("-crnoscpatch")) {
-		// Long route, chained with Lilu's own wrapper of the same function (its user patcher, used by RestrictEvents).
-		KernelPatcher::RouteRequest request {"_cs_validate_range", wrapCsValidateRange, orgCsValidateRange};
-		scPatchHooked = patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1) && orgCsValidateRange &&
-			orgCsValidateRange != EINVAL;
-		if (!scPatchHooked) {
-			SYSLOG("cr", "failed to hook cs_validate_range for the libSC Stoney patch (error %d)", patcher.getError());
-			orgCsValidateRange = 0;
+		auto solve = [&patcher](const char *name) {
+			auto addr = patcher.solveSymbol(KernelPatcher::KernelID, name);
 			patcher.clearError();
-		}
+			return addr;
+		};
+		scSrGet = reinterpret_cast<t_srGet>(solve("_vm_shared_region_get"));
+		scSrStart = reinterpret_cast<t_srStart>(solve("_vm_shared_region_start_address"));
+		scSrRelease = reinterpret_cast<t_srRelease>(solve("_vm_shared_region_deallocate"));
+		scReadUser = reinterpret_cast<t_mapReadUser>(solve("_vm_map_read_user"));
+		scWriteUser = reinterpret_cast<t_mapWriteUser>(solve("_vm_map_write_user"));
+		scCsEnforcementSet = reinterpret_cast<t_mapSetFlag>(solve("_vm_map_cs_enforcement_set"));
+		scCsDebuggedSet = reinterpret_cast<t_mapSetFlag>(solve("_vm_map_cs_debugged_set"));
+		scSwitchProtect = reinterpret_cast<t_mapSetFlag>(solve("_vm_map_switch_protect"));
 	}
 
 	auto *devInfo = DeviceInfo::create();
@@ -4347,7 +4402,8 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	if (gpuDeadMs)
 		add("GPU NOT RESPONDING (registers read ffffffff) %s, first seen @%llu: power off fully before the next boot\n",
 			gpuDeadAtStart ? "from start-up" : "since", gpuDeadMs / 100);
-	add("scpatch: hooked %d, pages patched %u (of %u validated)\n", scPatchHooked, scPatchPages, scPatchCalls);
+	add("scpatch: compiler starts %u, patched %u, already %u, last error %x, cache at %llx\n", scProcs, scPatched,
+		scAlready, scLastError, scLastStart);
 	add("routes: %u ok, %u failed, %u not landed (last %s); pool %lu/%lu\n", routesOk, routesFailed, routesUnverified,
 		routeLastFailed ? routeLastFailed : "-", routePoolUsed, RoutePoolSize);
 	add("kexts: X4000 %u(+%u)@%llx HWServices %u(+%u)@%llx HWLibs %u(+%u)@%llx\n", accelKextLoads[0], accelKextRepeats[0],
