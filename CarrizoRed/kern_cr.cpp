@@ -530,28 +530,67 @@ CRDriver *CRDriver::callback = nullptr;
 // pages matched), with the vnode and the page's file offset. Wrap it, as RestrictEvents does for its cache patches, and
 // after a successful validation patch the page in place: it is then shared by every process that maps the cache. The
 // match is 72 bytes of SCGetInstructionSet at 0xD78 in its page (file offset 0xEAED78 of dyld_shared_cache_x86_64h.03,
-// macOS 15.8.1 24H32); the patched byte is the VI branch's `mov eax, 0x0E`. -crnoscpatch disables it.
-static constexpr size_t ScPatchPageOffset = 0xD78, ScPatchByte = 0x25;
+// macOS 15.8.1 24H32); the patched byte is the VI branch's `mov eax, 0x0E`. -crnoscpatch disables it. nvram145: patched
+// and in use, no visible change.
+//
+// The same hook fixes two context registers the Metal driver (AMDMTLBronzeDriver, also in .03) programs for Baffin
+// that Stoney must not get (nvram146, read from WindowServer's command buffer):
+// - PA_SU_SMALL_PRIM_FILTER_CNTL (0x28830) = 5, the small-primitive filter, which culls triangles that cover no sample.
+//   amdMtlBronzeInitStaticHwCtxRegs sets it from the chip record's supportsSmallPrimFilter bit (`and ecx, 5`). Mesa
+//   enables the filter only after Polaris 12 (Polaris has a sample location bug with it) and never on Stoney, which
+//   predates it. Make it `and ecx, 0`: the register is then written as 0. -crnosmallprim disables this.
+// - PA_SC_MODE_CNTL_1 (0x28A4C) = 0x060201B8, i.e. WALK_FENCE_SIZE 3 (amdMtlBronzeInitRenderEncoderHwCtxRegs, a 64-bit
+//   immediate). Mesa uses 2 on 2-pipe chips (Stoney: GB_ADDR_CONFIG NUM_PIPES 1) and 3 otherwise. Make it 0x060201A8.
+//   -crnowalkfence disables this.
 static const uint8_t scPatchFind[] {
 	0x83, 0xC6, 0xD8, 0x83, 0xFE, 0x13, 0x77, 0x12, 0x83, 0xE2, 0xFE, 0xB8, 0x0D, 0x00, 0x00, 0x00, 0x81, 0xFA,
 	0xA0, 0x67, 0x00, 0x00, 0x75, 0x02, 0x5D, 0xC3, 0xB8, 0x0C, 0x00, 0x00, 0x00, 0x5D, 0xC3, 0x83, 0xC6, 0xEC,
 	0xB8, 0x0E, 0x00, 0x00, 0x00, 0x83, 0xFE, 0x13, 0x77, 0xEA, 0x81, 0xC2, 0xD7, 0x96, 0xFF, 0xFF, 0x83, 0xFA,
 	0x07, 0x73, 0xDF, 0x48, 0x63, 0xC2, 0x48, 0x8D, 0x0D, 0x41, 0x82, 0x0B, 0x00, 0x8B, 0x04, 0x81, 0x5D, 0xC3,
 };
-static_assert(ScPatchPageOffset + sizeof(scPatchFind) <= 0x1000, "pattern must fit in the page");
+// mov ecx, [rsi + 0xD8]; shl ecx, 10; sar ecx, 31; and ecx, 5; xor edx, edx; mov [rdi + 0x38], ecx
+static const uint8_t smallPrimFind[] {
+	0x8B, 0x8E, 0xD8, 0x00, 0x00, 0x00, 0xC1, 0xE1, 0x0A, 0xC1, 0xF9, 0x1F, 0x83, 0xE1, 0x05, 0x31, 0xD2, 0x89, 0x4F, 0x38,
+};
+// movabs rcx, 0x060201B800000002; mov [rdi + 0x2DC], rcx; mov dword [rdi + 0x2E4], 0x1E9
+static const uint8_t walkFenceFind[] {
+	0x48, 0xB9, 0x02, 0x00, 0x00, 0x00, 0xB8, 0x01, 0x02, 0x06, 0x48, 0x89, 0x8F, 0xDC, 0x02, 0x00, 0x00, 0xC7, 0x87,
+	0xE4, 0x02, 0x00, 0x00, 0xE9, 0x01, 0x00, 0x00,
+};
+struct PagePatch {
+	const char *name;
+	const char *offArg;
+	uint32_t pageOffset;
+	const uint8_t *find;
+	uint32_t size;
+	uint32_t byte;
+	uint8_t value;
+	bool enabled;
+	uint32_t hits;
+};
+static PagePatch pagePatches[] {
+	{"isa", "-crnoscpatch", 0xD78, scPatchFind, sizeof(scPatchFind), 0x25, 0x1E},
+	{"smallprim", "-crnosmallprim", 0x215, smallPrimFind, sizeof(smallPrimFind), 14, 0x00},
+	{"walkfence", "-crnowalkfence", 0x4AA, walkFenceFind, sizeof(walkFenceFind), 6, 0xA8},
+};
 static mach_vm_address_t orgCsValidatePage;
 static bool scPatchHooked;
-static uint32_t scPatchCalls, scPatchPages;
+static uint32_t scPatchCalls;
 
 static void wrapCsValidatePage(void *vnode, void *pager, uint64_t offset, const void *data, int *validated,
 	int *tainted, int *nx) {
 	FunctionCast(wrapCsValidatePage, orgCsValidatePage)(vnode, pager, offset, data, validated, tainted, nx);
 	__atomic_fetch_add(&scPatchCalls, 1, __ATOMIC_RELAXED);
-	if (data && validated && *validated && !(offset & 0xFFF)) {
-		auto *at = const_cast<uint8_t *>(static_cast<const uint8_t *>(data)) + ScPatchPageOffset;
-		if (at[0] == scPatchFind[0] && !memcmp(at, scPatchFind, sizeof(scPatchFind))) {
-			at[ScPatchByte] = 0x1E;
-			__atomic_fetch_add(&scPatchPages, 1, __ATOMIC_RELAXED);
+	if (!data || !validated || !*validated || (offset & 0xFFF))
+		return;
+	auto *page = const_cast<uint8_t *>(static_cast<const uint8_t *>(data));
+	for (auto &patch : pagePatches) {
+		if (!patch.enabled)
+			continue;
+		auto *at = page + patch.pageOffset;
+		if (at[0] == patch.find[0] && !memcmp(at, patch.find, patch.size)) {
+			at[patch.byte] = patch.value;
+			__atomic_fetch_add(&patch.hits, 1, __ATOMIC_RELAXED);
 		}
 	}
 }
@@ -571,13 +610,18 @@ void CRDriver::init() {
 }
 
 void CRDriver::processPatcher(KernelPatcher &patcher) {
-	if (!checkKernelArgument("-crnoscpatch")) {
+	bool anyPagePatch = false;
+	for (auto &patch : pagePatches) {
+		patch.enabled = !checkKernelArgument(patch.offArg) && patch.pageOffset + patch.size <= 0x1000;
+		anyPagePatch |= patch.enabled;
+	}
+	if (anyPagePatch) {
 		// Long route, chained with any other wrapper of the same function (RestrictEvents has one).
 		KernelPatcher::RouteRequest request {"_cs_validate_page", wrapCsValidatePage, orgCsValidatePage};
 		scPatchHooked = patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1) && orgCsValidatePage &&
 			orgCsValidatePage != EINVAL;
 		if (!scPatchHooked) {
-			SYSLOG("cr", "failed to hook cs_validate_page for the libSC Stoney patch (error %d)", patcher.getError());
+			SYSLOG("cr", "failed to hook cs_validate_page for the Metal patches (error %d)", patcher.getError());
 			orgCsValidatePage = 0;
 			patcher.clearError();
 		}
@@ -4568,7 +4612,10 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	if (gpuDeadMs)
 		add("GPU NOT RESPONDING (registers read ffffffff) %s, first seen @%llu: power off fully before the next boot\n",
 			gpuDeadAtStart ? "from start-up" : "since", gpuDeadMs / 100);
-	add("scpatch: hooked %d, pages patched %u (of %u validated)\n", scPatchHooked, scPatchPages, scPatchCalls);
+	add("page patches: hooked %d, %u pages validated;", scPatchHooked, scPatchCalls);
+	for (auto &patch : pagePatches)
+		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
+	add("\n");
 	add("routes: %u ok, %u failed, %u not landed (last %s); pool %lu/%lu\n", routesOk, routesFailed, routesUnverified,
 		routeLastFailed ? routeLastFailed : "-", routePoolUsed, RoutePoolSize);
 	add("kexts: X4000 %u(+%u)@%llx HWServices %u(+%u)@%llx HWLibs %u(+%u)@%llx\n", accelKextLoads[0], accelKextRepeats[0],
