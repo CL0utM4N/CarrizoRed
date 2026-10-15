@@ -4524,7 +4524,7 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 // and remembers what it has seen (VMID, address and a hash of the code). -crnointerpfix disables it.
 
 struct InterpFixStats {
-	uint32_t scans, shaders, hazards, fixed, skipped, lastSkip, writes, writeFails;
+	uint32_t scans, shaders, hazards, fixed, skipped, lastSkip, writes, writeFails, deadRegs;
 };
 static InterpFixStats interpFix;
 
@@ -4723,11 +4723,6 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 	for (uint32_t b = 0; b < badNum; b++) {
 		uint32_t at = badAt[b], w = code[at];
 		uint32_t vI = w & 0xFF, attrChan = (w >> 8) & 0xFF;
-		uint32_t vF = maxVgpr + 1;
-		if (vF >= allocated || vF > 255) {
-			skip = SkipNoFreeVgpr;
-			return fixedHere;
-		}
 		// The matching p2 (same attribute and channel, writing vI); nothing may touch vI in between.
 		uint32_t p2 = 0;
 		for (uint32_t i = at + gcn3InstLength(code + at, end - at); i < end;) {
@@ -4792,12 +4787,58 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 				break;
 			i += len;
 		}
+		// A register for the result: above the highest one used if the allocation has room, else one that is dead here
+		// (nothing touches it until the last renamed read, and its next use after that is a write, or there is none).
+		// That needs straight-line code: no backward branch anywhere in the shader.
+		uint32_t regionEnd = renames ? renameAt[renames - 1] : p2;
+		uint32_t vF = maxVgpr + 1;
+		if (vF >= allocated || vF > 255) {
+			vF = 0x100;
+			bool loops = false;
+			for (uint32_t i = 0; i < end && !loops;) {
+				uint32_t x = code[i];
+				if ((x >> 23) == 0x17F) {
+					uint32_t op = (x >> 16) & 0x7F;
+					loops = (op == 0x02 || (op >= 0x04 && op <= 0x09) || (op >= 0x17 && op <= 0x1A)) && (x & 0x8000);
+				}
+				i += gcn3InstLength(code + i, end - i);
+			}
+			for (uint32_t r = 0; r < allocated && r < 256 && vF == 0x100 && !loops; r++) {
+				if (r == vI)
+					continue;
+				bool decided = false, usable = true;
+				for (uint32_t i = at; i < end && !decided;) {
+					gcn3VgprFields(code + i, end - i, f, n);
+					bool reads = false, writes = false;
+					for (uint32_t k = 0; k < n; k++) {
+						uint32_t v = fieldValue(code + i, f[k]);
+						if (v <= r && r < v + f[k].count) {
+							reads |= f[k].read;
+							writes |= f[k].write;
+						}
+					}
+					if (reads || writes) {
+						decided = true;
+						usable = i > regionEnd && !reads;
+					}
+					i += gcn3InstLength(code + i, end - i);
+				}
+				if (usable)
+					vF = r;
+			}
+			if (vF == 0x100) {
+				skip = SkipNoFreeVgpr;
+				return fixedHere;
+			}
+			interpFix.deadRegs++;
+		}
 		// Apply: the p1 and p2 write vF, the reads use vF.
 		code[at] = (code[at] & ~(0xFFU << 18)) | (vF << 18);
 		code[p2] = (code[p2] & ~(0xFFU << 18)) | (vF << 18);
 		for (uint32_t r = 0; r < renames; r++)
 			setField(code + renameAt[r], renameField[r], vF);
-		maxVgpr = vF;
+		if (vF > maxVgpr)
+			maxVgpr = vF;
 		fixedHere++;
 	}
 	return fixedHere;
@@ -5190,9 +5231,9 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
-	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u\n",
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u\n",
 		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
-		interpFix.writes, interpFix.writeFails);
+		interpFix.writes, interpFix.writeFails, interpFix.deadRegs);
 	if (!checkKernelArgument("-crnoibdump")) {
 		static char ibText[3600];
 		captureUserIbs(ibText, sizeof(ibText));
