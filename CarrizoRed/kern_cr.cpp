@@ -4420,6 +4420,89 @@ static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va) {
 	return ibMcToPhys(entry & 0xFFFFFFFFF000ULL, entry & 2) + (va & 0xFFF);
 }
 
+// GFX8 (GCN3) instruction length in dwords, for walking shader code: SOP2/SOPK/SOP1/SOPC/SOPP and VOP1/VOP2/VOPC and
+// VINTRP are one dword (+ a literal when a source operand is 0xFF; + one for SDWA/DPP, src0 0xF9/0xFA), SMEM, VOP3, DS,
+// FLAT, MUBUF, MTBUF, MIMG and EXP two.
+static uint32_t gcn3InstLength(const uint32_t *code, uint32_t left) {
+	uint32_t w = code[0];
+	if (!(w >> 31)) {  // VOP2 / VOP1 / VOPC
+		uint32_t src0 = w & 0x1FF;
+		return src0 == 0xFF || src0 == 0xF9 || src0 == 0xFA ? 2 : 1;
+	}
+	if ((w >> 30) == 2) {  // scalar ALU
+		if ((w >> 28) == 0xB)  // SOPK
+			return 1;
+		uint32_t top9 = w >> 23;
+		if (top9 == 0x17F)  // SOPP
+			return 1;
+		if (top9 == 0x17D)  // SOP1
+			return (w & 0xFF) == 0xFF ? 2 : 1;
+		if (top9 == 0x17E)  // SOPC
+			return (w & 0xFF) == 0xFF || ((w >> 8) & 0xFF) == 0xFF ? 2 : 1;
+		return (w & 0xFF) == 0xFF || ((w >> 8) & 0xFF) == 0xFF ? 2 : 1;  // SOP2
+	}
+	switch (w >> 26) {
+		case 0x32:  // VINTRP
+			return 1;
+		default:
+			return left >= 2 ? 2 : 1;
+	}
+}
+
+// Pixel shaders the command buffer runs (SPI_SHADER_PGM_LO/HI_PS, SH registers 0x08/0x09): read each through the VM and
+// count its v_interp instructions. Stoney has 16 LDS banks: v_interp_p1_f32 must not write the VGPR it reads (its I
+// barycentric); a back end for 32-bank chips may do that, which gives a wrong attribute (nvram141 photos: textures
+// sampled with one coordinate fixed, only one triangle of each quad visible). Reports, per shader, the p1/p2/mov
+// counts, how many p1 have vdst == vsrc, and the first such instruction.
+static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t count,
+	void (*put)(void *, const char *, ...), void *ctx) {
+	static uint32_t code[0x800];
+	for (uint32_t k = 0; k < count; k++) {
+		uint64_t va = addrs[k];
+		uint32_t got = 0;
+		while (got < arrsize(code)) {
+			uint64_t a = va + got * 4ULL;
+			uint32_t chunk = static_cast<uint32_t>((0x1000 - (a & 0xFFF)) / 4);
+			if (chunk > arrsize(code) - got)
+				chunk = arrsize(code) - got;
+			uint64_t phys = ibVaToPhys(vmid, a);
+			if (!phys || !ibReadPhys(phys, chunk * 4, code + got))
+				break;
+			got += chunk;
+		}
+		uint32_t p1 = 0, p2 = 0, mov = 0, bad = 0, firstBad = 0, len = 0;
+		for (uint32_t i = 0; i < got;) {
+			uint32_t w = code[i];
+			if (w == 0xBF810000) {  // s_endpgm
+				len = i + 1;
+				break;
+			}
+			if ((w >> 26) == 0x32) {
+				uint32_t op = (w >> 16) & 3, vdst = (w >> 18) & 0xFF, vsrc = w & 0xFF;
+				if (op == 0) {
+					p1++;
+					if (vdst == vsrc && !bad++)
+						firstBad = w;
+				} else if (op == 1) {
+					p2++;
+				} else {
+					mov++;
+				}
+			}
+			i += gcn3InstLength(code + i, got - i);
+		}
+		put(ctx, " ps%u %llx: %u dw, p1 %u p2 %u mov %u, p1 dst=src %u", k, va, len ? len : got, p1, p2, mov, bad);
+		if (bad)
+			put(ctx, " (%08x)", firstBad);
+	}
+}
+
+struct PutState {
+	char *out;
+	size_t size;
+	size_t len;
+};
+
 static void captureUserIbs(char *out, size_t size) {
 	size_t len = 0;
 	auto put = [&](const char *fmt, ...) {
@@ -4491,6 +4574,8 @@ static void captureUserIbs(char *out, size_t size) {
 	memset(keyNum, 0, sizeof(keyNum));
 	uint32_t primTypes[4] {}, primNum = 0, indexTypes[4] {}, indexNum = 0;
 	uint32_t draws[8] {}, ib2 = 0, packets = 0;
+	uint32_t psLo = 0, psHi = 0, psNum = 0;
+	uint64_t psAddrs[6] {};
 	auto addDistinct = [](uint32_t *vals, uint32_t &num, uint32_t v) {
 		for (uint32_t k = 0; k < num; k++)
 			if (vals[k] == v)
@@ -4523,6 +4608,23 @@ static void captureUserIbs(char *out, size_t size) {
 				for (uint32_t q = 0; q < arrsize(keys); q++)
 					if (keys[q] == reg)
 						addDistinct(keyVals[q], keyNum[q], v);
+			}
+		} else if (op == 0x76 && j + 1 < got) {
+			uint32_t start = buf[j + 1] & 0xFFFF;
+			for (uint32_t k = 0; k + 1 < count && j + 2 + k < got; k++) {
+				uint32_t reg = start + k, v = buf[j + 2 + k];
+				if (reg == 0x08)
+					psLo = v;
+				else if (reg == 0x09)
+					psHi = v;
+			}
+			if (psLo) {
+				uint64_t va = (static_cast<uint64_t>(psHi & 0xFF) << 40) | (static_cast<uint64_t>(psLo) << 8);
+				bool known = false;
+				for (uint32_t q = 0; q < psNum; q++)
+					known |= psAddrs[q] == va;
+				if (!known && psNum < arrsize(psAddrs))
+					psAddrs[psNum++] = va;
 			}
 		} else if (op == 0x79 && j + 2 < got) {
 			uint32_t reg = buf[j + 1] & 0xFFFF;
@@ -4564,11 +4666,29 @@ static void captureUserIbs(char *out, size_t size) {
 		for (uint32_t k = 0; k < keyNum[q]; k++)
 			put(k ? "/%x" : "%x", keyVals[q][k]);
 	}
-	put("\nuserib ctx:");
-	for (uint32_t reg = 0; reg < 0x400; reg++)
-		if (ctxSeen[reg / 32] & (1U << (reg % 32)))
-			put(" %x=%x", reg, ctxLast[reg]);
+	put("\nuserib ps (%u):", psNum);
+	PutState state {out, size, len};
+	reportPixelShaders(bestVmid, psAddrs, psNum,
+		[](void *c, const char *fmt, ...) {
+			auto *st = static_cast<PutState *>(c);
+			if (st->len + 1 >= st->size)
+				return;
+			va_list va;
+			va_start(va, fmt);
+			int n = vsnprintf(st->out + st->len, st->size - st->len, fmt, va);
+			va_end(va);
+			if (n > 0)
+				st->len += static_cast<size_t>(n) < st->size - st->len ? static_cast<size_t>(n) : st->size - st->len - 1;
+		}, &state);
+	len = state.len;
 	put("\n");
+	if (checkKernelArgument("-crdumpctx")) {
+		put("userib ctx:");
+		for (uint32_t reg = 0; reg < 0x400; reg++)
+			if (ctxSeen[reg / 32] & (1U << (reg % 32)))
+				put(" %x=%x", reg, ctxLast[reg]);
+		put("\n");
+	}
 }
 
 // crpanicat=N black-box report. Spoof boot 21 went to a black panel with no panic in NVRAM, after IOFramebuffer saved a
