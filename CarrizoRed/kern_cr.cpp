@@ -623,7 +623,12 @@ void CRDriver::init() {
 		this);
 }
 
+static uint64_t *physmapBaseVar, *physmapMaxVar;  // see physmapPtr
+
 void CRDriver::processPatcher(KernelPatcher &patcher) {
+	physmapBaseVar = reinterpret_cast<uint64_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_base"));
+	physmapMaxVar = reinterpret_cast<uint64_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_max"));
+	patcher.clearError();
 	bool anyPagePatch = false;
 	for (auto &patch : pagePatches) {
 		patch.enabled = checkKernelArgument(patch.arg) == patch.optIn && patch.pageOffset + patch.size <= 0x1000 &&
@@ -4446,6 +4451,26 @@ static bool carveInit() {
 // Set while the submit hook runs: it must neither block nor allocate (it runs inside the accelerator's submission
 // path; a mapping made there can wait on memory the accelerator has to give back, which needs that same path: the two
 // boots with the first version of the hook froze). Only the carve-out mapping, made beforehand by the scan thread.
+// The kernel's physmap (every physical page at physmap_base + address, write-back): command buffers and shader code
+// are mostly in system memory, which the submit hook can't map (nvram164: it saw 32760 command buffers and fixed
+// nothing). Reads flush the lines first (the Metal driver writes through its own write-combined mapping); writes flush
+// after (the GPU may read system memory without snooping).
+static uint8_t *physmapPtr(uint64_t phys, uint32_t bytes) {
+	if (!interpSubmit || !physmapBaseVar || !physmapMaxVar)
+		return nullptr;
+	uint64_t base = *physmapBaseVar, max = *physmapMaxVar;
+	if (!base || base + phys + bytes > max || base + phys < base)
+		return nullptr;
+	return reinterpret_cast<uint8_t *>(base + phys);
+}
+
+static void flushLines(const uint8_t *p, uint32_t bytes) {
+	uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~static_cast<uintptr_t>(63);
+	for (; a < reinterpret_cast<uintptr_t>(p) + bytes; a += 64)
+		__builtin_ia32_clflush(reinterpret_cast<const void *>(a));
+	__builtin_ia32_mfence();
+}
+
 static uint32_t hookDepth;
 static inline bool inHook() {
 	return __atomic_load_n(&hookDepth, __ATOMIC_ACQUIRE) != 0;
@@ -4467,6 +4492,11 @@ static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out) {
 		return false;
 	if (auto *fast = carvePtr(phys, bytes)) {
 		memcpy(out, fast, bytes);
+		return true;
+	}
+	if (auto *direct = physmapPtr(phys, bytes)) {
+		flushLines(direct, bytes);
+		memcpy(out, direct, bytes);
 		return true;
 	}
 	if (inHook())
@@ -4627,6 +4657,11 @@ static bool ibWritePhys(uint64_t phys, uint32_t bytes, const void *in) {
 		return false;
 	if (auto *fast = carvePtr(phys, bytes)) {
 		memcpy(fast, in, bytes);
+		return true;
+	}
+	if (auto *direct = physmapPtr(phys, bytes)) {
+		memcpy(direct, in, bytes);
+		flushLines(direct, bytes);
 		return true;
 	}
 	if (inHook())
