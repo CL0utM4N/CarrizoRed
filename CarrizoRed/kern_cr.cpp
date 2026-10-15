@@ -4503,6 +4503,18 @@ struct PutState {
 	size_t len;
 };
 
+static void psPut(void *c, const char *fmt, ...) {
+	auto *st = static_cast<PutState *>(c);
+	if (st->len + 1 >= st->size)
+		return;
+	va_list va;
+	va_start(va, fmt);
+	int n = vsnprintf(st->out + st->len, st->size - st->len, fmt, va);
+	va_end(va);
+	if (n > 0)
+		st->len += static_cast<size_t>(n) < st->size - st->len ? static_cast<size_t>(n) : st->size - st->len - 1;
+}
+
 static void captureUserIbs(char *out, size_t size) {
 	size_t len = 0;
 	auto put = [&](const char *fmt, ...) {
@@ -4668,18 +4680,7 @@ static void captureUserIbs(char *out, size_t size) {
 	}
 	put("\nuserib ps (%u):", psNum);
 	PutState state {out, size, len};
-	reportPixelShaders(bestVmid, psAddrs, psNum,
-		[](void *c, const char *fmt, ...) {
-			auto *st = static_cast<PutState *>(c);
-			if (st->len + 1 >= st->size)
-				return;
-			va_list va;
-			va_start(va, fmt);
-			int n = vsnprintf(st->out + st->len, st->size - st->len, fmt, va);
-			va_end(va);
-			if (n > 0)
-				st->len += static_cast<size_t>(n) < st->size - st->len ? static_cast<size_t>(n) : st->size - st->len - 1;
-		}, &state);
+	reportPixelShaders(bestVmid, psAddrs, psNum, psPut, &state);
 	len = state.len;
 	put("\n");
 	if (checkKernelArgument("-crdumpctx")) {
