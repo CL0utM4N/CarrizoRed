@@ -1061,6 +1061,11 @@ static void writeBreadcrumb(uint32_t t) {
 }
 
 static void startInterpFix();  // defined with the black box below
+// The interpolation fix's submit hook and its shared state (see wrapCommitIb).
+static IOLock *interpLock;
+static bool interpFixOff, interpHooked;
+static mach_vm_address_t orgCommitIb;
+static uint64_t wrapCommitIb(void *channel, uint8_t *info);
 
 void CRDriver::watcherThread(void *arg, wait_result_t) {
 	auto *self = static_cast<CRDriver *>(arg);
@@ -1865,6 +1870,14 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		}
 		return true;
 	};
+
+	// The 16-bank LDS interpolation fix, at submission (see wrapCommitIb).
+	interpFixOff = checkKernelArgument("-crnointerpfix") || family != ChipFamily::Stoney;
+	if (!interpFixOff && !interpLock) {
+		interpLock = IOLockAlloc();
+		interpHooked = interpLock && route("__ZN30AMDRadeonX4000_AMDVIPM4Channel27commitIndirectCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
+			reinterpret_cast<mach_vm_address_t>(wrapCommitIb), orgCommitIb, nullptr, 0, "commitIndirectCommandBuffer");
+	}
 
 	if (family == ChipFamily::Stoney && !checkKernelArgument("-crnosdmafix")) {
 		static const char *const allocChecks[] {"4c89b3b8030000", "4c89b3c0030000", nullptr};
@@ -4373,10 +4386,50 @@ void CRDriver::initDisplayRegs() {
 // carve-out's physical address once the VM fix has converted them, else an FB offset. Packets: every context register
 // SET_CONTEXT_REG writes (last value; up to four distinct values for the ones that decide blending, colour formats,
 // pixel shader inputs and primitive set-up), the UCONFIG primitive and index types, and the draw packets by type.
+// The carve-out ("VRAM"), mapped once: command buffers, page tables and shader code mostly live there, and a mapping per
+// 4 KB read is too slow for the submit-time shader fix.
+static IOMemoryMap *carveMapObj;
+static uint8_t *carveMap;
+static uint64_t carveBase, carveSize;
+static bool carveInitStarted;
+
+static bool carveInit() {
+	if (carveMap)
+		return true;
+	if (!gpuMmio || __atomic_exchange_n(&carveInitStarted, true, __ATOMIC_ACQ_REL))
+		return false;
+	auto *mmio = gpuMmio;
+	uint64_t base = static_cast<uint64_t>(mmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22;
+	uint64_t size = ((static_cast<uint64_t>(mmio[Reg::MC_VM_FB_LOCATION] >> 16) + 1) << 24) -
+		(static_cast<uint64_t>(mmio[Reg::MC_VM_FB_LOCATION] & 0xFFFF) << 24);
+	if (!base || !size || size > 0x40000000ULL)
+		return false;
+	auto *desc = IOMemoryDescriptor::withPhysicalAddress(base, size, kIODirectionInOut);
+	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+	OSSafeReleaseNULL(desc);
+	if (!map)
+		return false;
+	carveBase = base;
+	carveSize = size;
+	carveMapObj = map;
+	__atomic_store_n(&carveMap, reinterpret_cast<uint8_t *>(map->getVirtualAddress()), __ATOMIC_RELEASE);
+	return true;
+}
+
+static uint8_t *carvePtr(uint64_t phys, uint32_t bytes) {
+	if (!carveInit() || phys < carveBase || phys + bytes > carveBase + carveSize)
+		return nullptr;
+	return carveMap + (phys - carveBase);
+}
+
 static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out) {
 	// Only RAM and the carve-out (below 8.5 GB here), never the PCI hole.
 	if (!phys || (phys >= 0xC0000000ULL && phys < 0x100000000ULL) || phys + bytes > 0x220000000ULL)
 		return false;
+	if (auto *fast = carvePtr(phys, bytes)) {
+		memcpy(out, fast, bytes);
+		return true;
+	}
 	auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, bytes, kIODirectionIn);
 	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
 	bool mapped = map != nullptr;
@@ -4524,13 +4577,17 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 // and remembers what it has seen (VMID, address and a hash of the code). -crnointerpfix disables it.
 
 struct InterpFixStats {
-	uint32_t scans, shaders, hazards, fixed, skipped, lastSkip, writes, writeFails, deadRegs;
+	uint32_t scans, shaders, hazards, fixed, skipped, lastSkip, writes, writeFails, deadRegs, bumps;
 };
 static InterpFixStats interpFix;
 
 static bool ibWritePhys(uint64_t phys, uint32_t bytes, const void *in) {
 	if (!phys || (phys >= 0xC0000000ULL && phys < 0x100000000ULL) || phys + bytes > 0x220000000ULL)
 		return false;
+	if (auto *fast = carvePtr(phys, bytes)) {
+		memcpy(fast, in, bytes);
+		return true;
+	}
 	auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, bytes, kIODirectionOut);
 	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
 	bool mapped = map != nullptr;
@@ -4682,7 +4739,9 @@ enum InterpSkip {
 };
 
 // Returns the number of hazards fixed in code[0..len) (0 if none or skipped; skip reason in *skip).
-static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, uint32_t &hazards, InterpSkip &skip) {
+static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, uint32_t &hazards, InterpSkip &skip,
+	bool allowBump, uint32_t &newVgprs) {
+	newVgprs = 0;
 	hazards = 0;
 	skip = SkipNone;
 	// Walk once: end, highest VGPR touched, and the hazards.
@@ -4826,11 +4885,17 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 				if (usable)
 					vF = r;
 			}
-			if (vF == 0x100) {
+			if (vF == 0x100 && allowBump && allocated + 4 <= 256) {
+				// Give the shader four more VGPRs (the caller raises SPI_SHADER_PGM_RSRC1_PS.VGPRS in the command buffer).
+				vF = allocated;
+				allocated += 4;
+				newVgprs = allocated / 4 - 1;
+			} else if (vF == 0x100) {
 				skip = SkipNoFreeVgpr;
 				return fixedHere;
+			} else {
+				interpFix.deadRegs++;
 			}
-			interpFix.deadRegs++;
 		}
 		// Apply: the p1 and p2 write vF, the reads use vF.
 		code[at] = (code[at] & ~(0xFFU << 18)) | (vF << 18);
@@ -4844,13 +4909,18 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 	return fixedHere;
 }
 
-// Seen pixel shaders: VMID, address, hash of the code as we last saw (or left) it.
+// Seen pixel shaders: VMID, address, hash of the code as we last saw (or left) it, the VGPRS field it needs when we
+// gave it more registers (0: its own), and whether a fix is still pending (no register without raising the allocation,
+// which only the submit hook can do).
 struct SeenShader {
 	uint64_t va;
-	uint32_t vmid, hash;
+	uint32_t vmid, hash, vgprs;
+	bool pending;
 };
 static SeenShader seenShaders[512];
 static uint32_t seenNum, seenNext;
+static uint32_t ibHookCalls, ibHookIbs, ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags;
+static uint64_t ibHookNs;
 
 static uint32_t codeHash(const uint32_t *code, uint32_t n) {
 	uint32_t h = 2166136261U;
@@ -4859,10 +4929,136 @@ static uint32_t codeHash(const uint32_t *code, uint32_t n) {
 	return h;
 }
 
+// Read up to max dwords at a GPU VA (page by page through the VM); stops after s_endpgm if stopAtEnd.
+static uint32_t readGpuVa(uint32_t vmid, uint64_t va, uint32_t max, uint32_t *out, bool stopAtEnd) {
+	uint32_t have = 0;
+	while (have < max) {
+		uint64_t a = va + have * 4ULL;
+		uint32_t chunk = static_cast<uint32_t>((0x1000 - (a & 0xFFF)) / 4);
+		if (chunk > max - have)
+			chunk = max - have;
+		uint64_t phys = ibVaToPhys(vmid, a);
+		if (!phys || !ibReadPhys(phys, chunk * 4, out + have))
+			break;
+		have += chunk;
+		if (stopAtEnd) {
+			bool ended = false;
+			for (uint32_t q = have - chunk; q < have && !ended; q++)
+				ended = out[q] == 0xBF810000;
+			if (ended)
+				break;
+		}
+	}
+	return have;
+}
+
+// A pixel shader bound with RSRC1_PS = rsrc1: fix it if we haven't, and return the RSRC1 value it needs.
+static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, bool allowBump) {
+	static uint32_t code[0x800], original[0x800];
+	uint32_t have = readGpuVa(vmid, psVa, arrsize(code), code, true);
+	if (!have)
+		return rsrc1;
+	uint32_t hash = codeHash(code, have < 64 ? have : 64);
+	SeenShader *entry = nullptr;
+	for (uint32_t q = 0; q < seenNum && !entry; q++)
+		if (seenShaders[q].va == psVa && seenShaders[q].vmid == vmid)
+			entry = &seenShaders[q];
+	if (entry && entry->hash == hash && !(entry->pending && allowBump))
+		return entry->vgprs && (rsrc1 & 0x3F) < entry->vgprs ? (rsrc1 & ~0x3FU) | entry->vgprs : rsrc1;
+	interpFix.shaders++;
+	memcpy(original, code, have * 4);
+	uint32_t hazards = 0, newVgprs = 0;
+	InterpSkip skip = SkipNone;
+	uint32_t fixedHere = fixInterpInShader(code, have, rsrc1, hazards, skip, allowBump, newVgprs);
+	if (!entry || entry->hash != hash)
+		interpFix.hazards += hazards;
+	if (skip != SkipNone) {
+		interpFix.skipped++;
+		interpFix.lastSkip = skip;
+	}
+	bool ok = true;
+	if (fixedHere) {
+		for (uint32_t q = 0; q < have; q++) {
+			if (code[q] == original[q])
+				continue;
+			uint64_t phys = ibVaToPhys(vmid, psVa + q * 4ULL);
+			if (phys && ibWritePhys(phys, 4, &code[q]))
+				interpFix.writes++;
+			else
+				ok = false;
+		}
+		if (ok)
+			interpFix.fixed += fixedHere;
+		else
+			interpFix.writeFails++;
+	}
+	if (newVgprs && ok)
+		interpFix.bumps++;
+	SeenShader fresh {psVa, vmid, codeHash(code, have < 64 ? have : 64), ok ? newVgprs : 0,
+		skip == SkipNoFreeVgpr && !allowBump};
+	if (entry) {
+		*entry = fresh;
+	} else if (seenNum < arrsize(seenShaders)) {
+		seenShaders[seenNum++] = fresh;
+	} else {
+		seenShaders[seenNext] = fresh;
+		seenNext = (seenNext + 1) % arrsize(seenShaders);
+	}
+	return fresh.vgprs && (rsrc1 & 0x3F) < fresh.vgprs ? (rsrc1 & ~0x3FU) | fresh.vgprs : rsrc1;
+}
+
+// Walk one user command buffer: every pixel shader it binds (SET_SH_REG SPI_SHADER_PGM_LO/HI_PS, RSRC1_PS) gets
+// fixed; with allowBump (before submission) a raised RSRC1_PS is written back into the command buffer.
+static void processUserIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords, bool allowBump) {
+	static uint32_t buf[0x4000];
+	uint32_t got = readGpuVa(vmid, ibVa, dwords < arrsize(buf) ? dwords : arrsize(buf), buf, false);
+	uint32_t psLo = 0, psHi = 0, rsrc1 = 0, rsrc1At = 0xFFFFFFFF;
+	for (uint32_t j = 0; j < got;) {
+		uint32_t header = buf[j], type = header >> 30;
+		if (type == 2) {
+			j++;
+			continue;
+		}
+		uint32_t count = ((header >> 16) & 0x3FFF) + 1;
+		if (type == 3 && ((header >> 8) & 0xFF) == 0x76 && j + 1 < got) {
+			uint32_t start = buf[j + 1] & 0xFFFF;
+			bool touched = false;
+			for (uint32_t k = 0; k + 1 < count && j + 2 + k < got; k++) {
+				uint32_t reg = start + k, v = buf[j + 2 + k];
+				if (reg == 0x08) {
+					psLo = v;
+					touched = true;
+				} else if (reg == 0x09) {
+					psHi = v;
+					touched = true;
+				} else if (reg == 0x0A) {
+					rsrc1 = v;
+					rsrc1At = j + 2 + k;
+					touched = true;
+				}
+			}
+			if (touched && psLo && rsrc1) {
+				uint64_t psVa = (static_cast<uint64_t>(psHi & 0xFF) << 40) | (static_cast<uint64_t>(psLo) << 8);
+				uint32_t want = handlePixelShader(vmid, psVa, rsrc1, allowBump);
+				if (allowBump && want != rsrc1 && rsrc1At < got) {
+					uint64_t phys = ibVaToPhys(vmid, ibVa + rsrc1At * 4ULL);
+					if (phys && ibWritePhys(phys, 4, &want)) {
+						buf[rsrc1At] = want;
+						rsrc1 = want;
+						ibHookRsrcBumps++;
+					}
+				}
+			}
+		}
+		j += 1 + count;
+	}
+}
+
+// Fallback: the last 16 user command buffers on the GFX ring, every second (already submitted, so no RSRC1 changes).
 static void interpFixScan() {
 	auto *hw = static_cast<uint8_t *>(accelHardware);
 	auto *mmio = gpuMmio;
-	if (!hw || !mmio)
+	if (!hw || !mmio || !interpLock)
 		return;
 	auto *pm4 = *reinterpret_cast<uint8_t **>(hw + 0x3B0);
 	auto *ring = pm4 ? *reinterpret_cast<uint8_t **>(pm4 + 0x50) : nullptr;
@@ -4870,10 +5066,9 @@ static void interpFixScan() {
 	uint32_t dwords = ring ? *reinterpret_cast<uint32_t *>(ring + 0x30) : 0;
 	if (!cpu || dwords < 0x100 || (dwords & (dwords - 1)))
 		return;
+	IOLockLock(interpLock);
 	interpFix.scans++;
-	uint32_t rptr = mmio[0x21C0] & (dwords - 1);
-	static uint32_t buf[0x4000], code[0x800];
-	uint32_t found = 0;
+	uint32_t rptr = mmio[0x21C0] & (dwords - 1), found = 0;
 	for (uint32_t back = 4; back < dwords && found < 16; back++) {
 		uint32_t i = (rptr - back) & (dwords - 1);
 		if (cpu[i] != 0xC0023F00)
@@ -4884,103 +5079,9 @@ static void interpFixScan() {
 		found++;
 		uint64_t ibVa = (static_cast<uint64_t>(cpu[(i + 2) & (dwords - 1)] & 0xFFFF) << 32) |
 			(cpu[(i + 1) & (dwords - 1)] & ~3U);
-		uint32_t want = dw < arrsize(buf) ? dw : arrsize(buf), got = 0;
-		while (got < want) {
-			uint64_t va = ibVa + got * 4ULL;
-			uint32_t chunk = static_cast<uint32_t>((0x1000 - (va & 0xFFF)) / 4);
-			if (chunk > want - got)
-				chunk = want - got;
-			uint64_t phys = ibVaToPhys(vmid, va);
-			if (!phys || !ibReadPhys(phys, chunk * 4, buf + got))
-				break;
-			got += chunk;
-		}
-		uint32_t psLo = 0, psHi = 0, rsrc1 = 0;
-		for (uint32_t j = 0; j < got;) {
-			uint32_t header = buf[j], type = header >> 30;
-			if (type == 2) {
-				j++;
-				continue;
-			}
-			uint32_t count = ((header >> 16) & 0x3FFF) + 1;
-			if (type == 3 && ((header >> 8) & 0xFF) == 0x76 && j + 1 < got) {
-				uint32_t start = buf[j + 1] & 0xFFFF;
-				for (uint32_t k = 0; k + 1 < count && j + 2 + k < got; k++) {
-					uint32_t reg = start + k, v = buf[j + 2 + k];
-					if (reg == 0x08)
-						psLo = v;
-					else if (reg == 0x09)
-						psHi = v;
-					else if (reg == 0x0A)
-						rsrc1 = v;
-				}
-				if (psLo && rsrc1) {
-					uint64_t psVa = (static_cast<uint64_t>(psHi & 0xFF) << 40) | (static_cast<uint64_t>(psLo) << 8);
-					// Read the shader (up to 8 KB) and see whether we have handled this exact code here before.
-					uint32_t have = 0;
-					while (have < arrsize(code)) {
-						uint64_t va = psVa + have * 4ULL;
-						uint32_t chunk = static_cast<uint32_t>((0x1000 - (va & 0xFFF)) / 4);
-						if (chunk > arrsize(code) - have)
-							chunk = arrsize(code) - have;
-						uint64_t phys = ibVaToPhys(vmid, va);
-						if (!phys || !ibReadPhys(phys, chunk * 4, code + have))
-							break;
-						have += chunk;
-						bool ended = false;
-						for (uint32_t q = have - chunk; q < have && !ended; q++)
-							ended = code[q] == 0xBF810000;
-						if (ended)
-							break;
-					}
-					if (have) {
-						uint32_t hash = codeHash(code, have < 64 ? have : 64);
-						bool seen = false;
-						for (uint32_t q = 0; q < seenNum && !seen; q++)
-							seen = seenShaders[q].va == psVa && seenShaders[q].vmid == vmid && seenShaders[q].hash == hash;
-						if (!seen) {
-							interpFix.shaders++;
-							static uint32_t original[arrsize(code)];
-							memcpy(original, code, have * 4);
-							uint32_t hazards = 0;
-							InterpSkip skip = SkipNone;
-							uint32_t fixedHere = fixInterpInShader(code, have, rsrc1, hazards, skip);
-							interpFix.hazards += hazards;
-							if (skip != SkipNone) {
-								interpFix.skipped++;
-								interpFix.lastSkip = skip;
-							}
-							if (fixedHere) {
-								// Write back every changed dword.
-								bool ok = true;
-								for (uint32_t q = 0; q < have; q++) {
-									if (code[q] == original[q])
-										continue;
-									uint64_t phys = ibVaToPhys(vmid, psVa + q * 4ULL);
-									if (phys && ibWritePhys(phys, 4, &code[q]))
-										interpFix.writes++;
-									else
-										ok = false;
-								}
-								if (ok)
-									interpFix.fixed += fixedHere;
-								else
-									interpFix.writeFails++;
-							}
-							SeenShader entry {psVa, vmid, codeHash(code, have < 64 ? have : 64)};
-							if (seenNum < arrsize(seenShaders)) {
-								seenShaders[seenNum++] = entry;
-							} else {
-								seenShaders[seenNext] = entry;
-								seenNext = (seenNext + 1) % arrsize(seenShaders);
-							}
-						}
-					}
-				}
-			}
-			j += 1 + count;
-		}
+		processUserIb(vmid, ibVa, dw, false);
 	}
+	IOLockUnlock(interpLock);
 }
 
 static void interpFixThread(void *, wait_result_t) {
@@ -4992,12 +5093,43 @@ static void interpFixThread(void *, wait_result_t) {
 
 static void startInterpFix() {
 	static bool started;
-	if (started || checkKernelArgument("-crnointerpfix"))
+	if (started || interpFixOff || !interpLock)
 		return;
 	started = true;
 	thread_t thread = nullptr;
 	if (kernel_thread_start(interpFixThread, nullptr, &thread) == KERN_SUCCESS)
 		thread_deallocate(thread);
+}
+
+// AMDVIPM4Channel::commitIndirectCommandBuffer(AMD_SUBMIT_COMMAND_BUFFER_INFO *): writes the INDIRECT_BUFFER packets for
+// a submission into the GFX ring. info: +0 flags (bits 1 and 4 select other paths), +4 VMID, +0xC number of command
+// buffers, then one entry per command buffer from +0x44, 0x28 bytes each: dwords at +0, GPU address at +0xC. Fix every
+// pixel shader the command buffers bind before the GPU sees them.
+static uint64_t wrapCommitIb(void *channel, uint8_t *info) {
+	if (info && interpLock && !interpFixOff && gpuMmio) {
+		uint32_t flags = *reinterpret_cast<uint32_t *>(info), vmid = *reinterpret_cast<uint32_t *>(info + 4);
+		uint32_t count = *reinterpret_cast<uint32_t *>(info + 0xC);
+		ibHookCalls++;
+		ibHookLastVmid = vmid;
+		ibHookLastFlags = flags;
+		if (!(flags & 0x12) && vmid >= 1 && vmid <= 15) {
+			uint64_t start = mach_absolute_time();
+			IOLockLock(interpLock);
+			for (uint32_t i = 0; i < count && i < 8; i++) {
+				uint32_t dw = *reinterpret_cast<uint32_t *>(info + 0x44 + i * 0x28);
+				uint64_t va = *reinterpret_cast<uint64_t *>(info + 0x50 + i * 0x28);
+				if (dw && va) {
+					ibHookIbs++;
+					processUserIb(vmid, va, dw, true);
+				}
+			}
+			IOLockUnlock(interpLock);
+			uint64_t ns = 0;
+			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+			ibHookNs += ns;
+		}
+	}
+	return FunctionCast(wrapCommitIb, orgCommitIb)(channel, info);
 }
 
 struct PutState {
@@ -5231,9 +5363,10 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
-	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u\n",
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu\n",
 		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
-		interpFix.writes, interpFix.writeFails, interpFix.deadRegs);
+		interpFix.writes, interpFix.writeFails, interpFix.deadRegs, interpFix.bumps, interpHooked, ibHookCalls, ibHookIbs,
+		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000);
 	if (!checkKernelArgument("-crnoibdump")) {
 		static char ibText[3600];
 		captureUserIbs(ibText, sizeof(ibText));
