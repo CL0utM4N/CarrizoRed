@@ -49,7 +49,8 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 			SYSLOG("cr", "route: %s not found (error %d)", request.symbol, patcher.getError());
 			return false;
 		}
-		for (size_t copied = 0; copied < 14;) {
+		size_t copied = 0;
+		while (copied < 14) {
 			hde64s hs {};
 			size_t len = Disassembler::hdeDisasm(func + copied, &hs);
 			if (!len || (hs.flags & F_ERROR)) {
