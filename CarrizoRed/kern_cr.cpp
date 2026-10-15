@@ -4442,7 +4442,7 @@ static uint32_t gcn3InstLength(const uint32_t *code, uint32_t left) {
 		return (w & 0xFF) == 0xFF || ((w >> 8) & 0xFF) == 0xFF ? 2 : 1;  // SOP2
 	}
 	switch (w >> 26) {
-		case 0x32:  // VINTRP
+		case 0x35:  // VINTRP (GCN3; 0x32 on GCN1/2)
 			return 1;
 		default:
 			return left >= 2 ? 2 : 1;
@@ -4470,17 +4470,19 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 				break;
 			got += chunk;
 		}
-		uint32_t p1 = 0, p2 = 0, mov = 0, bad = 0, firstBad = 0, len = 0;
+		uint32_t p1 = 0, p2 = 0, mov = 0, bad = 0, firstBad = 0, len = 0, shown[4] {}, shownNum = 0;
 		for (uint32_t i = 0; i < got;) {
 			uint32_t w = code[i];
 			if (w == 0xBF810000) {  // s_endpgm
 				len = i + 1;
 				break;
 			}
-			if ((w >> 26) == 0x32) {
+			if ((w >> 26) == 0x35) {
 				uint32_t op = (w >> 16) & 3, vdst = (w >> 18) & 0xFF, vsrc = w & 0xFF;
 				if (op == 0) {
 					p1++;
+					if (shownNum < arrsize(shown))
+						shown[shownNum++] = w;
 					if (vdst == vsrc && !bad++)
 						firstBad = w;
 				} else if (op == 1) {
@@ -4494,6 +4496,10 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 		put(ctx, " ps%u %llx: %u dw, p1 %u p2 %u mov %u, p1 dst=src %u", k, va, len ? len : got, p1, p2, mov, bad);
 		if (bad)
 			put(ctx, " (%08x)", firstBad);
+		for (uint32_t q = 0; q < shownNum; q++)
+			put(ctx, q ? ",v%u<-v%u" : " [v%u<-v%u", (shown[q] >> 18) & 0xFF, shown[q] & 0xFF);
+		if (shownNum)
+			put(ctx, "]");
 	}
 }
 
