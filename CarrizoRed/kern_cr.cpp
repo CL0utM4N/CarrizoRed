@@ -4649,6 +4649,7 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 
 struct InterpFixStats {
 	uint32_t scans, shaders, hazards, fixed, skipped, lastSkip, writes, writeFails, deadRegs, bumps;
+	uint32_t lastSkipWhy, lastLoopTarget, lastShaderLen, lastHazardAt;
 };
 static InterpFixStats interpFix;
 
@@ -4886,30 +4887,53 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 		// Plan the renames after p2: reads of vI until it is written again, or vI inside a multi-register range and we
 		// leave the shader alone. Loops (backward branches) are fine if they all start after p2 and nothing writes vI
 		// after p2: then every later read is of this result (nvram165: the 11 hazards left were in shaders with loops).
+		// A loop that goes back to before p1 is fine too when the result gets a register of its own: vI then keeps I
+		// for the next pass (as p1 needs), so nothing between the loop start and p1 may read vI expecting the result.
+		// A loop that goes back between p1 and p2 is not.
 		bool loopAfter = false, writtenAfter = false;
+		interpFix.lastShaderLen = end;
+		interpFix.lastHazardAt = at;
 		for (uint32_t i = p2 + 1; i < end;) {
 			uint32_t x = code[i];
-			if ((x >> 23) == 0x17F) {  // SOPP
-				uint32_t op = (x >> 16) & 0x7F;
-				bool branch = op == 0x02 || (op >= 0x04 && op <= 0x09) || (op >= 0x17 && op <= 0x1A);
-				if (branch && (x & 0x8000)) {  // negative simm16: target = next instruction + simm16
-					int32_t target = static_cast<int32_t>(i) + 1 + static_cast<int16_t>(x & 0xFFFF);
-					if (target <= static_cast<int32_t>(p2)) {
-						skip = SkipBranch;
-						return fixedHere;
-					}
-					loopAfter = true;
-				}
-			}
 			gcn3VgprFields(code + i, end - i, f, n);
 			for (uint32_t k = 0; k < n; k++) {
 				uint32_t v = fieldValue(code + i, f[k]);
 				if (f[k].write && v <= vI && vI < v + f[k].count)
 					writtenAfter = true;
 			}
+			if ((x >> 23) == 0x17F) {  // SOPP
+				uint32_t op = (x >> 16) & 0x7F;
+				bool branch = op == 0x02 || (op >= 0x04 && op <= 0x09) || (op >= 0x17 && op <= 0x1A);
+				if (branch && (x & 0x8000)) {  // negative simm16: target = next instruction + simm16
+					int32_t target = static_cast<int32_t>(i) + 1 + static_cast<int16_t>(x & 0xFFFF);
+					loopAfter = true;
+					interpFix.lastLoopTarget = static_cast<uint32_t>(target);
+					if (target <= static_cast<int32_t>(p2) && target > static_cast<int32_t>(at)) {
+						interpFix.lastSkipWhy = 1;  // re-enters between p1 and p2
+						skip = SkipBranch;
+						return fixedHere;
+					}
+					for (int32_t r = target; r >= 0 && r < static_cast<int32_t>(at);) {
+						gcn3VgprFields(code + r, end - r, f, n);
+						for (uint32_t k = 0; k < n; k++) {
+							uint32_t v = fieldValue(code + r, f[k]);
+							// v_interp reading vI as its I barycentric is what the fix preserves; anything else would
+							// have read the previous pass's result.
+							bool readsI = (code[r] >> 26) == 0x35 && ((code[r] >> 16) & 3) != 2;
+							if (f[k].read && v <= vI && vI < v + f[k].count && !readsI) {
+								interpFix.lastSkipWhy = 2;  // the loop reads vI before p1
+								skip = SkipBranch;
+								return fixedHere;
+							}
+						}
+						r += static_cast<int32_t>(gcn3InstLength(code + r, end - r));
+					}
+				}
+			}
 			i += gcn3InstLength(code + i, end - i);
 		}
 		if (loopAfter && writtenAfter) {
+			interpFix.lastSkipWhy = 3;  // vI written again after p2
 			skip = SkipBranch;
 			return fixedHere;
 		}
@@ -5584,11 +5608,11 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
-	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u\n",
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u; last loop skip %u target %u at %u len %u\n",
 		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
 		interpFix.writes, interpFix.writeFails, interpFix.deadRegs, interpFix.bumps, interpHooked, ibHookCalls, ibHookIbs,
 		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap, ibHookRaiseOnly,
-		raisedNum);
+		raisedNum, interpFix.lastSkipWhy, interpFix.lastLoopTarget, interpFix.lastHazardAt, interpFix.lastShaderLen);
 	if (!checkKernelArgument("-crnoibdump")) {
 		static char ibText[3600];
 		captureUserIbs(ibText, sizeof(ibText));
