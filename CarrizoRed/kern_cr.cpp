@@ -4610,6 +4610,10 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			"cus %u; chiprev %x\n", w[0xA0 / 4], w[0xA8 / 4], w[0xB0 / 4], w[0xB8 / 4], gpuMmio ? gpuMmio[0x263E] : 0,
 			gpuMmio ? gpuMmio[0x9D8] : 0, w[0x98 / 4], w[0x88 / 4], w[0x8C / 4], w[0x90 / 4], w[0x94 / 4], w[0x8 / 4]);
 	}
+	add("page patches: hooked %d, %u pages validated;", scPatchHooked, scPatchCalls);
+	for (auto &patch : pagePatches)
+		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
+	add("\n");
 	if (!checkKernelArgument("-crnoibdump")) {
 		static char ibText[3600];
 		captureUserIbs(ibText, sizeof(ibText));
@@ -4627,10 +4631,6 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	if (gpuDeadMs)
 		add("GPU NOT RESPONDING (registers read ffffffff) %s, first seen @%llu: power off fully before the next boot\n",
 			gpuDeadAtStart ? "from start-up" : "since", gpuDeadMs / 100);
-	add("page patches: hooked %d, %u pages validated;", scPatchHooked, scPatchCalls);
-	for (auto &patch : pagePatches)
-		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
-	add("\n");
 	add("routes: %u ok, %u failed, %u not landed (last %s); pool %lu/%lu\n", routesOk, routesFailed, routesUnverified,
 		routeLastFailed ? routeLastFailed : "-", routePoolUsed, RoutePoolSize);
 	add("kexts: X4000 %u(+%u)@%llx HWServices %u(+%u)@%llx HWLibs %u(+%u)@%llx\n", accelKextLoads[0], accelKextRepeats[0],
