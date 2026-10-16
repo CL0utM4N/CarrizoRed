@@ -4967,7 +4967,7 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 		static VgprField renameField[64];
 		uint32_t renames = 0;
 		if (branchy) {
-			static uint8_t state[0x800], start[0x800];
+			static uint8_t state[0x2000], start[0x2000];
 			memset(state, 0, end);
 			memset(start, 0, end);
 			for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i))
@@ -5217,7 +5217,8 @@ static uint32_t readGpuVa(uint32_t vmid, uint64_t va, uint32_t max, uint32_t *ou
 
 // A pixel shader bound with RSRC1_PS = rsrc1: fix it if we haven't, and return the RSRC1 value it needs.
 static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, bool allowBump) {
-	static uint32_t code[0x800], original[0x800];
+	// Up to 32 KB of code (nvram173: WindowServer has pixel shaders longer than 8 KB).
+	static uint32_t code[0x2000], original[0x2000];
 	// Every bind of a known shader only costs its first 16 dwords (a fingerprint taken after fixing it); the whole
 	// shader is read and fixed only when it is new here or its code changed.
 	if (readGpuVa(vmid, psVa, 16, code, false) != 16)
