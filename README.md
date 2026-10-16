@@ -74,7 +74,7 @@ Still open:
 - the GPU occasionally not responding after a warm restart (power off fully);
 - stability over longer sessions.
 
- HWLibs patches not taking at boot turned out to be Lilu's
+HWLibs patches not taking at boot turned out to be Lilu's
 trampoline buffer running out; CarrizoRed now builds its own trampolines.
 
 Each fix is documented in the code, in [docs/TEST_MACHINES.md](docs/TEST_MACHINES.md) and in
