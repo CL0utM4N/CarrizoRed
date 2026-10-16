@@ -4876,6 +4876,7 @@ enum InterpSkip {
 static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, uint32_t &hazards, InterpSkip &skip,
 	bool allowBump, uint32_t &newVgprs) {
 	newVgprs = 0;
+	interpFix.lastSkipWhy = 0;
 	hazards = 0;
 	skip = SkipNone;
 	// Walk once: end, highest VGPR touched, and the hazards.
@@ -4939,88 +4940,139 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 			skip = SkipNoP2;
 			return fixedHere;
 		}
-		// Plan the renames after p2: reads of vI until it is written again, or vI inside a multi-register range and we
-		// leave the shader alone. Loops (backward branches) are fine if they all start after p2 and nothing writes vI
-		// after p2: then every later read is of this result (nvram165: the 11 hazards left were in shaders with loops).
-		// A loop that goes back to before p1 is fine too when the result gets a register of its own: vI then keeps I
-		// for the next pass (as p1 needs), so nothing between the loop start and p1 may read vI expecting the result.
-		// A loop that goes back between p1 and p2 is not.
-		bool loopAfter = false, writtenAfter = false;
+		// Which reads of vI see this hazard's result? Straight-line code: those after p2 until vI is written again. With
+		// branches anywhere, follow the control flow: for each instruction, the set of definitions of vI that can reach
+		// it (bit 0: any other, or vI's value on entry; bit 1: this result). A read reached only by the result is
+		// renamed, one reached by both can't be (the shader is left alone). nvram170: the 7 hazards left were in shaders
+		// with loops that write vI again.
 		interpFix.lastShaderLen = end;
 		interpFix.lastHazardAt = at;
-		for (uint32_t i = p2 + 1; i < end;) {
+		bool branchy = false;
+		for (uint32_t i = 0; i < end;) {
 			uint32_t x = code[i];
-			gcn3VgprFields(code + i, end - i, f, n);
-			for (uint32_t k = 0; k < n; k++) {
-				uint32_t v = fieldValue(code + i, f[k]);
-				if (f[k].write && v <= vI && vI < v + f[k].count)
-					writtenAfter = true;
-			}
-			if ((x >> 23) == 0x17F) {  // SOPP
+			if ((x >> 23) == 0x17F) {
 				uint32_t op = (x >> 16) & 0x7F;
-				bool branch = op == 0x02 || (op >= 0x04 && op <= 0x09) || (op >= 0x17 && op <= 0x1A);
-				if (branch && (x & 0x8000)) {  // negative simm16: target = next instruction + simm16
-					int32_t target = static_cast<int32_t>(i) + 1 + static_cast<int16_t>(x & 0xFFFF);
-					loopAfter = true;
-					interpFix.lastLoopTarget = static_cast<uint32_t>(target);
-					if (target <= static_cast<int32_t>(p2) && target > static_cast<int32_t>(at)) {
-						interpFix.lastSkipWhy = 1;  // re-enters between p1 and p2
-						skip = SkipBranch;
-						return fixedHere;
-					}
-					for (int32_t r = target; r >= 0 && r < static_cast<int32_t>(at);) {
-						gcn3VgprFields(code + r, end - r, f, n);
-						for (uint32_t k = 0; k < n; k++) {
-							uint32_t v = fieldValue(code + r, f[k]);
-							// v_interp reading vI as its I barycentric is what the fix preserves; anything else would
-							// have read the previous pass's result.
-							bool readsI = (code[r] >> 26) == 0x35 && ((code[r] >> 16) & 3) != 2;
-							if (f[k].read && v <= vI && vI < v + f[k].count && !readsI) {
-								interpFix.lastSkipWhy = 2;  // the loop reads vI before p1
-								skip = SkipBranch;
-								return fixedHere;
-							}
-						}
-						r += static_cast<int32_t>(gcn3InstLength(code + r, end - r));
-					}
-				}
+				branchy |= op == 0x02 || (op >= 0x04 && op <= 0x09) || (op >= 0x17 && op <= 0x1A);
+			} else if ((x >> 23) == 0x17D && (((x >> 8) & 0xFF) == 0x1D || ((x >> 8) & 0xFF) == 0x1E)) {
+				interpFix.lastSkipWhy = 4;  // s_setpc / s_swappc: control flow we can't follow
+				skip = SkipBranch;
+				return fixedHere;
 			}
 			i += gcn3InstLength(code + i, end - i);
-		}
-		if (loopAfter && writtenAfter) {
-			interpFix.lastSkipWhy = 3;  // vI written again after p2
-			skip = SkipBranch;
-			return fixedHere;
 		}
 		static uint32_t renameAt[64];
 		static VgprField renameField[64];
 		uint32_t renames = 0;
-		for (uint32_t i = p2 + 1; i < end;) {
-			uint32_t len = gcn3InstLength(code + i, end - i);
-			gcn3VgprFields(code + i, end - i, f, n);
-			bool written = false;
-			for (uint32_t k = 0; k < n; k++) {
-				uint32_t v = fieldValue(code + i, f[k]);
-				if (!(v <= vI && vI < v + f[k].count))
-					continue;
-				if (f[k].count > 1 && (f[k].read || (v != vI && !f[k].exact))) {
-					skip = SkipRange;
-					return fixedHere;
+		if (branchy) {
+			static uint8_t state[0x800], start[0x800];
+			memset(state, 0, end);
+			memset(start, 0, end);
+			for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i))
+				start[i] = 1;
+			state[0] = 1;
+			bool changed = true;
+			for (uint32_t pass = 0; changed && pass < 256; pass++) {
+				changed = false;
+				for (uint32_t i = 0; i < end;) {
+					uint32_t len = gcn3InstLength(code + i, end - i);
+					uint8_t in = state[i], out = in;
+					if (in) {
+						if (i == at || i == p2) {
+							out = 2;
+						} else {
+							gcn3VgprFields(code + i, end - i, f, n);
+							for (uint32_t k = 0; k < n; k++) {
+								uint32_t v = fieldValue(code + i, f[k]);
+								if (!f[k].write || !(v <= vI && vI < v + f[k].count))
+									continue;
+								if (f[k].count > 1 && !f[k].exact && v != vI) {
+									interpFix.lastSkipWhy = 5;  // a write that may or may not cover vI
+									skip = SkipRange;
+									return fixedHere;
+								}
+								out = 1;
+							}
+						}
+						uint32_t x = code[i];
+						bool fall = true;
+						int32_t target = -1;
+						if ((x >> 23) == 0x17F) {
+							uint32_t op = (x >> 16) & 0x7F;
+							int32_t to = static_cast<int32_t>(i) + 1 + static_cast<int16_t>(x & 0xFFFF);
+							if (op == 0x01) {  // s_endpgm
+								fall = false;
+							} else if (op == 0x02) {  // s_branch
+								fall = false;
+								target = to;
+							} else if ((op >= 0x04 && op <= 0x09) || (op >= 0x17 && op <= 0x1A)) {
+								target = to;
+							}
+						}
+						auto flow = [&](int32_t to) {
+							if (to >= 0 && to < static_cast<int32_t>(end) && start[to] && (state[to] | out) != state[to]) {
+								state[to] |= out;
+								changed = true;
+							}
+						};
+						if (fall)
+							flow(static_cast<int32_t>(i + len));
+						if (target >= 0)
+							flow(target);
+					}
+					i += len;
 				}
-				if (f[k].read) {
-					if (renames == arrsize(renameAt)) {
+			}
+			// The result reaching p1 (or another v_interp) through a loop is fine: after the fix it lives in vF, and vI
+			// keeps I, which is what a v_interp reads there. Those I reads are never renamed.
+			for (uint32_t i = 0; i < end;) {
+				uint32_t len = gcn3InstLength(code + i, end - i);
+				if (i != at && i != p2 && (state[i] & 2)) {
+					gcn3VgprFields(code + i, end - i, f, n);
+					for (uint32_t k = 0; k < n; k++) {
+						uint32_t v = fieldValue(code + i, f[k]);
+						if (!f[k].read || !(v <= vI && vI < v + f[k].count))
+							continue;
+						if ((code[i] >> 26) == 0x35 && f[k].shift == 0)
+							continue;  // a v_interp's I/J source
+						if ((state[i] & 1) || f[k].count > 1 || renames == arrsize(renameAt)) {
+							interpFix.lastSkipWhy = 3;  // a read that sees the result on some paths only
+							skip = (state[i] & 1) ? SkipBranch : SkipRange;
+							return fixedHere;
+						}
+						renameAt[renames] = i;
+						renameField[renames++] = f[k];
+					}
+				}
+				i += len;
+			}
+		} else {
+			for (uint32_t i = p2 + 1; i < end;) {
+				uint32_t len = gcn3InstLength(code + i, end - i);
+				gcn3VgprFields(code + i, end - i, f, n);
+				bool written = false;
+				for (uint32_t k = 0; k < n; k++) {
+					uint32_t v = fieldValue(code + i, f[k]);
+					if (!(v <= vI && vI < v + f[k].count))
+						continue;
+					if (f[k].count > 1 && (f[k].read || (v != vI && !f[k].exact))) {
 						skip = SkipRange;
 						return fixedHere;
 					}
-					renameAt[renames] = i;
-					renameField[renames++] = f[k];
+					if (f[k].read) {
+						if (renames == arrsize(renameAt)) {
+							skip = SkipRange;
+							return fixedHere;
+						}
+						renameAt[renames] = i;
+						renameField[renames++] = f[k];
+					}
+					if (f[k].write)
+						written = true;
 				}
-				if (f[k].write)
-					written = true;
+				if (written)
+					break;
+				i += len;
 			}
-			if (written)
-				break;
-			i += len;
 		}
 		// A register for the result: above the highest one used if the allocation has room, else one that is dead here
 		// (nothing touches it until the last renamed read, and its next use after that is a write, or there is none).
@@ -5029,16 +5081,7 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 		uint32_t vF = maxVgpr + 1;
 		if (vF >= allocated || vF > 255) {
 			vF = 0x100;
-			bool loops = false;
-			for (uint32_t i = 0; i < end && !loops;) {
-				uint32_t x = code[i];
-				if ((x >> 23) == 0x17F) {
-					uint32_t op = (x >> 16) & 0x7F;
-					loops = (op == 0x02 || (op >= 0x04 && op <= 0x09) || (op >= 0x17 && op <= 0x1A)) && (x & 0x8000);
-				}
-				i += gcn3InstLength(code + i, end - i);
-			}
-			for (uint32_t r = 0; r < allocated && r < 256 && vF == 0x100 && !loops; r++) {
+			for (uint32_t r = 0; r < allocated && r < 256 && vF == 0x100 && !branchy; r++) {
 				if (r == vI)
 					continue;
 				bool decided = false, usable = true;
@@ -5106,6 +5149,13 @@ struct RaisedShader {
 	uint32_t vmid, vgprs;
 };
 static RaisedShader raisedShaders[1024];
+// Shaders the fix had to leave alone: address, length, hazard position, reason, detail (for the report).
+struct SkippedShader {
+	uint64_t va;
+	uint32_t len, at, reason, why;
+};
+static SkippedShader skippedShaders[12];
+static uint32_t skippedNum;
 static uint32_t raisedNum;
 
 static uint32_t raisedVgprs(uint32_t vmid, uint64_t va) {
@@ -5188,6 +5238,12 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 	if (skip != SkipNone) {
 		interpFix.skipped++;
 		interpFix.lastSkip = skip;
+		bool listed = false;
+		for (uint32_t q = 0; q < skippedNum && !listed; q++)
+			listed = skippedShaders[q].va == psVa;
+		if (!listed && skippedNum < arrsize(skippedShaders))
+			skippedShaders[skippedNum++] = {psVa, have, interpFix.lastHazardAt, static_cast<uint32_t>(skip),
+				interpFix.lastSkipWhy};
 	}
 	bool ok = true;
 	if (fixedHere) {
@@ -5674,6 +5730,13 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		interpFix.writes, interpFix.writeFails, interpFix.deadRegs, interpFix.bumps, interpHooked, ibHookCalls, ibHookIbs,
 		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap, ibHookRaiseOnly,
 		raisedNum, interpFix.lastSkipWhy, interpFix.lastLoopTarget, interpFix.lastHazardAt, interpFix.lastShaderLen);
+	if (skippedNum) {
+		add("interp skipped:");
+		for (uint32_t q = 0; q < skippedNum; q++)
+			add(" %llx(%u dw, at %u, %u/%u)", skippedShaders[q].va, skippedShaders[q].len, skippedShaders[q].at,
+				skippedShaders[q].reason, skippedShaders[q].why);
+		add("\n");
+	}
 	if (!checkKernelArgument("-crnoibdump")) {
 		static char ibText[3600];
 		captureUserIbs(ibText, sizeof(ibText));
