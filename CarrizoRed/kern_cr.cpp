@@ -4663,7 +4663,7 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 struct InterpFixStats {
 	uint32_t scans, shaders, hazards, fixed, skipped, lastSkip, writes, writeFails, deadRegs, bumps;
 	uint32_t lastSkipWhy, lastLoopTarget, lastShaderLen, lastHazardAt, lastUnknownWord, lastUnknownAt;
-	uint32_t probeReverts;
+	uint32_t probeReverts, blockMoves;
 };
 static InterpFixStats interpFix;
 
@@ -4874,6 +4874,189 @@ enum InterpSkip {
 };
 
 // Returns the number of hazards fixed in code[0..len) (0 if none or skipped; skip reason in *skip).
+// Control flow of one instruction: falls through to the next, and/or branches to target (-1: none).
+static void cfgStep(const uint32_t *code, uint32_t i, bool &fall, int32_t &target) {
+	uint32_t x = code[i];
+	fall = true;
+	target = -1;
+	if ((x >> 23) == 0x17F) {
+		uint32_t op = (x >> 16) & 0x7F;
+		int32_t to = static_cast<int32_t>(i) + 1 + static_cast<int16_t>(x & 0xFFFF);
+		if (op == 0x01) {  // s_endpgm
+			fall = false;
+		} else if (op == 0x02) {  // s_branch
+			fall = false;
+			target = to;
+		} else if ((op >= 0x04 && op <= 0x09) || (op >= 0x17 && op <= 0x1A)) {
+			target = to;
+		}
+	}
+}
+
+// When the hazard's result is read as part of a register block (an image coordinate, say), it can't get a register of
+// its own: move the whole block [base, base + k) to fresh registers [F, F + k) instead. For each member, the one
+// definition that reaches the block read is moved, with every read it reaches; the hazard's p1/p2 are the result's
+// definition, so moving them fixes the hazard. Every member needs a single definition reaching the block read, and no
+// read may see both a moved and an unmoved definition. Plans the changes; false if the block can't be moved.
+struct RegChange {
+	uint32_t at;
+	VgprField field;
+	uint32_t reg;
+};
+
+static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint32_t p2, uint32_t vI, uint32_t blockAt,
+	uint32_t base, uint32_t k, uint32_t F, RegChange *out, uint32_t &outNum, uint32_t outMax) {
+	static uint32_t state[0x8000];
+	static uint8_t start[0x8000];
+	static uint8_t defId[0x8000];
+	VgprField f[8];
+	uint32_t n;
+	outNum = 0;
+	memset(start, 0, end);
+	for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i))
+		start[i] = 1;
+	auto addChange = [&](uint32_t i, const VgprField &field, uint32_t reg) {
+		for (uint32_t c = 0; c < outNum; c++)
+			if (out[c].at == i && out[c].field.dword == field.dword && out[c].field.shift == field.shift)
+				return out[c].reg == reg;
+		if (outNum == outMax)
+			return false;
+		out[outNum++] = {i, field, reg};
+		return true;
+	};
+	for (uint32_t r = base; r < base + k; r++) {
+		// Definitions of r: ids 0-30 (p1 and p2 share one when r is the result's register), bit 31 is "on entry".
+		uint32_t defs = 0;
+		memset(defId, 0xFF, end);
+		for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i)) {
+			if (r == vI && (i == at || i == p2)) {
+				defId[i] = 0;
+				continue;
+			}
+			// A v_interp_p2 completes the p1 before it (same destination, attribute and channel): one definition.
+			uint32_t x = code[i];
+			if ((x >> 26) == 0x35 && ((x >> 16) & 3) == 1 && ((x >> 18) & 0xFF) == r) {
+				bool paired = false;
+				for (uint32_t j = 0; j < i && !paired;) {
+					uint32_t y = code[j];
+					uint32_t jl = gcn3InstLength(code + j, end - j);
+					uint32_t next = j + jl;
+					if ((y >> 26) == 0x35 && ((y >> 16) & 3) == 0 && ((y >> 18) & 0xFF) == r &&
+						((y >> 8) & 0xFF) == ((x >> 8) & 0xFF) && defId[j] != 0xFF) {
+						// the last such p1 before i wins
+						bool later = false;
+						for (uint32_t m = next; m < i; m += gcn3InstLength(code + m, end - m))
+							if ((code[m] >> 26) == 0x35 && ((code[m] >> 16) & 3) == 0 && ((code[m] >> 18) & 0xFF) == r)
+								later = true;
+						if (!later) {
+							defId[i] = defId[j];
+							paired = true;
+						}
+					}
+					j = next;
+				}
+				if (paired)
+					continue;
+			}
+			gcn3VgprFields(code + i, end - i, f, n);
+			for (uint32_t q = 0; q < n; q++) {
+				uint32_t v = fieldValue(code + i, f[q]);
+				if (!f[q].write || !(v <= r && r < v + f[q].count))
+					continue;
+				if (f[q].count > 1 && !f[q].exact && v != r)
+					return false;  // may or may not write r
+				if (defId[i] == 0xFF) {
+					if (defs == 30)
+						return false;
+					defId[i] = static_cast<uint8_t>(r == vI ? ++defs : defs++);
+				}
+			}
+		}
+		memset(state, 0, end * sizeof(state[0]));
+		state[0] = 1U << 31;
+		bool changed = true;
+		for (uint32_t pass = 0; changed && pass < 256; pass++) {
+			changed = false;
+			for (uint32_t i = 0; i < end;) {
+				uint32_t len = gcn3InstLength(code + i, end - i);
+				if (state[i]) {
+					uint32_t o = defId[i] != 0xFF ? 1U << defId[i] : state[i];
+					bool fall;
+					int32_t target;
+					cfgStep(code, i, fall, target);
+					auto flow = [&](int32_t to) {
+						if (to >= 0 && to < static_cast<int32_t>(end) && start[to] && (state[to] | o) != state[to]) {
+							state[to] |= o;
+							changed = true;
+						}
+					};
+					if (fall)
+						flow(static_cast<int32_t>(i + len));
+					if (target >= 0)
+						flow(target);
+				}
+				i += len;
+			}
+		}
+		uint32_t reach = state[blockAt];
+		if (reach == (1U << 31)) {
+			// Never written before the block read: the block operand's size is an upper bound (an image address can
+			// be shorter than 4 registers), so this may be a slot the instruction doesn't use, holding nothing. Leave
+			// it behind only if nothing else reads its starting value and it lies above the interpolation inputs
+			// (I/J); an input the shader uses can't be moved.
+			uint32_t maxInterpSource = 0;
+			for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i))
+				if ((code[i] >> 26) == 0x35 && ((code[i] >> 16) & 3) != 2 && (code[i] & 0xFF) > maxInterpSource)
+					maxInterpSource = code[i] & 0xFF;
+			if (r <= maxInterpSource)
+				return false;
+			for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i)) {
+				if (!(state[i] & (1U << 31)))
+					continue;
+				gcn3VgprFields(code + i, end - i, f, n);
+				for (uint32_t q = 0; q < n; q++) {
+					uint32_t v = fieldValue(code + i, f[q]);
+					if (f[q].read && v <= r && r < v + f[q].count && !(v == base && f[q].count == k))
+						return false;
+				}
+			}
+			continue;
+		}
+		if (!reach || (reach & (reach - 1)) || (reach & (1U << 31)))
+			return false;  // not exactly one definition reaches the block read
+		if (r == vI && reach != 1U)
+			return false;
+		uint32_t d = reach;
+		uint32_t newReg = F + (r - base);
+		for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i)) {
+			bool isDef = defId[i] != 0xFF && (1U << defId[i]) == d;
+			bool reached = (state[i] & d) != 0;
+			if (!isDef && !reached)
+				continue;
+			gcn3VgprFields(code + i, end - i, f, n);
+			for (uint32_t q = 0; q < n; q++) {
+				uint32_t v = fieldValue(code + i, f[q]);
+				if (!(v <= r && r < v + f[q].count))
+					continue;
+				bool interpSource = (code[i] >> 26) == 0x35 && f[q].shift == 0;
+				bool useRead = f[q].read && reached && !interpSource;
+				bool useWrite = f[q].write && isDef;
+				if (!useRead && !useWrite)
+					continue;
+				if (useRead && state[i] != d)
+					return false;  // this read sees other definitions too
+				if (f[q].count > 1) {
+					if (v != base || f[q].count != k || !addChange(i, f[q], F))
+						return false;
+				} else if (!addChange(i, f[q], newReg)) {
+					return false;
+				}
+			}
+		}
+	}
+	return outNum != 0;
+}
+
 static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, uint32_t &hazards, InterpSkip &skip,
 	bool allowBump, uint32_t &newVgprs) {
 	newVgprs = 0;
@@ -4966,6 +5149,7 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 		static uint32_t renameAt[64];
 		static VgprField renameField[64];
 		uint32_t renames = 0;
+		uint32_t blockBase = 0, blockCount = 0, blockAt = 0;
 		if (branchy) {
 			static uint8_t state[0x8000], start[0x8000];
 			memset(state, 0, end);
@@ -5037,6 +5221,12 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 							continue;
 						if ((code[i] >> 26) == 0x35 && f[k].shift == 0)
 							continue;  // a v_interp's I/J source
+						if (f[k].count > 1 && !(state[i] & 1) && !blockCount) {
+							blockBase = v;
+							blockCount = f[k].count;
+							blockAt = i;
+							continue;
+						}
 						if ((state[i] & 1) || f[k].count > 1 || renames == arrsize(renameAt)) {
 							interpFix.lastSkipWhy = 3;  // a read that sees the result on some paths only
 							skip = (state[i] & 1) ? SkipBranch : SkipRange;
@@ -5057,6 +5247,12 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 					uint32_t v = fieldValue(code + i, f[k]);
 					if (!(v <= vI && vI < v + f[k].count))
 						continue;
+					if (f[k].count > 1 && f[k].read && !blockCount) {
+						blockBase = v;
+						blockCount = f[k].count;
+						blockAt = i;
+						continue;
+					}
 					if (f[k].count > 1 && (f[k].read || (v != vI && !f[k].exact))) {
 						skip = SkipRange;
 						return fixedHere;
@@ -5076,6 +5272,39 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 					break;
 				i += len;
 			}
+		}
+		if (blockCount) {
+			// Move the whole block to fresh registers above everything the shader uses (raising the allocation if
+			// needed).
+			uint32_t F = maxVgpr + 1;
+			uint32_t need = F + blockCount;
+			uint32_t newAllocated = allocated;
+			if (need > allocated) {
+				if (!allowBump || need > 256) {
+					interpFix.lastSkipWhy = 6;
+					skip = SkipRange;
+					return fixedHere;
+				}
+				newAllocated = (need + 3) & ~3U;
+			}
+			static RegChange changes[256];
+			uint32_t changeNum = 0;
+			if (!planBlockMove(code, end, at, p2, vI, blockAt, blockBase, blockCount, F, changes, changeNum,
+					arrsize(changes))) {
+				interpFix.lastSkipWhy = 7;  // a block member without a single definition, or a mixed read
+				skip = SkipRange;
+				return fixedHere;
+			}
+			for (uint32_t c = 0; c < changeNum; c++)
+				setField(code + changes[c].at, changes[c].field, changes[c].reg);
+			if (newAllocated != allocated) {
+				allocated = newAllocated;
+				newVgprs = allocated / 4 - 1;
+			}
+			maxVgpr = F + blockCount - 1;
+			interpFix.blockMoves++;
+			fixedHere++;
+			continue;
 		}
 		// A register for the result: above the highest one used if the allocation has room, else one that is dead here
 		// (nothing touches it until the last renamed read, and its next use after that is a write, or there is none).
@@ -5746,11 +5975,11 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
-	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u; last loop skip %u target %u at %u len %u\n",
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u block-moves %u; last loop skip %u target %u at %u len %u\n",
 		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
 		interpFix.writes, interpFix.writeFails, interpFix.deadRegs, interpFix.bumps, interpHooked, ibHookCalls, ibHookIbs,
 		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap, ibHookRaiseOnly,
-		raisedNum, interpFix.probeReverts, interpFix.lastSkipWhy, interpFix.lastLoopTarget, interpFix.lastHazardAt, interpFix.lastShaderLen);
+		raisedNum, interpFix.probeReverts, interpFix.blockMoves, interpFix.lastSkipWhy, interpFix.lastLoopTarget, interpFix.lastHazardAt, interpFix.lastShaderLen);
 	if (skippedNum) {
 		add("interp skipped:");
 		for (uint32_t q = 0; q < skippedNum; q++)
