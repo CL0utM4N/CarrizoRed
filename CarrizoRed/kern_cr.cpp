@@ -1038,11 +1038,13 @@ static void writeBreadcrumb(uint32_t t) {
 	static char text[1000];
 	uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
 	uint32_t ih = __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED);
-	// Interrupts alone (every 5 s) only until Metal is drawing: after that they never stop, and each write is a forced
-	// NVRAM sync (a flash write).
-	bool ihOnly = head == lastHead && (ih == lastIh || t % 5 || desktopRunning());
-	if (writes >= 160 || ihOnly)
+	// Each write is a forced NVRAM sync (a flash write): at most every 2 s, and none once Metal is drawing (nvram179:
+	// trace events never stop then, and all 160 writes were gone by t=109 s; the GPU stall panic covers later hangs).
+	static uint32_t lastT;
+	bool ihOnly = head == lastHead && (ih == lastIh || t % 5);
+	if (writes >= 160 || ihOnly || desktopRunning() || (writes && t - lastT < 2))
 		return;
+	lastT = t;
 	if (!options && !(options = IORegistryEntry::fromPath("/options", gIODTPlane))) {
 		breadcrumbNoOptions = true;
 		return;
@@ -4532,17 +4534,22 @@ static uint8_t *carvePtr(uint64_t phys, uint32_t bytes) {
 	return carveMap + (phys - carveBase);
 }
 
-static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out) {
+// coherent: system memory the GPU snoops (PTE bits system + snooped), which the CPU caches stay coherent with: no flush
+// needed. Everything else is read through the physmap after flushing the lines, the carve-out too: its uncached
+// mapping reads 8 bytes per memory access, a cache line fill 64 (nvram179: command buffers and shader code in the
+// carve-out made most of the submit hook's time).
+static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out, bool coherent = false) {
 	// Only RAM and the carve-out (below 8.5 GB here), never the PCI hole.
 	if (!phys || (phys >= 0xC0000000ULL && phys < 0x100000000ULL) || phys + bytes > 0x220000000ULL)
 		return false;
-	if (auto *fast = carvePtr(phys, bytes)) {
-		memcpy(out, fast, bytes);
+	if (auto *direct = physmapPtr(phys, bytes)) {
+		if (!coherent)
+			flushLines(direct, bytes);
+		memcpy(out, direct, bytes);
 		return true;
 	}
-	if (auto *direct = physmapPtr(phys, bytes)) {
-		flushLines(direct, bytes);
-		memcpy(out, direct, bytes);
+	if (auto *fast = carvePtr(phys, bytes)) {
+		memcpy(out, fast, bytes);
 		return true;
 	}
 	if (inHook())
@@ -5743,8 +5750,9 @@ static uint32_t readGpuVa(uint32_t vmid, uint64_t va, uint32_t max, uint32_t *ou
 		uint32_t chunk = static_cast<uint32_t>((0x1000 - (a & 0xFFF)) / 4);
 		if (chunk > max - have)
 			chunk = max - have;
-		uint64_t phys = ibVaToPhysLocked(vmid, a);
-		if (!phys || !ibReadPhys(phys, chunk * 4, out + have))
+		uint32_t pte = 0;
+		uint64_t phys = ibVaToPhysLocked(vmid, a, &pte);
+		if (!phys || !ibReadPhys(phys, chunk * 4, out + have, (pte & 6) == 6))
 			break;
 		have += chunk;
 		if (stopAtEnd) {
@@ -6343,6 +6351,24 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap, ibHookRaiseOnly,
 		raisedNum, interpFix.probeReverts, interpFix.blockMoves, ibHookBinds, ibHookMemoHits, vmWalks,
 		absToMs(ibReadTime), absToMs(psCheckTime), ibDwordsRead, ibPagesSnooped, ibPagesPlain, ibPagesVram);
+	// The clock samples (sampleGpuClock); "window": the SMU firmware version read through window 13 and window 0,
+	// which must match for the samples to mean anything.
+	uint32_t windowVersion = gpuMmio ? smuWindowRead(0x10000000 + 0x1FF80) : 0, version = 0;
+	if (gpuMmio) {
+		gpuMmio[0x180] = 0x10000000 + 0x1FF80;
+		version = gpuMmio[0x181];
+	}
+	add("gpu clock: samples %u, last %x, window %x/%x; current level:", sclkSamples, sclkLast, windowVersion, version);
+	for (uint32_t level = 0; level < arrsize(sclkCurrent); level++)
+		if (sclkCurrent[level])
+			add(" L%u %u", level, sclkCurrent[level]);
+	add("; target:");
+	for (uint32_t level = 0; level < arrsize(sclkTarget); level++)
+		if (sclkTarget[level])
+			add(" L%u %u", level, sclkTarget[level]);
+	if (sclkSamples && gfxVidMax <= 248)
+		add("; gfx %u-%u mV", (6200 - 25 * gfxVidMax) / 4, (6200 - 25 * gfxVidMin) / 4);
+	add("\n");
 	if (skippedNum) {
 		add("interp skipped:");
 		for (uint32_t q = 0; q < skippedNum; q++) {
@@ -6919,20 +6945,6 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			};
 			add("smu: version %x load-status %x signature %x; msg %x resp %x arg %x\n", smuSram(0), smuSram(0x18),
 				smuSram(0x7C), gpuMmio[0x1C0], gpuMmio[0x1D0], gpuMmio[0x1E0]);
-			// The clock samples (sampleGpuClock); "window" is the firmware version read through window 13, which must
-			// match the version above for the samples to mean anything.
-			add("gpu clock: samples %u, last %x, window %x; current level:", sclkSamples, sclkLast,
-				smuWindowRead(0x10000000 + 0x1FF80));
-			for (uint32_t level = 0; level < arrsize(sclkCurrent); level++)
-				if (sclkCurrent[level])
-					add(" L%u %u", level, sclkCurrent[level]);
-			add("; target:");
-			for (uint32_t level = 0; level < arrsize(sclkTarget); level++)
-				if (sclkTarget[level])
-					add(" L%u %u", level, sclkTarget[level]);
-			if (sclkSamples && gfxVidMax <= 248)
-				add("; gfx %u-%u mV", (6200 - 25 * gfxVidMax) / 4, (6200 - 25 * gfxVidMin) / 4);
-			add("\n");
 		}
 		// Our SMU load (smuLoadFirmware): CAIL's block and our region, the SMU's answers to DriverDramAddrHi/Lo,
 		// InitJobs and the three ExecuteJobs (1 = OK; Bxxxx busy, Cxxxx no answer), UcodeLoadStatus before/after.
