@@ -1093,6 +1093,7 @@ static uint64_t wrapCommitIbFiji(void *channel, uint8_t *info);
 // table.
 static uint32_t sclkCurrent[32], sclkTarget[32], sclkSamples, sclkLast, gfxVidMin = ~0U, gfxVidMax;
 static void smuReadClockTable();  // defined with the SMU loader
+static void smuEnableSclkDpm();
 
 static uint32_t smuWindowRead(uint32_t address) {
 	gpuMmio[0x19A] = address;
@@ -1226,6 +1227,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			sampleGpuClock();
 		if (self->family == ChipFamily::Stoney && t >= 60)
 			smuReadClockTable();
+		if (self->family == ChipFamily::Stoney && t >= 90)
+			smuEnableSclkDpm();
 		if (smuLoadOk())
 			fixRbPlus(gpuMmio, self->family == ChipFamily::Stoney);
 		if (smuLoadOk() && self->family == ChipFamily::Stoney)
@@ -2291,7 +2294,10 @@ namespace Smu8 {
 	static constexpr uint32_t SramBase = 0x10000000, UcodeLoadStatus = 0x1FF80 + 0x18;  // SMU8_Firmware_Header
 	static constexpr uint16_t DriverDramAddrHi = 0x33, DriverDramAddrLo = 0x34, InitJobs = 0x252, ExecuteJob = 0x254;
 	static constexpr uint16_t GetMaxSclkLevel = 0x3B, SetClkTableAddrHi = 0x49, SetClkTableAddrLo = 0x4A,
-	                          ClkTableXferToDram = 0x267;  // cz_ppsmc.h
+	                          ClkTableXferToDram = 0x267, GetFeatureStatus = 0x2, EnableAllSmuFeatures = 0x3,
+	                          SetSclkSoftMin = 0x12, SetSclkSoftMax = 0x13, SetSclkHardMin = 0x14;  // cz_ppsmc.h
+	static constexpr uint32_t SclkDpmMask = 0x80000, SclkDpmOn = 0x200000;  // SCLK_DPM_MASK, scoreboard SclkDpmOn
+	static constexpr uint32_t CgFreqTranVoting0 = 0xD02001A8, VotingRightsDefault = 0x3FFFC102;
 	// UCODE_ID_* (smu_ucode_xfer_cz.h); Stoney has no SDMA1 or MEC2, Linux maps them to SDMA0 and MEC_JT1.
 	static constexpr uint8_t SDMA0 = 0, CE = 2, PFP = 3, ME = 4, MEC_JT1 = 5, RLC_G = 8, RLC_SCRATCH = 9,
 	                         RLC_SRM_ARAM = 10, RLC_SRM_DRAM = 11;
@@ -2629,6 +2635,48 @@ static void smuReadClockTable() {
 	OSSafeReleaseNULL(map);
 	OSSafeReleaseNULL(desc);
 	traceNote("smuclk=%x ", smuClk.resp[4]);
+}
+
+// SCLK DPM, opt-in (-crsclkdpm): what Linux's smu8_enable_dpm_tasks and smu8_update_sclk_limit send, once the clock
+// table has been read and holds every level (nvram181: 200-900 MHz, as in the VBIOS). Voting clients
+// (CG_FREQ_TRAN_VOTING_0), EnableAllSmuFeatures(SCLK_DPM_MASK), then hard min crsclkmin (default level 2, 400 MHz:
+// the clock the firmware boots with, so it never runs slower than without DPM), soft min 0, soft max the top level.
+// GetFeatureStatus before and after (SclkDpmOn 0x200000).
+static struct {
+	bool done;
+	uint32_t featuresBefore, featuresAfter, resp[5], hardMin;
+} smuDpm;
+
+static void smuEnableSclkDpm() {
+	using namespace Smu8;
+	if (smuDpm.done || !smuClk.done || !checkKernelArgument("-crsclkdpm"))
+		return;
+	smuDpm.done = true;
+	uint32_t top = smuClk.maxLevel;
+	bool tableOk = smuClk.resp[4] == 1 && top >= 1 && top < 8;
+	for (uint32_t level = 0; level <= top && tableOk; level++) {
+		uint32_t freq = 0;
+		memcpy(&freq, smuClk.table + level * 12 + 8, 4);
+		tableOk = freq >= 10000 && freq <= 120000;  // 100-1200 MHz
+	}
+	if (!tableOk) {
+		smuDpm.resp[0] = 0xDEAD;
+		return;
+	}
+	uint32_t hardMin = 2;
+	PE_parse_boot_argn("crsclkmin", &hardMin, sizeof(hardMin));
+	smuDpm.hardMin = hardMin = hardMin > top ? top : hardMin;
+	smuSendMessage(GetFeatureStatus, 0);
+	smuDpm.featuresBefore = gpuMmio[ARG];
+	gpuMmio[0x19A] = CgFreqTranVoting0;
+	gpuMmio[0x19B] = VotingRightsDefault;
+	smuDpm.resp[0] = smuSendMessage(EnableAllSmuFeatures, SclkDpmMask);
+	smuDpm.resp[1] = smuSendMessage(SetSclkHardMin, hardMin);
+	smuDpm.resp[2] = smuSendMessage(SetSclkSoftMin, 0);
+	smuDpm.resp[3] = smuSendMessage(SetSclkSoftMax, top);
+	smuDpm.resp[4] = smuSendMessage(GetFeatureStatus, 0);
+	smuDpm.featuresAfter = gpuMmio[ARG];
+	traceNote("sclkdpm=%x/%x ", smuDpm.resp[0], smuDpm.featuresAfter);
 }
 
 static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
@@ -6428,6 +6476,10 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		memcpy(&maxIndex, smuClk.table + 112, 4);
 		add("; valid %x max %u\n", valid, maxIndex);
 	}
+	if (smuDpm.done)
+		add("sclk dpm: resp %x %x %x %x %x, hard min L%u, features %x -> %x (SclkDpmOn %u)\n", smuDpm.resp[0],
+			smuDpm.resp[1], smuDpm.resp[2], smuDpm.resp[3], smuDpm.resp[4], smuDpm.hardMin, smuDpm.featuresBefore,
+			smuDpm.featuresAfter, (smuDpm.featuresAfter & Smu8::SclkDpmOn) != 0);
 	if (skippedNum) {
 		add("interp skipped:");
 		for (uint32_t q = 0; q < skippedNum; q++) {
