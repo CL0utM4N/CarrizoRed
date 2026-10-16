@@ -4662,7 +4662,8 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 
 struct InterpFixStats {
 	uint32_t scans, shaders, hazards, fixed, skipped, lastSkip, writes, writeFails, deadRegs, bumps;
-	uint32_t lastSkipWhy, lastLoopTarget, lastShaderLen, lastHazardAt;
+	uint32_t lastSkipWhy, lastLoopTarget, lastShaderLen, lastHazardAt, lastUnknownWord, lastUnknownAt;
+	uint32_t probeReverts;
 };
 static InterpFixStats interpFix;
 
@@ -4891,6 +4892,8 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 		}
 		uint32_t len = gcn3InstLength(code + i, got - i);
 		if (!gcn3VgprFields(code + i, got - i, f, n)) {
+			interpFix.lastUnknownWord = w;
+			interpFix.lastUnknownAt = i;
 			skip = SkipUnknownEncoding;
 			return 0;
 		}
@@ -5135,6 +5138,7 @@ struct SeenShader {
 	uint64_t va;
 	uint32_t vmid, hash, vgprs;
 	bool pending;
+	uint32_t probeAt, probeVal;  // a fixed instruction and its fixed value (probeAt 0xFFFFFFFF: none)
 };
 static SeenShader seenShaders[512];
 static uint32_t seenNum, seenNext;
@@ -5152,7 +5156,7 @@ static RaisedShader raisedShaders[1024];
 // Shaders the fix had to leave alone: address, length, hazard position, reason, detail (for the report).
 struct SkippedShader {
 	uint64_t va;
-	uint32_t len, at, reason, why;
+	uint32_t len, at, reason, why, word;
 };
 static SkippedShader skippedShaders[12];
 static uint32_t skippedNum;
@@ -5223,8 +5227,15 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 	for (uint32_t q = 0; q < seenNum && !entry; q++)
 		if (seenShaders[q].va == psVa && seenShaders[q].vmid == vmid)
 			entry = &seenShaders[q];
-	if (entry && entry->hash == hash && !(entry->pending && allowBump))
-		return withRaise(vmid, psVa, rsrc1);
+	if (entry && entry->hash == hash && !(entry->pending && allowBump)) {
+		// The fix can lie past the fingerprint: an original re-uploaded at the same address (nvram171: a shader
+		// bound with its hazard back) would look fixed. Check the fixed instruction itself.
+		uint32_t now = 0;
+		if (entry->probeAt == 0xFFFFFFFF ||
+			(readGpuVa(vmid, psVa + entry->probeAt * 4ULL, 1, &now, false) == 1 && now == entry->probeVal))
+			return withRaise(vmid, psVa, rsrc1);
+		interpFix.probeReverts++;
+	}
 	uint32_t have = readGpuVa(vmid, psVa, arrsize(code), code, true);
 	if (!have)
 		return rsrc1;
@@ -5242,8 +5253,9 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 		for (uint32_t q = 0; q < skippedNum && !listed; q++)
 			listed = skippedShaders[q].va == psVa;
 		if (!listed && skippedNum < arrsize(skippedShaders))
-			skippedShaders[skippedNum++] = {psVa, have, interpFix.lastHazardAt, static_cast<uint32_t>(skip),
-				interpFix.lastSkipWhy};
+			skippedShaders[skippedNum++] = {psVa, have,
+				skip == SkipUnknownEncoding ? interpFix.lastUnknownAt : interpFix.lastHazardAt, static_cast<uint32_t>(skip),
+				interpFix.lastSkipWhy, skip == SkipUnknownEncoding ? interpFix.lastUnknownWord : 0};
 	}
 	bool ok = true;
 	if (fixedHere) {
@@ -5267,8 +5279,16 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 	}
 	uint32_t print[16] {};
 	readGpuVa(vmid, psVa, 16, print, false);
+	uint32_t probeAt = 0xFFFFFFFF, probeVal = 0;
+	for (uint32_t q = 0; q < have && fixedHere && ok; q++) {
+		if (code[q] != original[q]) {
+			probeAt = q;
+			probeVal = code[q];
+			break;
+		}
+	}
 	SeenShader fresh {psVa, vmid, codeHash(print, 16), ok ? newVgprs : 0,
-		skip == SkipNoFreeVgpr && !allowBump};
+		skip == SkipNoFreeVgpr && !allowBump, probeAt, probeVal};
 	if (entry) {
 		*entry = fresh;
 	} else if (seenNum < arrsize(seenShaders)) {
@@ -5725,16 +5745,17 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
-	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u; last loop skip %u target %u at %u len %u\n",
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u; last loop skip %u target %u at %u len %u\n",
 		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
 		interpFix.writes, interpFix.writeFails, interpFix.deadRegs, interpFix.bumps, interpHooked, ibHookCalls, ibHookIbs,
 		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap, ibHookRaiseOnly,
-		raisedNum, interpFix.lastSkipWhy, interpFix.lastLoopTarget, interpFix.lastHazardAt, interpFix.lastShaderLen);
+		raisedNum, interpFix.probeReverts, interpFix.lastSkipWhy, interpFix.lastLoopTarget, interpFix.lastHazardAt, interpFix.lastShaderLen);
 	if (skippedNum) {
 		add("interp skipped:");
 		for (uint32_t q = 0; q < skippedNum; q++)
-			add(" %llx(%u dw, at %u, %u/%u)", skippedShaders[q].va, skippedShaders[q].len, skippedShaders[q].at,
-				skippedShaders[q].reason, skippedShaders[q].why);
+			add(" %llx(%u dw, at %u, %u/%u%s%x)", skippedShaders[q].va, skippedShaders[q].len, skippedShaders[q].at,
+				skippedShaders[q].reason, skippedShaders[q].why, skippedShaders[q].word ? " word " : "",
+				skippedShaders[q].word);
 		add("\n");
 	}
 	if (!checkKernelArgument("-crnoibdump")) {
