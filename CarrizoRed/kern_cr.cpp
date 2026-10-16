@@ -1093,6 +1093,24 @@ static uint64_t wrapCommitIbFiji(void *channel, uint8_t *info);
 // table.
 static uint32_t sclkCurrent[32], sclkTarget[32], sclkSamples, sclkLast, gfxVidMin = ~0U, gfxVidMax;
 static uint32_t sclkPrevLevel, sclkChanges, sclkMaxSeen;
+// SMU mailbox use by anyone else (Apple's HWLibs): the message register holding something we didn't send. A message
+// sent while ours is in flight would make the SMU act on the wrong message or argument.
+static uint32_t smuLastMsg, smuForeignMsgs, smuForeignIds[8], smuForeignNum;
+
+static void watchSmuMailbox() {
+	if (!gpuMmio || !smuLastMsg)
+		return;
+	uint32_t msg = gpuMmio[0x1C0] & 0xFFFF;
+	if (msg == smuLastMsg)
+		return;
+	smuForeignMsgs++;
+	smuLastMsg = msg;
+	bool known = false;
+	for (uint32_t i = 0; i < smuForeignNum && !known; i++)
+		known = smuForeignIds[i] == msg;
+	if (!known && smuForeignNum < arrsize(smuForeignIds))
+		smuForeignIds[smuForeignNum++] = msg;
+}
 static void smuReadClockTable();  // defined with the SMU loader
 static void smuEnableSclkDpm();
 static bool sclkDpmRunning();
@@ -1235,6 +1253,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		// these SMU register reads every 500 ms are the one thing we do that Linux doesn't (it reads them on request).
 		if (self->family == ChipFamily::Stoney && !sclkDpmRunning())
 			sampleGpuClock();
+		if (self->family == ChipFamily::Stoney)
+			watchSmuMailbox();
 		if (self->family == ChipFamily::Stoney && t >= 60)
 			smuReadClockTable();
 		if (self->family == ChipFamily::Stoney && t >= 90)
@@ -2305,7 +2325,8 @@ namespace Smu8 {
 	static constexpr uint16_t DriverDramAddrHi = 0x33, DriverDramAddrLo = 0x34, InitJobs = 0x252, ExecuteJob = 0x254;
 	static constexpr uint16_t GetMaxSclkLevel = 0x3B, SetClkTableAddrHi = 0x49, SetClkTableAddrLo = 0x4A,
 	                          ClkTableXferToDram = 0x267, GetFeatureStatus = 0x2, EnableAllSmuFeatures = 0x3,
-	                          SetSclkSoftMin = 0x12, SetSclkSoftMax = 0x13, SetSclkHardMin = 0x14;  // cz_ppsmc.h
+	                          SetSclkSoftMin = 0x12, SetSclkSoftMax = 0x13, SetSclkHardMin = 0x14,
+	                          SetMinDeepSleepSclk = 0x11, SetWatermarkFrequency = 0x26E;  // cz_ppsmc.h
 	static constexpr uint32_t SclkDpmMask = 0x80000, SclkDpmOn = 0x200000;  // SCLK_DPM_MASK, scoreboard SclkDpmOn
 	static constexpr uint32_t CgFreqTranVoting0 = 0xD02001A8, VotingRightsDefault = 0x3FFFC102;
 	// UCODE_ID_* (smu_ucode_xfer_cz.h); Stoney has no SDMA1 or MEC2, Linux maps them to SDMA0 and MEC_JT1.
@@ -2372,6 +2393,7 @@ static uint32_t smuSendMessage(uint16_t msg, uint32_t arg) {
 	mmio[Smu8::ARG] = arg;
 	mmio[Smu8::RESP] = 0;
 	mmio[Smu8::MSG] = msg;
+	smuLastMsg = msg;
 	uint32_t resp = wait();
 	return resp ? resp : 0xC0000 | msg;  // never answered
 }
@@ -2654,7 +2676,7 @@ static void smuReadClockTable() {
 // GetFeatureStatus before and after (SclkDpmOn 0x200000).
 static struct {
 	bool done;
-	uint32_t featuresBefore, featuresAfter, resp[5], hardMin, softMax;
+	uint32_t featuresBefore, featuresAfter, resp[7], hardMin, softMax;
 } smuDpm;
 
 
@@ -2691,6 +2713,12 @@ static void smuEnableSclkDpm() {
 	smuDpm.resp[1] = smuSendMessage(SetSclkHardMin, hardMin);
 	smuDpm.resp[2] = smuSendMessage(SetSclkSoftMin, 0);
 	smuDpm.resp[3] = smuSendMessage(SetSclkSoftMax, top);
+	// smu8_set_power_state_tasks also sets the deep-sleep floor (SMU8_MIN_DEEP_SLEEP_SCLK, 8 MHz, when the display
+	// gives none) and the watermark frequency (the soft max clock, 10 kHz units).
+	uint32_t topFreq = 0;
+	memcpy(&topFreq, smuClk.table + top * 12 + 8, 4);
+	smuDpm.resp[5] = smuSendMessage(SetMinDeepSleepSclk, 800);
+	smuDpm.resp[6] = smuSendMessage(SetWatermarkFrequency, topFreq);
 	smuDpm.resp[4] = smuSendMessage(GetFeatureStatus, 0);
 	smuDpm.featuresAfter = gpuMmio[ARG];
 	traceNote("sclkdpm=%x/%x ", smuDpm.resp[0], smuDpm.featuresAfter);
@@ -6499,10 +6527,16 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		add("; valid %x max %u\n", valid, maxIndex);
 	}
 	if (smuDpm.done)
-		add("sclk dpm: resp %x %x %x %x %x, L%u-L%u, features %x -> %x (SclkDpmOn %u), level changes %u, max seen L%u (before DPM), now %x\n",
+		add("sclk dpm: resp %x %x %x %x %x, L%u-L%u, features %x -> %x (SclkDpmOn %u), level changes %u, max seen L%u (before DPM), now %x; deep sleep %x watermark %x; mailbox msg %x resp %x arg %x, foreign %u:",
 			smuDpm.resp[0], smuDpm.resp[1], smuDpm.resp[2], smuDpm.resp[3], smuDpm.resp[4], smuDpm.hardMin,
 			smuDpm.softMax, smuDpm.featuresBefore, smuDpm.featuresAfter, (smuDpm.featuresAfter & Smu8::SclkDpmOn) != 0,
-			sclkChanges, sclkMaxSeen, gpuMmio ? smuWindowRead(0xD0200014) : 0);
+			sclkChanges, sclkMaxSeen, gpuMmio ? smuWindowRead(0xD0200014) : 0, smuDpm.resp[5], smuDpm.resp[6],
+			gpuMmio ? gpuMmio[0x1C0] : 0, gpuMmio ? gpuMmio[0x1D0] : 0, gpuMmio ? gpuMmio[0x1E0] : 0, smuForeignMsgs);
+	if (smuDpm.done) {
+		for (uint32_t i = 0; i < smuForeignNum; i++)
+			add(" %x", smuForeignIds[i]);
+		add("\n");
+	}
 	if (skippedNum) {
 		add("interp skipped:");
 		for (uint32_t q = 0; q < skippedNum; q++) {
