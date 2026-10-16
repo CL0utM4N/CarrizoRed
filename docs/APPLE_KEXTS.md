@@ -488,5 +488,17 @@ command buffer, so nothing is drawn with a broken shader. Lessons on the way:
 - most command buffers and shader code live in system memory, not the carve-out;
 - known shaders are recognised by a 16-dword fingerprint, which brought the cost from ~9% to ~2–3% of one core.
 
-Reasons a shader is still left alone (counted in the report's `interp fix` line): the result read inside a register
-range (e.g. image coordinates), and loops that write the result register again.
+Later (nvram170-176): loops are followed with reaching definitions; when the result is read as part of a register
+block (an image coordinate), the whole block moves to fresh registers, each member as a web (its definitions reaching
+the block read, every read they reach, and every other definition reaching those reads), so members set on several
+paths or written many times move too. A read that sees the result on one path and another value on another moves the
+same way, as a one-register block. Left alone: a block that contains an interpolation input (I/J), which can't move.
+
+The GCN3 length decoder had SOP1/SOPC/SOPP after SOPK, which shares their top bits: `s_mov_b32 sN, <literal>` was one
+dword and the literal was decoded as an instruction (nvram176: an "unknown encoding" `ff7fffff`, i.e. -FLT_MAX; other
+literals decode as VALU or 2-dword instructions and could hide a real one from the fixer). An early `s_endpgm` no longer
+ends the analysis while a branch jumps past it.
+
+Cost: the page-table walk read ~12 GPU registers per translation (each an uncached access); the memory-controller
+and VM settings are now read once, translations are remembered while the lock is held, and a shader bound again in
+the same submission reuses the first answer.

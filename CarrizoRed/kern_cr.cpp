@@ -1029,6 +1029,7 @@ static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_
 // 500 ms and 160 times per boot. -crnobreadcrumb disables it.
 static uint32_t breadcrumbWrites, breadcrumbRefused;
 static bool breadcrumbNoOptions;
+static bool desktopRunning();
 
 static void writeBreadcrumb(uint32_t t) {
 	static IORegistryEntry *options;
@@ -1037,7 +1038,10 @@ static void writeBreadcrumb(uint32_t t) {
 	static char text[1000];
 	uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
 	uint32_t ih = __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED);
-	if (writes >= 160 || (head == lastHead && (ih == lastIh || t % 5)))
+	// Interrupts alone (every 5 s) only until Metal is drawing: after that they never stop, and each write is a forced
+	// NVRAM sync (a flash write).
+	bool ihOnly = head == lastHead && (ih == lastIh || t % 5 || desktopRunning());
+	if (writes >= 160 || ihOnly)
 		return;
 	if (!options && !(options = IORegistryEntry::fromPath("/options", gIODTPlane))) {
 		breadcrumbNoOptions = true;
@@ -1118,8 +1122,9 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		// Interrupt activity since the last tick: a storm shows as a fast-climbing handler count.
 		{
 			static uint32_t lastCalls;
+			// Once the desktop runs, interrupts never stop: log them every 30 s, or when they storm.
 			uint32_t calls = __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED);
-			if (calls != lastCalls)
+			if (calls != lastCalls && (!desktopRunning() || tick % 60 == 0 || calls - lastCalls > 5000))
 				IOLog("CarrizoRed: IH handler calls %u (+%u), rptr writes %u, last rptr 0x%x\n", calls, calls - lastCalls,
 					__atomic_load_n(&ihReadPointerWrites, __ATOMIC_RELAXED), ihLastReadPointer);
 			lastCalls = calls;
@@ -1232,7 +1237,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			}
 		}
 
-		if (tick % 2) {
+		// The registry walk below: every second during start-up, every 10 s once Metal is drawing.
+		if (tick % 2 || (desktopRunning() && tick % 20)) {
 			IOSleep(500);
 			continue;
 		}
@@ -4519,25 +4525,72 @@ static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out) {
 	return mapped;
 }
 
-// GPU (MC) address of a page table structure or VRAM page -> system physical address.
+// GPU (MC) address of a page table structure or VRAM page -> system physical address. The frame buffer location and
+// carve-out don't change once the driver has set them, so they are read from the GPU once: each register read is an
+// uncached access, and a translation used to make about 12 (nvram176: the submit hook took ~200 us per command buffer).
+static uint64_t mcFbBase, mcFbTop, mcCarveout;
+static bool mcKnown;
+
 static uint64_t ibMcToPhys(uint64_t addr, bool system) {
-	auto *mmio = gpuMmio;
-	uint64_t fbBase = static_cast<uint64_t>(mmio[Reg::MC_VM_FB_LOCATION] & 0xFFFF) << 24;
-	uint64_t fbTop = (static_cast<uint64_t>(mmio[Reg::MC_VM_FB_LOCATION] >> 16) + 1) << 24;
-	uint64_t carveout = static_cast<uint64_t>(mmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22;
-	if (!system && addr >= fbBase && addr < fbTop)
-		return carveout + (addr - fbBase);
+	if (!__atomic_load_n(&mcKnown, __ATOMIC_ACQUIRE)) {
+		auto *mmio = gpuMmio;
+		uint32_t location = mmio[Reg::MC_VM_FB_LOCATION];
+		uint64_t fbBase = static_cast<uint64_t>(location & 0xFFFF) << 24;
+		uint64_t fbTop = (static_cast<uint64_t>(location >> 16) + 1) << 24;
+		uint64_t carveout = static_cast<uint64_t>(mmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22;
+		if (!carveout || fbTop <= fbBase || location == 0xFFFFFFFF)
+			return !system && addr >= fbBase && addr < fbTop ? carveout + (addr - fbBase) : addr;
+		mcFbBase = fbBase;
+		mcFbTop = fbTop;
+		mcCarveout = carveout;
+		__atomic_store_n(&mcKnown, true, __ATOMIC_RELEASE);
+	}
+	if (!system && addr >= mcFbBase && addr < mcFbTop)
+		return mcCarveout + (addr - mcFbBase);
 	return addr;
 }
 
-static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va) {
+// Translations made while holding interpLock (the submit hook or the scan; ibVaToPhysLocked), remembered until it lets
+// go: page tables don't change under a command buffer being submitted. Other callers walk the tables every time.
+struct VmCacheEntry {
+	uint64_t page, phys;
+	uint32_t vmid, gen;
+};
+static VmCacheEntry vmCache[64];
+static uint32_t vmCacheGen;
+static uint32_t vmWalks;
+// VM_CONTEXT1_CNTL and the page table start, read once the VM is enabled.
+static uint32_t vmCntl, vmStart;
+static bool vmKnown;
+
+// Called right after taking interpLock: forget the last holder's translations.
+static void vmCacheBegin() {
+	if (++vmCacheGen == 0)
+		vmCacheGen = 1;
+}
+
+static uint64_t ibVaToPhysWalk(uint32_t vmid, uint64_t va, VmCacheEntry *slot) {
 	auto *mmio = gpuMmio;
 	if (!vmid || vmid > 15)
 		return 0;
-	uint32_t cntl = mmio[0x505];
+	uint64_t page = va >> 12;
+	vmWalks++;
+	uint32_t cntl, start;
+	if (__atomic_load_n(&vmKnown, __ATOMIC_ACQUIRE)) {
+		cntl = vmCntl;
+		start = vmStart;
+	} else {
+		cntl = mmio[0x505];
+		start = mmio[0x558];
+		if ((cntl & 1) && cntl != 0xFFFFFFFF) {
+			vmCntl = cntl;
+			vmStart = start;
+			__atomic_store_n(&vmKnown, true, __ATOMIC_RELEASE);
+		}
+	}
 	uint32_t depth = (cntl >> 1) & 3, block = (cntl >> 24) & 0xF;
 	uint64_t pdb = static_cast<uint64_t>(vmid < 8 ? mmio[0x550 + vmid - 1] : mmio[0x50E + vmid - 8]) << 12;
-	uint64_t pfn = (va >> 12) - mmio[0x558];
+	uint64_t pfn = page - start;
 	uint64_t entry = 0;
 	if (depth == 0) {
 		if (!ibReadPhys(ibMcToPhys(pdb, false) + pfn * 8, 8, &entry))
@@ -4553,7 +4606,23 @@ static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va) {
 	}
 	if (!(entry & 1))
 		return 0;
-	return ibMcToPhys(entry & 0xFFFFFFFFF000ULL, entry & 2) + (va & 0xFFF);
+	uint64_t phys = ibMcToPhys(entry & 0xFFFFFFFFF000ULL, entry & 2);
+	if (slot)
+		*slot = {page, phys, vmid, vmCacheGen};
+	return phys + (va & 0xFFF);
+}
+
+static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va) {
+	return ibVaToPhysWalk(vmid, va, nullptr);
+}
+
+// Only with interpLock held.
+static uint64_t ibVaToPhysLocked(uint32_t vmid, uint64_t va) {
+	uint64_t page = va >> 12;
+	VmCacheEntry *slot = &vmCache[(page ^ (page >> 6) ^ vmid) & (arrsize(vmCache) - 1)];
+	if (slot->gen == vmCacheGen && slot->vmid == vmid && slot->page == page)
+		return slot->phys + (va & 0xFFF);
+	return ibVaToPhysWalk(vmid, va, slot);
 }
 
 // GFX8 (GCN3) instruction length in dwords, for walking shader code: SOP2/SOPK/SOP1/SOPC/SOPP and VOP1/VOP2/VOPC and
@@ -4571,8 +4640,8 @@ static uint32_t gcn3InstLength(const uint32_t *code, uint32_t left) {
 		return src0 == 0xFF || src0 == 0xF9 || src0 == 0xFA ? 2 : 1;
 	}
 	if ((w >> 30) == 2) {  // scalar ALU
-		if ((w >> 28) == 0xB)  // SOPK; s_setreg_imm32_b32 (op 0x14) carries a literal
-			return ((w >> 23) & 0x1F) == 0x14 ? 2 : 1;
+		// SOPP, SOP1 and SOPC first: they share SOPK's top bits (1011). nvram176: checked the other way round,
+		// `s_mov_b32 s0, 0xff7fffff` was one dword and its literal was taken for an instruction.
 		uint32_t top9 = w >> 23;
 		if (top9 == 0x17F)  // SOPP
 			return 1;
@@ -4580,6 +4649,8 @@ static uint32_t gcn3InstLength(const uint32_t *code, uint32_t left) {
 			return (w & 0xFF) == 0xFF ? 2 : 1;
 		if (top9 == 0x17E)  // SOPC
 			return (w & 0xFF) == 0xFF || ((w >> 8) & 0xFF) == 0xFF ? 2 : 1;
+		if ((w >> 28) == 0xB)  // SOPK; s_setreg_imm32_b32 (op 0x14) carries a literal
+			return ((w >> 23) & 0x1F) == 0x14 ? 2 : 1;
 		return (w & 0xFF) == 0xFF || ((w >> 8) & 0xFF) == 0xFF ? 2 : 1;  // SOP2
 	}
 	switch (w >> 26) {
@@ -4588,6 +4659,27 @@ static uint32_t gcn3InstLength(const uint32_t *code, uint32_t left) {
 		default:
 			return left >= 2 ? 2 : 1;
 	}
+}
+
+// One past the program's last instruction in code[0..got): the s_endpgm no branch jumps beyond (an early s_endpgm, for
+// waves with every pixel killed say, has more code after it). 0 if it isn't in code[0..got).
+static uint32_t gcn3ProgramEnd(const uint32_t *code, uint32_t got) {
+	uint32_t furthest = 0;
+	for (uint32_t i = 0; i < got;) {
+		uint32_t w = code[i];
+		if ((w >> 23) == 0x17F) {
+			uint32_t op = (w >> 16) & 0x7F;
+			if (op == 0x01 && furthest <= i)
+				return i + 1;
+			if (op == 0x02 || (op >= 0x04 && op <= 0x09) || (op >= 0x17 && op <= 0x1A)) {
+				int32_t to = static_cast<int32_t>(i) + 1 + static_cast<int16_t>(w & 0xFFFF);
+				if (to > static_cast<int32_t>(furthest))
+					furthest = static_cast<uint32_t>(to);
+			}
+		}
+		i += gcn3InstLength(code + i, got - i);
+	}
+	return 0;
 }
 
 // Pixel shaders the command buffer runs (SPI_SHADER_PGM_LO/HI_PS, SH registers 0x08/0x09): read each through the VM and
@@ -4611,13 +4703,10 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 				break;
 			got += chunk;
 		}
-		uint32_t p1 = 0, p2 = 0, mov = 0, bad = 0, firstBad = 0, len = 0, shown[6] {}, shownNum = 0;
-		for (uint32_t i = 0; i < got;) {
+		uint32_t p1 = 0, p2 = 0, mov = 0, bad = 0, firstBad = 0, shown[6] {}, shownNum = 0;
+		uint32_t len = gcn3ProgramEnd(code, got);
+		for (uint32_t i = 0; i < (len ? len : got);) {
 			uint32_t w = code[i];
-			if (w == 0xBF810000) {  // s_endpgm
-				len = i + 1;
-				break;
-			}
 			if ((w >> 26) == 0x35) {
 				uint32_t op = (w >> 16) & 3, vdst = (w >> 18) & 0xFF, vsrc = w & 0xFF;
 				if (op == 0) {
@@ -4663,7 +4752,7 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 struct InterpFixStats {
 	uint32_t scans, shaders, hazards, fixed, skipped, lastSkip, writes, writeFails, deadRegs, bumps;
 	uint32_t lastSkipWhy, lastLoopTarget, lastShaderLen, lastHazardAt, lastUnknownWord, lastUnknownAt;
-	uint32_t probeReverts, blockMoves;
+	uint32_t probeReverts, blockMoves, lastBlockFail;
 };
 static InterpFixStats interpFix;
 
@@ -4893,165 +4982,270 @@ static void cfgStep(const uint32_t *code, uint32_t i, bool &fall, int32_t &targe
 	}
 }
 
+// The instruction graph of one shader, for following a register's values backwards: which dwords start an
+// instruction, the instruction before each, and the branches into each (cfgFirstIn: 1 + index into cfgBranchFrom).
+static uint8_t cfgIsStart[0x8000];
+static uint16_t cfgPrev[0x8000], cfgFirstIn[0x8000];
+static uint16_t cfgBranchFrom[0x1000], cfgNextIn[0x1000];
+
+static bool cfgBuild(const uint32_t *code, uint32_t end) {
+	if (end > arrsize(cfgIsStart))
+		return false;
+	memset(cfgIsStart, 0, end);
+	memset(cfgFirstIn, 0, end * sizeof(cfgFirstIn[0]));
+	uint32_t prev = 0xFFFF, branches = 0;
+	for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i)) {
+		cfgIsStart[i] = 1;
+		cfgPrev[i] = static_cast<uint16_t>(prev);
+		prev = i;
+	}
+	for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i)) {
+		bool fall;
+		int32_t target;
+		cfgStep(code, i, fall, target);
+		if (target < 0)
+			continue;
+		if (target >= static_cast<int32_t>(end) || !cfgIsStart[target] || branches == arrsize(cfgBranchFrom))
+			return false;  // a branch out of the program or into the middle of an instruction
+		cfgBranchFrom[branches] = static_cast<uint16_t>(i);
+		cfgNextIn[branches] = cfgFirstIn[target];
+		cfgFirstIn[target] = static_cast<uint16_t>(++branches);
+	}
+	return true;
+}
+
 // When the hazard's result is read as part of a register block (an image coordinate, say), it can't get a register of
-// its own: move the whole block [base, base + k) to fresh registers [F, F + k) instead. For each member, the one
-// definition that reaches the block read is moved, with every read it reaches; the hazard's p1/p2 are the result's
-// definition, so moving them fixes the hazard. Every member needs a single definition reaching the block read, and no
-// read may see both a moved and an unmoved definition. Plans the changes; false if the block can't be moved.
+// its own: move the whole block [base, base + k) to fresh registers [F, F + k) instead. Each member moves as a web:
+// the definitions reaching the block read, every read those reach, and (until nothing changes) every other definition
+// reaching one of those reads. So a member may be set on several paths, or written any number of times elsewhere in
+// the shader (the first version needed one definition, and gave up past 31 writes of the register). The hazard's p1/p2
+// are in the result's web, so moving it fixes the hazard. A member whose starting value reaches the block read is only
+// moved if it is above the interpolation inputs and nothing but block reads see it (a slot the instruction doesn't
+// use). Instructions that move several members at once (a multi-register operand) must move all of them. Plans the
+// changes; false if the block can't be moved (fail: member << 8 | why).
 struct RegChange {
 	uint32_t at;
 	VgprField field;
 	uint32_t reg;
+	uint32_t votes, lastMember;  // members moving this operand (a multi-register one needs all it names)
 };
 
+static uint8_t webKind[0x8000], webDef[0x8000], webIn[0x8000], webSeen[0x8000];
+static uint16_t webStack[0xA000];
+
 static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint32_t p2, uint32_t vI, uint32_t blockAt,
-	uint32_t base, uint32_t k, uint32_t F, RegChange *out, uint32_t &outNum, uint32_t outMax) {
-	static uint32_t state[0x8000];
-	static uint8_t start[0x8000];
-	static uint8_t defId[0x8000];
+	uint32_t base, uint32_t k, uint32_t F, RegChange *out, uint32_t &outNum, uint32_t outMax, uint32_t &fail) {
 	VgprField f[8];
 	uint32_t n;
 	outNum = 0;
-	memset(start, 0, end);
+	fail = 1;
+	if (!cfgBuild(code, end))
+		return false;
+	uint32_t maxInterpSource = 0;
 	for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i))
-		start[i] = 1;
-	auto addChange = [&](uint32_t i, const VgprField &field, uint32_t reg) {
-		for (uint32_t c = 0; c < outNum; c++)
-			if (out[c].at == i && out[c].field.dword == field.dword && out[c].field.shift == field.shift)
-				return out[c].reg == reg;
+		if ((code[i] >> 26) == 0x35 && ((code[i] >> 16) & 3) != 2 && (code[i] & 0xFF) > maxInterpSource)
+			maxInterpSource = code[i] & 0xFF;
+	auto isInterpSource = [&](uint32_t i, const VgprField &field) {
+		return (code[i] >> 26) == 0x35 && field.shift == 0;
+	};
+	auto addChange = [&](uint32_t i, const VgprField &field, uint32_t reg, uint32_t member) {
+		for (uint32_t c = 0; c < outNum; c++) {
+			if (out[c].at != i || out[c].field.dword != field.dword || out[c].field.shift != field.shift)
+				continue;
+			if (out[c].reg != reg)
+				return false;
+			if (out[c].lastMember != member) {
+				out[c].votes++;
+				out[c].lastMember = member;
+			}
+			return true;
+		}
 		if (outNum == outMax)
 			return false;
-		out[outNum++] = {i, field, reg};
+		out[outNum++] = {i, field, reg, 1, member};
 		return true;
 	};
 	for (uint32_t r = base; r < base + k; r++) {
-		// Definitions of r: ids 0-30 (p1 and p2 share one when r is the result's register), bit 31 is "on entry".
-		uint32_t defs = 0;
-		memset(defId, 0xFF, end);
+		uint32_t member = (r - base) << 8;
+		// How each instruction writes r: 0 not, 1 writes it, 2 may write it (a register range whose size is a bound).
 		for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i)) {
-			if (r == vI && (i == at || i == p2)) {
-				defId[i] = 0;
-				continue;
-			}
-			// A v_interp_p2 completes the p1 before it (same destination, attribute and channel): one definition.
-			uint32_t x = code[i];
-			if ((x >> 26) == 0x35 && ((x >> 16) & 3) == 1 && ((x >> 18) & 0xFF) == r) {
-				bool paired = false;
-				for (uint32_t j = 0; j < i && !paired;) {
-					uint32_t y = code[j];
-					uint32_t jl = gcn3InstLength(code + j, end - j);
-					uint32_t next = j + jl;
-					if ((y >> 26) == 0x35 && ((y >> 16) & 3) == 0 && ((y >> 18) & 0xFF) == r &&
-						((y >> 8) & 0xFF) == ((x >> 8) & 0xFF) && defId[j] != 0xFF) {
-						// the last such p1 before i wins
-						bool later = false;
-						for (uint32_t m = next; m < i; m += gcn3InstLength(code + m, end - m))
-							if ((code[m] >> 26) == 0x35 && ((code[m] >> 16) & 3) == 0 && ((code[m] >> 18) & 0xFF) == r)
-								later = true;
-						if (!later) {
-							defId[i] = defId[j];
-							paired = true;
-						}
-					}
-					j = next;
-				}
-				if (paired)
-					continue;
-			}
+			uint8_t kind = 0;
 			gcn3VgprFields(code + i, end - i, f, n);
 			for (uint32_t q = 0; q < n; q++) {
 				uint32_t v = fieldValue(code + i, f[q]);
-				if (!f[q].write || !(v <= r && r < v + f[q].count))
-					continue;
-				if (f[q].count > 1 && !f[q].exact && v != r)
-					return false;  // may or may not write r
-				if (defId[i] == 0xFF) {
-					if (defs == 30)
-						return false;
-					defId[i] = static_cast<uint8_t>(r == vI ? ++defs : defs++);
-				}
+				if (f[q].write && v <= r && r < v + f[q].count)
+					kind = f[q].count > 1 && !f[q].exact && v != r ? (kind ? kind : 2) : 1;
 			}
+			webKind[i] = kind;
 		}
-		memset(state, 0, end * sizeof(state[0]));
-		state[0] = 1U << 31;
-		bool changed = true;
-		for (uint32_t pass = 0; changed && pass < 256; pass++) {
-			changed = false;
-			for (uint32_t i = 0; i < end;) {
-				uint32_t len = gcn3InstLength(code + i, end - i);
-				if (state[i]) {
-					uint32_t o = defId[i] != 0xFF ? 1U << defId[i] : state[i];
+		memset(webDef, 0, end);
+		bool entry = false, overflow = false;
+		// The definitions whose value can reach instruction x join the web (the starting value: entry). True if any
+		// was new.
+		auto join = [&](uint32_t x) {
+			bool grew = false;
+			uint32_t sp = 0;
+			memset(webSeen, 0, end);
+			auto push = [&](uint32_t y) {
+				if (sp == arrsize(webStack))
+					overflow = true;
+				else
+					webStack[sp++] = static_cast<uint16_t>(y);
+			};
+			auto preds = [&](uint32_t y) {
+				if (y == 0 && !entry) {
+					entry = true;
+					grew = true;
+				}
+				uint32_t p = cfgPrev[y];
+				if (p != 0xFFFF) {
 					bool fall;
 					int32_t target;
-					cfgStep(code, i, fall, target);
-					auto flow = [&](int32_t to) {
-						if (to >= 0 && to < static_cast<int32_t>(end) && start[to] && (state[to] | o) != state[to]) {
-							state[to] |= o;
+					cfgStep(code, p, fall, target);
+					if (fall)
+						push(p);
+				}
+				for (uint32_t b = cfgFirstIn[y]; b; b = cfgNextIn[b - 1])
+					push(cfgBranchFrom[b - 1]);
+			};
+			preds(x);
+			while (sp && !overflow) {
+				uint32_t p = webStack[--sp];
+				if (webSeen[p])
+					continue;
+				webSeen[p] = 1;
+				if (webKind[p] && !webDef[p]) {
+					webDef[p] = 1;
+					grew = true;
+				}
+				if (webKind[p] != 1)
+					preds(p);
+			}
+			return grew;
+		};
+		// Which values of r reach each instruction: 1 the web's, 2 any other.
+		auto flow = [&]() {
+			memset(webIn, 0, end);
+			webIn[0] = entry ? 1 : 2;
+			for (uint32_t pass = 0; pass < 1024; pass++) {
+				bool changed = false;
+				for (uint32_t i = 0; i < end;) {
+					uint32_t len = gcn3InstLength(code + i, end - i);
+					uint8_t in = webIn[i];
+					if (in) {
+						uint8_t mine = webDef[i] ? 1 : 2;
+						uint8_t o = webKind[i] == 1 ? mine : webKind[i] == 2 ? static_cast<uint8_t>(in | mine) : in;
+						bool fall;
+						int32_t target;
+						cfgStep(code, i, fall, target);
+						if (fall && i + len < end && (webIn[i + len] | o) != webIn[i + len]) {
+							webIn[i + len] |= o;
 							changed = true;
 						}
-					};
-					if (fall)
-						flow(static_cast<int32_t>(i + len));
-					if (target >= 0)
-						flow(target);
+						if (target >= 0 && (webIn[target] | o) != webIn[target]) {
+							webIn[target] |= o;
+							changed = true;
+						}
+					}
+					i += len;
 				}
-				i += len;
+				if (!changed)
+					return true;
 			}
-		}
-		uint32_t reach = state[blockAt];
-		if (reach == (1U << 31)) {
-			// Never written before the block read: the block operand's size is an upper bound (an image address can
-			// be shorter than 4 registers), so this may be a slot the instruction doesn't use, holding nothing. Leave
-			// it behind only if nothing else reads its starting value and it lies above the interpolation inputs
-			// (I/J); an input the shader uses can't be moved.
-			uint32_t maxInterpSource = 0;
-			for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i))
-				if ((code[i] >> 26) == 0x35 && ((code[i] >> 16) & 3) != 2 && (code[i] & 0xFF) > maxInterpSource)
-					maxInterpSource = code[i] & 0xFF;
-			if (r <= maxInterpSource)
+			return false;
+		};
+		join(blockAt);
+		bool settled = false;
+		for (uint32_t round = 0; round < 256 && !overflow; round++) {
+			if (!flow()) {
+				fail = member | 8;
 				return false;
-			for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i)) {
-				if (!(state[i] & (1U << 31)))
+			}
+			bool grew = false;
+			for (uint32_t i = 0; i < end && !overflow; i += gcn3InstLength(code + i, end - i)) {
+				uint8_t in = webIn[i];
+				if (!in)
 					continue;
 				gcn3VgprFields(code + i, end - i, f, n);
 				for (uint32_t q = 0; q < n; q++) {
 					uint32_t v = fieldValue(code + i, f[q]);
-					if (f[q].read && v <= r && r < v + f[q].count && !(v == base && f[q].count == k))
-						return false;
+					if (!f[q].read || isInterpSource(i, f[q]) || !(v <= r && r < v + f[q].count))
+						continue;
+					// One operand read and written (v_mac, a p2's accumulator): both move or neither.
+					if ((in & 1) && f[q].write && !webDef[i]) {
+						webDef[i] = 1;
+						grew = true;
+					}
+					if ((in & 2) && ((in & 1) || (f[q].write && webDef[i])))
+						grew |= join(i);
 				}
 			}
-			continue;
+			if (!grew) {
+				settled = !overflow;
+				break;
+			}
 		}
-		if (!reach || (reach & (reach - 1)) || (reach & (1U << 31)))
-			return false;  // not exactly one definition reaches the block read
-		if (r == vI && reach != 1U)
+		if (overflow) {
+			fail = member | 2;
 			return false;
-		uint32_t d = reach;
-		uint32_t newReg = F + (r - base);
+		}
+		if (!settled) {
+			fail = member | 8;
+			return false;
+		}
+		if (r == vI && !(webDef[at] && webDef[p2])) {
+			fail = member | 4;
+			return false;
+		}
+		if (entry && (r == vI || r <= maxInterpSource)) {
+			fail = member | 3;  // an input (or the result's register on entry) would move
+			return false;
+		}
 		for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i)) {
-			bool isDef = defId[i] != 0xFF && (1U << defId[i]) == d;
-			bool reached = (state[i] & d) != 0;
-			if (!isDef && !reached)
+			uint8_t in = webIn[i];
+			if (!(in & 1) && !webDef[i])
 				continue;
 			gcn3VgprFields(code + i, end - i, f, n);
 			for (uint32_t q = 0; q < n; q++) {
 				uint32_t v = fieldValue(code + i, f[q]);
 				if (!(v <= r && r < v + f[q].count))
 					continue;
-				bool interpSource = (code[i] >> 26) == 0x35 && f[q].shift == 0;
-				bool useRead = f[q].read && reached && !interpSource;
-				bool useWrite = f[q].write && isDef;
-				if (!useRead && !useWrite)
-					continue;
-				if (useRead && state[i] != d)
-					return false;  // this read sees other definitions too
-				if (f[q].count > 1) {
-					if (v != base || f[q].count != k || !addChange(i, f[q], F))
+				if (isInterpSource(i, f[q])) {
+					// A v_interp's I/J stays where it is: it must not read a value that moves (the hazard's own p1
+					// only could, round a loop, and there it wants I, which the move leaves in vI).
+					if ((in & 1) && !(r == vI && i == at)) {
+						fail = member | 10;
 						return false;
-				} else if (!addChange(i, f[q], newReg)) {
+					}
+					continue;
+				}
+				bool moveRead = f[q].read && (in & 1), moveWrite = f[q].write && webDef[i];
+				if (!moveRead && !moveWrite)
+					continue;
+				if ((moveRead && (in & 2)) || (f[q].read && f[q].write && moveRead != moveWrite)) {
+					fail = member | 6;
+					return false;
+				}
+				bool inBlock = v >= base && v + f[q].count <= base + k;
+				if (entry && moveRead && !(v == base && f[q].count == k)) {
+					fail = member | 3;  // the starting value is read outside the block reads: not an unused slot
+					return false;
+				}
+				if (f[q].count > 1 && !inBlock) {
+					fail = member | 5;  // a register range reaching outside the block
+					return false;
+				}
+				if (!addChange(i, f[q], F + (f[q].count > 1 ? v : r) - base, r)) {
+					fail = member | 7;
 					return false;
 				}
 			}
+		}
+	}
+	for (uint32_t c = 0; c < outNum; c++) {
+		if (out[c].field.count > 1 && out[c].votes != out[c].field.count) {
+			fail = ((out[c].lastMember - base) << 8) | 9;  // an operand moving some of its registers only
+			return false;
 		}
 	}
 	return outNum != 0;
@@ -5064,15 +5258,11 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 	hazards = 0;
 	skip = SkipNone;
 	// Walk once: end, highest VGPR touched, and the hazards.
-	uint32_t end = 0, maxVgpr = 0, badAt[8], badNum = 0;
+	uint32_t end = gcn3ProgramEnd(code, got), maxVgpr = 0, badAt[8], badNum = 0;
 	VgprField f[8];
 	uint32_t n;
-	for (uint32_t i = 0; i < got;) {
+	for (uint32_t i = 0; i < (end ? end : got);) {
 		uint32_t w = code[i];
-		if (w == 0xBF810000) {
-			end = i + 1;
-			break;
-		}
 		uint32_t len = gcn3InstLength(code + i, got - i);
 		if (!gcn3VgprFields(code + i, got - i, f, n)) {
 			interpFix.lastUnknownWord = w;
@@ -5221,14 +5411,23 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 							continue;
 						if ((code[i] >> 26) == 0x35 && f[k].shift == 0)
 							continue;  // a v_interp's I/J source
-						if (f[k].count > 1 && !(state[i] & 1) &&
-							(!blockCount || (v == blockBase && f[k].count == blockCount))) {
-							if (!blockCount) {
+						// A register block read, or a read that also sees other values of vI: move the result's whole web
+						// (planBlockMove; a "block" of one register for a mixed read).
+						if (f[k].count > 1 && (blockCount <= 1 || (v == blockBase && f[k].count == blockCount))) {
+							if (blockCount <= 1) {
 								blockBase = v;
 								blockCount = f[k].count;
 								blockAt = i;
 							}
 							continue;  // the same block read again: the block move renames it too
+						}
+						if (f[k].count == 1 && ((state[i] & 1) || renames == arrsize(renameAt))) {
+							if (!blockCount) {
+								blockBase = vI;
+								blockCount = 1;
+								blockAt = i;
+							}
+							continue;
 						}
 						if ((state[i] & 1) || f[k].count > 1 || renames == arrsize(renameAt)) {
 							interpFix.lastSkipWhy = 3;  // a read that sees the result on some paths only
@@ -5294,10 +5493,11 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 				newAllocated = (need + 3) & ~3U;
 			}
 			static RegChange changes[256];
-			uint32_t changeNum = 0;
+			uint32_t changeNum = 0, blockFail = 0;
 			if (!planBlockMove(code, end, at, p2, vI, blockAt, blockBase, blockCount, F, changes, changeNum,
-					arrsize(changes))) {
-				interpFix.lastSkipWhy = 7;  // a block member without a single definition, or a mixed read
+					arrsize(changes), blockFail)) {
+				interpFix.lastBlockFail = blockFail;
+				interpFix.lastSkipWhy = 7;  // see planBlockMove's fail codes
 				skip = SkipRange;
 				return fixedHere;
 			}
@@ -5378,7 +5578,20 @@ struct SeenShader {
 static SeenShader seenShaders[512];
 static uint32_t seenNum, seenNext;
 static uint32_t ibHookCalls, ibHookIbs, ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookBusy, ibHookNoMap,
-	ibHookRaiseOnly;
+	ibHookRaiseOnly, ibHookBinds, ibHookMemoHits;
+// Pixel shader binds answered during the current lock hold (vmCacheGen): address, VMID, RSRC1 in and out.
+struct BindMemo {
+	uint64_t va;
+	uint32_t vmid, rsrcIn, rsrcOut, gen;
+	bool allowBump;
+};
+static BindMemo bindMemo[16];
+static uint32_t bindMemoNext;
+
+// Metal is drawing (the submit hook has seen work): the watcher's start-up diagnostics can quieten down.
+static bool desktopRunning() {
+	return __atomic_load_n(&ibHookCalls, __ATOMIC_RELAXED) > 100;
+}
 static uint64_t ibHookNs;
 
 // Shaders given more VGPRs: every command buffer that binds one must raise RSRC1_PS, even after the seen table has
@@ -5427,7 +5640,8 @@ static uint32_t codeHash(const uint32_t *code, uint32_t n) {
 	return h;
 }
 
-// Read up to max dwords at a GPU VA (page by page through the VM); stops after s_endpgm if stopAtEnd.
+// Read up to max dwords at a GPU VA (page by page through the VM); stops after s_endpgm if stopAtEnd. Only with
+// interpLock held.
 static uint32_t readGpuVa(uint32_t vmid, uint64_t va, uint32_t max, uint32_t *out, bool stopAtEnd) {
 	uint32_t have = 0;
 	while (have < max) {
@@ -5435,7 +5649,7 @@ static uint32_t readGpuVa(uint32_t vmid, uint64_t va, uint32_t max, uint32_t *ou
 		uint32_t chunk = static_cast<uint32_t>((0x1000 - (a & 0xFFF)) / 4);
 		if (chunk > max - have)
 			chunk = max - have;
-		uint64_t phys = ibVaToPhys(vmid, a);
+		uint64_t phys = ibVaToPhysLocked(vmid, a);
 		if (!phys || !ibReadPhys(phys, chunk * 4, out + have))
 			break;
 		have += chunk;
@@ -5473,6 +5687,13 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 		interpFix.probeReverts++;
 	}
 	uint32_t have = readGpuVa(vmid, psVa, arrsize(code), code, true);
+	while (have && have < arrsize(code) && !gcn3ProgramEnd(code, have)) {
+		// An early s_endpgm: the program goes on past the page it ended the read in.
+		uint32_t more = readGpuVa(vmid, psVa + have * 4ULL, arrsize(code) - have, code + have, true);
+		if (!more)
+			break;
+		have += more;
+	}
 	if (!have)
 		return rsrc1;
 	interpFix.shaders++;
@@ -5491,14 +5712,15 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 		if (!listed && skippedNum < arrsize(skippedShaders))
 			skippedShaders[skippedNum++] = {psVa, have,
 				skip == SkipUnknownEncoding ? interpFix.lastUnknownAt : interpFix.lastHazardAt, static_cast<uint32_t>(skip),
-				interpFix.lastSkipWhy, skip == SkipUnknownEncoding ? interpFix.lastUnknownWord : 0};
+				interpFix.lastSkipWhy, skip == SkipUnknownEncoding ? interpFix.lastUnknownWord :
+				interpFix.lastSkipWhy == 7 ? interpFix.lastBlockFail : 0};
 	}
 	bool ok = true;
 	if (fixedHere) {
 		for (uint32_t q = 0; q < have; q++) {
 			if (code[q] == original[q])
 				continue;
-			uint64_t phys = ibVaToPhys(vmid, psVa + q * 4ULL);
+			uint64_t phys = ibVaToPhysLocked(vmid, psVa + q * 4ULL);
 			if (phys && ibWritePhys(phys, 4, &code[q]))
 				interpFix.writes++;
 			else
@@ -5568,9 +5790,25 @@ static void processUserIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords, bool al
 			}
 			if (touched && psLo && rsrc1) {
 				uint64_t psVa = (static_cast<uint64_t>(psHi & 0xFF) << 40) | (static_cast<uint64_t>(psLo) << 8);
-				uint32_t want = handlePixelShader(vmid, psVa, rsrc1, allowBump);
+				// A shader bound again in the same submission was checked (and fixed) moments ago: reuse the answer
+				// instead of reading its fingerprint and probe again.
+				ibHookBinds++;
+				BindMemo *memo = nullptr;
+				for (uint32_t m = 0; m < arrsize(bindMemo) && !memo; m++)
+					if (bindMemo[m].gen == vmCacheGen && bindMemo[m].va == psVa && bindMemo[m].vmid == vmid &&
+						bindMemo[m].rsrcIn == rsrc1 && bindMemo[m].allowBump == allowBump)
+						memo = &bindMemo[m];
+				uint32_t want;
+				if (memo) {
+					want = memo->rsrcOut;
+					ibHookMemoHits++;
+				} else {
+					want = handlePixelShader(vmid, psVa, rsrc1, allowBump);
+					bindMemo[bindMemoNext] = {psVa, vmid, rsrc1, want, vmCacheGen, allowBump};
+					bindMemoNext = (bindMemoNext + 1) % arrsize(bindMemo);
+				}
 				if (allowBump && want != rsrc1 && rsrc1At < got) {
-					uint64_t phys = ibVaToPhys(vmid, ibVa + rsrc1At * 4ULL);
+					uint64_t phys = ibVaToPhysLocked(vmid, ibVa + rsrc1At * 4ULL);
 					if (phys && ibWritePhys(phys, 4, &want)) {
 						buf[rsrc1At] = want;
 						rsrc1 = want;
@@ -5656,6 +5894,7 @@ static void interpFixScan() {
 	if (interpHooked && __atomic_load_n(&ibHookCalls, __ATOMIC_RELAXED))
 		return;  // the submit hook sees everything; don't compete for the lock
 	IOLockLock(interpLock);
+	vmCacheBegin();
 	interpFix.scans++;
 	uint32_t rptr = mmio[0x21C0] & (dwords - 1), found = 0;
 	for (uint32_t back = 4; back < dwords && found < 16; back++) {
@@ -5723,6 +5962,7 @@ static void interpHookBody(uint8_t *info) {
 				__atomic_fetch_sub(&hookDepth, 1, __ATOMIC_ACQ_REL);
 				return;
 			}
+			vmCacheBegin();
 			for (uint32_t i = 0; i < count && i < 8; i++) {
 				uint32_t dw = *reinterpret_cast<uint32_t *>(info + 0x44 + i * 0x28);
 				uint64_t va = *reinterpret_cast<uint64_t *>(info + 0x50 + i * 0x28);
@@ -5981,17 +6221,22 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
-	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u block-moves %u; last loop skip %u target %u at %u len %u\n",
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u block-moves %u; binds %u memo %u walks %u\n",
 		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
 		interpFix.writes, interpFix.writeFails, interpFix.deadRegs, interpFix.bumps, interpHooked, ibHookCalls, ibHookIbs,
 		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap, ibHookRaiseOnly,
-		raisedNum, interpFix.probeReverts, interpFix.blockMoves, interpFix.lastSkipWhy, interpFix.lastLoopTarget, interpFix.lastHazardAt, interpFix.lastShaderLen);
+		raisedNum, interpFix.probeReverts, interpFix.blockMoves, ibHookBinds, ibHookMemoHits, vmWalks);
 	if (skippedNum) {
 		add("interp skipped:");
-		for (uint32_t q = 0; q < skippedNum; q++)
-			add(" %llx(%u dw, at %u, %u/%u%s%x)", skippedShaders[q].va, skippedShaders[q].len, skippedShaders[q].at,
-				skippedShaders[q].reason, skippedShaders[q].why, skippedShaders[q].word ? " word " : "",
-				skippedShaders[q].word);
+		for (uint32_t q = 0; q < skippedNum; q++) {
+			add(" %llx(%u dw, at %u, %u/%u", skippedShaders[q].va, skippedShaders[q].len, skippedShaders[q].at,
+				skippedShaders[q].reason, skippedShaders[q].why);
+			if (skippedShaders[q].word && skippedShaders[q].reason == SkipUnknownEncoding)
+				add(" word %x", skippedShaders[q].word);
+			else if (skippedShaders[q].word)
+				add(" detail %x", skippedShaders[q].word);
+			add(")");
+		}
 		add("\n");
 	}
 	if (!checkKernelArgument("-crnoibdump")) {
