@@ -2668,8 +2668,14 @@ static void smuReadClockTable() {
 // GetFeatureStatus before and after (SclkDpmOn 0x200000).
 static struct {
 	bool done;
-	uint32_t featuresBefore, featuresAfter, resp[5], hardMin, softMax, notes;
+	uint32_t featuresBefore, featuresAfter, resp[5], hardMin, softMax, notes, notesRefused;
 } smuDpm;
+
+// The notes go to CR-progress (nvram185: a new variable, CR-dpm, never appeared; CR-progress is known to take writes).
+static void dpmNote(const char *note) {
+	if (!writeNvramNote("CR-progress", note))
+		smuDpm.notesRefused++;
+}
 
 static void smuEnableSclkDpm() {
 	using namespace Smu8;
@@ -2698,7 +2704,7 @@ static void smuEnableSclkDpm() {
 	smuDpm.hardMin = hardMin = hardMin > top ? top : hardMin;
 	static char note[160];
 	snprintf(note, sizeof(note), "t=%llu enabling sclk dpm L%u-L%u", uptimeMs() / 1000, hardMin, top);
-	writeNvramNote("CR-dpm", note);
+	dpmNote(note);
 	smuSendMessage(GetFeatureStatus, 0);
 	smuDpm.featuresBefore = gpuMmio[ARG];
 	gpuMmio[0x19A] = CgFreqTranVoting0;
@@ -2712,13 +2718,13 @@ static void smuEnableSclkDpm() {
 	traceNote("sclkdpm=%x/%x ", smuDpm.resp[0], smuDpm.featuresAfter);
 	snprintf(note, sizeof(note), "t=%llu sclk dpm on: resp %x %x %x %x features %x", uptimeMs() / 1000, smuDpm.resp[0],
 		smuDpm.resp[1], smuDpm.resp[2], smuDpm.resp[3], smuDpm.featuresAfter);
-	writeNvramNote("CR-dpm", note);
+	dpmNote(note);
 }
 
 static uint32_t interpHookCallCount();
 
 // Flight recorder while SCLK DPM is on: every 10 s (at most 30 times a boot) the time, current/target level, level
-// changes so far, highest level seen, submissions and flips, in NVRAM (CR-dpm). A hard freeze leaves the last one.
+// changes so far, highest level seen, submissions and flips, in NVRAM (CR-progress). A hard freeze leaves the last one.
 static void dpmRecorder(uint32_t t) {
 	static uint32_t lastT;
 	if (!smuDpm.done || smuDpm.resp[0] == 0xDEAD || smuDpm.notes >= 30 || t - lastT < 10)
@@ -2729,7 +2735,7 @@ static void dpmRecorder(uint32_t t) {
 	snprintf(note, sizeof(note), "t=%u note %u: level %u target %u, changes %u, max seen L%u (L%u-L%u allowed), "
 		"submits %u, flips %u", t, smuDpm.notes, (sclkLast >> 16) & 0x1F, (sclkLast >> 21) & 0x1F, sclkChanges,
 		sclkMaxSeen, smuDpm.hardMin, smuDpm.softMax, interpHookCallCount(), flipPerforms);
-	writeNvramNote("CR-dpm", note);
+	dpmNote(note);
 }
 
 static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
@@ -6534,10 +6540,10 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		add("; valid %x max %u\n", valid, maxIndex);
 	}
 	if (smuDpm.done)
-		add("sclk dpm: resp %x %x %x %x %x, L%u-L%u, features %x -> %x (SclkDpmOn %u), level changes %u, max seen L%u\n",
+		add("sclk dpm: resp %x %x %x %x %x, L%u-L%u, features %x -> %x (SclkDpmOn %u), level changes %u, max seen L%u, notes %u refused %u\n",
 			smuDpm.resp[0], smuDpm.resp[1], smuDpm.resp[2], smuDpm.resp[3], smuDpm.resp[4], smuDpm.hardMin,
 			smuDpm.softMax, smuDpm.featuresBefore, smuDpm.featuresAfter, (smuDpm.featuresAfter & Smu8::SclkDpmOn) != 0,
-			sclkChanges, sclkMaxSeen);
+			sclkChanges, sclkMaxSeen, smuDpm.notes, smuDpm.notesRefused);
 	if (skippedNum) {
 		add("interp skipped:");
 		for (uint32_t q = 0; q < skippedNum; q++) {
