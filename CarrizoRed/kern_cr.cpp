@@ -5221,11 +5221,14 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 							continue;
 						if ((code[i] >> 26) == 0x35 && f[k].shift == 0)
 							continue;  // a v_interp's I/J source
-						if (f[k].count > 1 && !(state[i] & 1) && !blockCount) {
-							blockBase = v;
-							blockCount = f[k].count;
-							blockAt = i;
-							continue;
+						if (f[k].count > 1 && !(state[i] & 1) &&
+							(!blockCount || (v == blockBase && f[k].count == blockCount))) {
+							if (!blockCount) {
+								blockBase = v;
+								blockCount = f[k].count;
+								blockAt = i;
+							}
+							continue;  // the same block read again: the block move renames it too
 						}
 						if ((state[i] & 1) || f[k].count > 1 || renames == arrsize(renameAt)) {
 							interpFix.lastSkipWhy = 3;  // a read that sees the result on some paths only
@@ -5247,10 +5250,13 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 					uint32_t v = fieldValue(code + i, f[k]);
 					if (!(v <= vI && vI < v + f[k].count))
 						continue;
-					if (f[k].count > 1 && f[k].read && !blockCount) {
-						blockBase = v;
-						blockCount = f[k].count;
-						blockAt = i;
+					if (f[k].count > 1 && f[k].read &&
+						(!blockCount || (v == blockBase && f[k].count == blockCount))) {
+						if (!blockCount) {
+							blockBase = v;
+							blockCount = f[k].count;
+							blockAt = i;
+						}
 						continue;
 					}
 					if (f[k].count > 1 && (f[k].read || (v != vI && !f[k].exact))) {
