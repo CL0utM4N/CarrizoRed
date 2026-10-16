@@ -4554,7 +4554,7 @@ static uint64_t ibMcToPhys(uint64_t addr, bool system) {
 // go: page tables don't change under a command buffer being submitted. Other callers walk the tables every time.
 struct VmCacheEntry {
 	uint64_t page, phys;
-	uint32_t vmid, gen;
+	uint32_t vmid, gen, flags;  // flags: the PTE's low bits ([0] valid, [1] system, [2] snooped)
 };
 static VmCacheEntry vmCache[64];
 static uint32_t vmCacheGen;
@@ -4569,7 +4569,7 @@ static void vmCacheBegin() {
 		vmCacheGen = 1;
 }
 
-static uint64_t ibVaToPhysWalk(uint32_t vmid, uint64_t va, VmCacheEntry *slot) {
+static uint64_t ibVaToPhysWalk(uint32_t vmid, uint64_t va, VmCacheEntry *slot, uint32_t *flags = nullptr) {
 	auto *mmio = gpuMmio;
 	if (!vmid || vmid > 15)
 		return 0;
@@ -4608,7 +4608,9 @@ static uint64_t ibVaToPhysWalk(uint32_t vmid, uint64_t va, VmCacheEntry *slot) {
 		return 0;
 	uint64_t phys = ibMcToPhys(entry & 0xFFFFFFFFF000ULL, entry & 2);
 	if (slot)
-		*slot = {page, phys, vmid, vmCacheGen};
+		*slot = {page, phys, vmid, vmCacheGen, static_cast<uint32_t>(entry & 0xFFF)};
+	if (flags)
+		*flags = static_cast<uint32_t>(entry & 0xFFF);
 	return phys + (va & 0xFFF);
 }
 
@@ -4617,12 +4619,15 @@ static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va) {
 }
 
 // Only with interpLock held.
-static uint64_t ibVaToPhysLocked(uint32_t vmid, uint64_t va) {
+static uint64_t ibVaToPhysLocked(uint32_t vmid, uint64_t va, uint32_t *flags = nullptr) {
 	uint64_t page = va >> 12;
 	VmCacheEntry *slot = &vmCache[(page ^ (page >> 6) ^ vmid) & (arrsize(vmCache) - 1)];
-	if (slot->gen == vmCacheGen && slot->vmid == vmid && slot->page == page)
+	if (slot->gen == vmCacheGen && slot->vmid == vmid && slot->page == page) {
+		if (flags)
+			*flags = slot->flags;
 		return slot->phys + (va & 0xFFF);
-	return ibVaToPhysWalk(vmid, va, slot);
+	}
+	return ibVaToPhysWalk(vmid, va, slot, flags);
 }
 
 // GFX8 (GCN3) instruction length in dwords, for walking shader code: SOP2/SOPK/SOP1/SOPC/SOPP and VOP1/VOP2/VOPC and
@@ -5021,16 +5026,18 @@ static bool cfgBuild(const uint32_t *code, uint32_t end) {
 // the shader (the first version needed one definition, and gave up past 31 writes of the register). The hazard's p1/p2
 // are in the result's web, so moving it fixes the hazard. A member whose starting value reaches the block read is only
 // moved if it is above the interpolation inputs and nothing but block reads see it (a slot the instruction doesn't
-// use). Instructions that move several members at once (a multi-register operand) must move all of them. Plans the
-// changes; false if the block can't be moved (fail: member << 8 | why).
+// use). An operand naming several members (a multi-register one) moves all of them: when it is in some members' webs
+// only, it joins the others' too (their definitions reaching it, or its write) and the plan is made again
+// (nvram178: three shaders failed that check). Plans the changes; false if the block can't be moved (fail:
+// member << 8 | why).
 struct RegChange {
 	uint32_t at;
 	VgprField field;
 	uint32_t reg;
-	uint32_t votes, lastMember;  // members moving this operand (a multi-register one needs all it names)
+	uint32_t voted;  // members (bit = index in the block) moving this operand
 };
 
-static uint8_t webKind[0x8000], webDef[0x8000], webIn[0x8000], webSeen[0x8000];
+static uint8_t webKind[0x8000], webDef[0x8000], webIn[0x8000], webSeen[0x8000], webEntry[0x8000];
 static uint16_t webStack[0xA000];
 
 static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint32_t p2, uint32_t vI, uint32_t blockAt,
@@ -5054,17 +5061,21 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 				continue;
 			if (out[c].reg != reg)
 				return false;
-			if (out[c].lastMember != member) {
-				out[c].votes++;
-				out[c].lastMember = member;
-			}
+			out[c].voted |= 1U << (member - base);
 			return true;
 		}
 		if (outNum == outMax)
 			return false;
-		out[outNum++] = {i, field, reg, 1, member};
+		out[outNum++] = {i, field, reg, 1U << (member - base)};
 		return true;
 	};
+	// Operands a member must move with the others: instruction position, bit 15 set for its write.
+	static uint16_t forced[16][32];
+	uint32_t forcedNum[16] {};
+	if (k > arrsize(forced))
+		return false;
+	for (uint32_t attempt = 0;; attempt++) {
+	outNum = 0;
 	for (uint32_t r = base; r < base + k; r++) {
 		uint32_t member = (r - base) << 8;
 		// How each instruction writes r: 0 not, 1 writes it, 2 may write it (a register range whose size is a bound).
@@ -5155,6 +5166,13 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 			return false;
 		};
 		join(blockAt);
+		for (uint32_t s = 0; s < forcedNum[r - base]; s++) {
+			uint32_t site = forced[r - base][s] & 0x7FFF;
+			if (forced[r - base][s] & 0x8000)
+				webDef[site] = 1;
+			else
+				join(site);
+		}
 		bool settled = false;
 		for (uint32_t round = 0; round < 256 && !overflow; round++) {
 			if (!flow()) {
@@ -5201,6 +5219,18 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 			fail = member | 3;  // an input (or the result's register on entry) would move
 			return false;
 		}
+		if (entry) {
+			// Where the starting value itself can be read (webEntry bit 0): the definitions in the web don't count.
+			memcpy(webSeen, webDef, end);
+			memset(webDef, 0, end);
+			bool flowed = flow();
+			memcpy(webEntry, webIn, end);
+			memcpy(webDef, webSeen, end);
+			if (!flowed || !flow()) {
+				fail = member | 8;
+				return false;
+			}
+		}
 		for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i)) {
 			uint8_t in = webIn[i];
 			if (!(in & 1) && !webDef[i])
@@ -5227,7 +5257,7 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 					return false;
 				}
 				bool inBlock = v >= base && v + f[q].count <= base + k;
-				if (entry && moveRead && !(v == base && f[q].count == k)) {
+				if (entry && moveRead && (webEntry[i] & 1) && !(v == base && f[q].count == k)) {
 					fail = member | 3;  // the starting value is read outside the block reads: not an unused slot
 					return false;
 				}
@@ -5242,13 +5272,39 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 			}
 		}
 	}
+	bool more = false;
 	for (uint32_t c = 0; c < outNum; c++) {
-		if (out[c].field.count > 1 && out[c].votes != out[c].field.count) {
-			fail = ((out[c].lastMember - base) << 8) | 9;  // an operand moving some of its registers only
-			return false;
+		if (out[c].field.count < 2)
+			continue;
+		uint32_t first = fieldValue(code + out[c].at, out[c].field) - base;
+		uint32_t missing = (((1U << out[c].field.count) - 1) << first) & ~out[c].voted;
+		for (uint32_t m = 0; m < k; m++) {
+			if (!(missing & (1U << m)))
+				continue;
+			// An operand moving some of its registers only: its other members take it into their webs.
+			uint32_t sites[2], siteNum = 0;
+			if (out[c].field.read)
+				sites[siteNum++] = out[c].at;
+			if (out[c].field.write)
+				sites[siteNum++] = out[c].at | 0x8000;
+			for (uint32_t s = 0; s < siteNum; s++) {
+				bool known = false;
+				for (uint32_t q = 0; q < forcedNum[m] && !known; q++)
+					known = forced[m][q] == sites[s];
+				if (known)
+					continue;
+				if (forcedNum[m] == arrsize(forced[m]) || attempt == 16) {
+					fail = (m << 8) | 9;
+					return false;
+				}
+				forced[m][forcedNum[m]++] = static_cast<uint16_t>(sites[s]);
+				more = true;
+			}
 		}
 	}
-	return outNum != 0;
+	if (!more)
+		return outNum != 0;
+	}
 }
 
 static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, uint32_t &hazards, InterpSkip &skip,
@@ -5588,6 +5644,12 @@ struct BindMemo {
 static BindMemo bindMemo[16];
 static uint32_t bindMemoNext;
 
+static uint64_t absToMs(uint64_t abs) {
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(abs, &ns);
+	return ns / 1000000;
+}
+
 // Metal is drawing (the submit hook has seen work): the watcher's start-up diagnostics can quieten down.
 static bool desktopRunning() {
 	return __atomic_load_n(&ibHookCalls, __ATOMIC_RELAXED) > 100;
@@ -5760,9 +5822,29 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 
 // Walk one user command buffer: every pixel shader it binds (SET_SH_REG SPI_SHADER_PGM_LO/HI_PS, RSRC1_PS) gets
 // fixed; with allowBump (before submission) a raised RSRC1_PS is written back into the command buffer.
+// Where the submit hook's time goes (nvram178: ~146 us per command buffer): reading command buffers vs checking the
+// shaders they bind, how much is read, and what kind of memory the command buffers are in (system snooped, system
+// not snooped, carve-out): reads of non-snooped memory must flush the lines first.
+static uint64_t ibReadTime, psCheckTime, ibDwordsRead;
+static uint32_t ibPagesSnooped, ibPagesPlain, ibPagesVram;
+
 static void processUserIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords, bool allowBump) {
 	static uint32_t buf[0x4000];
+	uint64_t t0 = mach_absolute_time();
 	uint32_t got = readGpuVa(vmid, ibVa, dwords < arrsize(buf) ? dwords : arrsize(buf), buf, false);
+	ibReadTime += mach_absolute_time() - t0;
+	ibDwordsRead += got;
+	for (uint64_t page = ibVa & ~0xFFFULL; page < ibVa + got * 4ULL; page += 0x1000) {
+		uint32_t pte = 0;
+		if (!ibVaToPhysLocked(vmid, page, &pte))
+			continue;
+		if (!(pte & 2))
+			ibPagesVram++;
+		else if (pte & 4)
+			ibPagesSnooped++;
+		else
+			ibPagesPlain++;
+	}
 	uint32_t psLo = 0, psHi = 0, rsrc1 = 0, rsrc1At = 0xFFFFFFFF;
 	for (uint32_t j = 0; j < got;) {
 		uint32_t header = buf[j], type = header >> 30;
@@ -5803,7 +5885,9 @@ static void processUserIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords, bool al
 					want = memo->rsrcOut;
 					ibHookMemoHits++;
 				} else {
+					uint64_t t1 = mach_absolute_time();
 					want = handlePixelShader(vmid, psVa, rsrc1, allowBump);
+					psCheckTime += mach_absolute_time() - t1;
 					bindMemo[bindMemoNext] = {psVa, vmid, rsrc1, want, vmCacheGen, allowBump};
 					bindMemoNext = (bindMemoNext + 1) % arrsize(bindMemo);
 				}
@@ -6221,11 +6305,12 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
-	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u block-moves %u; binds %u memo %u walks %u\n",
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u block-moves %u; binds %u memo %u walks %u; ib-read ms %llu ps-check ms %llu ib-dw %llu pages snooped %u plain %u vram %u\n",
 		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
 		interpFix.writes, interpFix.writeFails, interpFix.deadRegs, interpFix.bumps, interpHooked, ibHookCalls, ibHookIbs,
 		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap, ibHookRaiseOnly,
-		raisedNum, interpFix.probeReverts, interpFix.blockMoves, ibHookBinds, ibHookMemoHits, vmWalks);
+		raisedNum, interpFix.probeReverts, interpFix.blockMoves, ibHookBinds, ibHookMemoHits, vmWalks,
+		absToMs(ibReadTime), absToMs(psCheckTime), ibDwordsRead, ibPagesSnooped, ibPagesPlain, ibPagesVram);
 	if (skippedNum) {
 		add("interp skipped:");
 		for (uint32_t q = 0; q < skippedNum; q++) {
