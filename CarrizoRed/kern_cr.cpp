@@ -1031,21 +1031,6 @@ static uint32_t breadcrumbWrites, breadcrumbRefused;
 static bool breadcrumbNoOptions;
 static bool desktopRunning();
 
-// Write an NVRAM variable now (forced sync: a flash write; use sparingly).
-static bool writeNvramNote(const char *name, const char *text) {
-	static IORegistryEntry *options;
-	if (!options && !(options = IORegistryEntry::fromPath("/options", gIODTPlane)))
-		return false;
-	auto *data = OSData::withBytes(text, static_cast<unsigned>(strlen(text)));
-	if (!data)
-		return false;
-	bool ok = options->setProperty(name, data);
-	data->release();
-	options->setProperty("IONVRAM-FORCESYNCNOW-PROPERTY", name);
-	options->setProperty("IONVRAM-SYNCNOW-PROPERTY", name);
-	return ok;
-}
-
 static void writeBreadcrumb(uint32_t t) {
 	static IORegistryEntry *options;
 	static uint32_t lastHead = ~0U, lastIh;
@@ -1110,7 +1095,7 @@ static uint32_t sclkCurrent[32], sclkTarget[32], sclkSamples, sclkLast, gfxVidMi
 static uint32_t sclkPrevLevel, sclkChanges, sclkMaxSeen;
 static void smuReadClockTable();  // defined with the SMU loader
 static void smuEnableSclkDpm();
-static void dpmRecorder(uint32_t t);
+static bool sclkDpmRunning();
 
 static uint32_t smuWindowRead(uint32_t address) {
 	gpuMmio[0x19A] = address;
@@ -1246,13 +1231,14 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		}
 		self->setGpuModel();
 		checkGpuAlive(gpuMmio);
-		if (self->family == ChipFamily::Stoney)
+		// Not while SCLK DPM runs: nvram183/188 froze with it on (both without a report, so the CPU stopped too), and
+		// these SMU register reads every 500 ms are the one thing we do that Linux doesn't (it reads them on request).
+		if (self->family == ChipFamily::Stoney && !sclkDpmRunning())
 			sampleGpuClock();
 		if (self->family == ChipFamily::Stoney && t >= 60)
 			smuReadClockTable();
 		if (self->family == ChipFamily::Stoney && t >= 90)
 			smuEnableSclkDpm();
-		dpmRecorder(t);
 		if (smuLoadOk())
 			fixRbPlus(gpuMmio, self->family == ChipFamily::Stoney);
 		if (smuLoadOk() && self->family == ChipFamily::Stoney)
@@ -2668,14 +2654,9 @@ static void smuReadClockTable() {
 // GetFeatureStatus before and after (SclkDpmOn 0x200000).
 static struct {
 	bool done;
-	uint32_t featuresBefore, featuresAfter, resp[5], hardMin, softMax, notes, notesRefused;
+	uint32_t featuresBefore, featuresAfter, resp[5], hardMin, softMax;
 } smuDpm;
 
-// The notes go to CR-progress (nvram185: a new variable, CR-dpm, never appeared; CR-progress is known to take writes).
-static void dpmNote(const char *note) {
-	if (!writeNvramNote("CR-progress", note))
-		smuDpm.notesRefused++;
-}
 
 static void smuEnableSclkDpm() {
 	using namespace Smu8;
@@ -2702,9 +2683,6 @@ static void smuEnableSclkDpm() {
 	uint32_t hardMin = 2;
 	PE_parse_boot_argn("crsclkmin", &hardMin, sizeof(hardMin));
 	smuDpm.hardMin = hardMin = hardMin > top ? top : hardMin;
-	static char note[160];
-	snprintf(note, sizeof(note), "t=%llu enabling sclk dpm L%u-L%u", uptimeMs() / 1000, hardMin, top);
-	dpmNote(note);
 	smuSendMessage(GetFeatureStatus, 0);
 	smuDpm.featuresBefore = gpuMmio[ARG];
 	gpuMmio[0x19A] = CgFreqTranVoting0;
@@ -2716,26 +2694,11 @@ static void smuEnableSclkDpm() {
 	smuDpm.resp[4] = smuSendMessage(GetFeatureStatus, 0);
 	smuDpm.featuresAfter = gpuMmio[ARG];
 	traceNote("sclkdpm=%x/%x ", smuDpm.resp[0], smuDpm.featuresAfter);
-	snprintf(note, sizeof(note), "t=%llu sclk dpm on: resp %x %x %x %x features %x", uptimeMs() / 1000, smuDpm.resp[0],
-		smuDpm.resp[1], smuDpm.resp[2], smuDpm.resp[3], smuDpm.featuresAfter);
-	dpmNote(note);
 }
 
-static uint32_t interpHookCallCount();
 
-// Flight recorder while SCLK DPM is on: every 10 s (at most 30 times a boot) the time, current/target level, level
-// changes so far, highest level seen, submissions and flips, in NVRAM (CR-progress). A hard freeze leaves the last one.
-static void dpmRecorder(uint32_t t) {
-	static uint32_t lastT;
-	if (!smuDpm.done || smuDpm.resp[0] == 0xDEAD || smuDpm.notes >= 30 || t - lastT < 10)
-		return;
-	lastT = t;
-	smuDpm.notes++;
-	static char note[200];
-	snprintf(note, sizeof(note), "t=%u note %u: level %u target %u, changes %u, max seen L%u (L%u-L%u allowed), "
-		"submits %u, flips %u", t, smuDpm.notes, (sclkLast >> 16) & 0x1F, (sclkLast >> 21) & 0x1F, sclkChanges,
-		sclkMaxSeen, smuDpm.hardMin, smuDpm.softMax, interpHookCallCount(), flipPerforms);
-	dpmNote(note);
+static bool sclkDpmRunning() {
+	return smuDpm.done && smuDpm.resp[0] == 1;
 }
 
 static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
@@ -5837,10 +5800,6 @@ static uint64_t absToMs(uint64_t abs) {
 	return ns / 1000000;
 }
 
-static uint32_t interpHookCallCount() {
-	return __atomic_load_n(&ibHookCalls, __ATOMIC_RELAXED);
-}
-
 // Metal is drawing (the submit hook has seen work): the watcher's start-up diagnostics can quieten down.
 static bool desktopRunning() {
 	return __atomic_load_n(&ibHookCalls, __ATOMIC_RELAXED) > 100;
@@ -6540,10 +6499,10 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		add("; valid %x max %u\n", valid, maxIndex);
 	}
 	if (smuDpm.done)
-		add("sclk dpm: resp %x %x %x %x %x, L%u-L%u, features %x -> %x (SclkDpmOn %u), level changes %u, max seen L%u, notes %u refused %u\n",
+		add("sclk dpm: resp %x %x %x %x %x, L%u-L%u, features %x -> %x (SclkDpmOn %u), level changes %u, max seen L%u (before DPM), now %x\n",
 			smuDpm.resp[0], smuDpm.resp[1], smuDpm.resp[2], smuDpm.resp[3], smuDpm.resp[4], smuDpm.hardMin,
 			smuDpm.softMax, smuDpm.featuresBefore, smuDpm.featuresAfter, (smuDpm.featuresAfter & Smu8::SclkDpmOn) != 0,
-			sclkChanges, sclkMaxSeen, smuDpm.notes, smuDpm.notesRefused);
+			sclkChanges, sclkMaxSeen, gpuMmio ? smuWindowRead(0xD0200014) : 0);
 	if (skippedNum) {
 		add("interp skipped:");
 		for (uint32_t q = 0; q < skippedNum; q++) {
