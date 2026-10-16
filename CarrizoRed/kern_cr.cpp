@@ -1083,6 +1083,36 @@ static mach_vm_address_t orgCommitIb, orgCommitIbFiji;
 static uint64_t wrapCommitIb(void *channel, uint8_t *info);
 static uint64_t wrapCommitIbFiji(void *channel, uint8_t *info);
 
+// GPU clock: the SMU's current and target SCLK DPM level (ixTARGET_AND_CURRENT_PROFILE_INDEX, SMC 0xD0200014: current
+// [20:16], target [25:21]; Linux smu8_read_sensor) and the GFX rail's voltage ID (ixSMUSVI_GFX_CURRENTVID 0xD8230048
+// [31:24], mV = (6200 - 25 * vid) / 4), sampled every 500 ms. Read through MP0PUB_IND_INDEX_13/DATA_13 (0x19A/0x19B):
+// Apple's PowerPlay uses window 0 (0x180/0x181), and a read between its index write and data access would send its
+// access to the wrong address. No SMU messages (the mailbox is Apple's). Levels map to MHz through the VBIOS clock
+// table.
+static uint32_t sclkCurrent[32], sclkTarget[32], sclkSamples, sclkLast, gfxVidMin = ~0U, gfxVidMax;
+
+static uint32_t smuWindowRead(uint32_t address) {
+	gpuMmio[0x19A] = address;
+	return gpuMmio[0x19B];
+}
+
+static void sampleGpuClock() {
+	if (!gpuMmio || !smuLoadOk())
+		return;
+	uint32_t profile = smuWindowRead(0xD0200014);
+	if (profile == 0xFFFFFFFF)
+		return;
+	sclkLast = profile;
+	sclkCurrent[(profile >> 16) & 0x1F]++;
+	sclkTarget[(profile >> 21) & 0x1F]++;
+	uint32_t vid = smuWindowRead(0xD8230048) >> 24;
+	if (vid < gfxVidMin)
+		gfxVidMin = vid;
+	if (vid > gfxVidMax)
+		gfxVidMax = vid;
+	sclkSamples++;
+}
+
 void CRDriver::watcherThread(void *arg, wait_result_t) {
 	auto *self = static_cast<CRDriver *>(arg);
 	static char last[1536], now[1536];
@@ -1189,6 +1219,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		}
 		self->setGpuModel();
 		checkGpuAlive(gpuMmio);
+		if (self->family == ChipFamily::Stoney)
+			sampleGpuClock();
 		if (smuLoadOk())
 			fixRbPlus(gpuMmio, self->family == ChipFamily::Stoney);
 		if (smuLoadOk() && self->family == ChipFamily::Stoney)
@@ -6887,6 +6919,20 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 			};
 			add("smu: version %x load-status %x signature %x; msg %x resp %x arg %x\n", smuSram(0), smuSram(0x18),
 				smuSram(0x7C), gpuMmio[0x1C0], gpuMmio[0x1D0], gpuMmio[0x1E0]);
+			// The clock samples (sampleGpuClock); "window" is the firmware version read through window 13, which must
+			// match the version above for the samples to mean anything.
+			add("gpu clock: samples %u, last %x, window %x; current level:", sclkSamples, sclkLast,
+				smuWindowRead(0x10000000 + 0x1FF80));
+			for (uint32_t level = 0; level < arrsize(sclkCurrent); level++)
+				if (sclkCurrent[level])
+					add(" L%u %u", level, sclkCurrent[level]);
+			add("; target:");
+			for (uint32_t level = 0; level < arrsize(sclkTarget); level++)
+				if (sclkTarget[level])
+					add(" L%u %u", level, sclkTarget[level]);
+			if (sclkSamples && gfxVidMax <= 248)
+				add("; gfx %u-%u mV", (6200 - 25 * gfxVidMax) / 4, (6200 - 25 * gfxVidMin) / 4);
+			add("\n");
 		}
 		// Our SMU load (smuLoadFirmware): CAIL's block and our region, the SMU's answers to DriverDramAddrHi/Lo,
 		// InitJobs and the three ExecuteJobs (1 = OK; Bxxxx busy, Cxxxx no answer), UcodeLoadStatus before/after.
