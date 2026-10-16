@@ -1092,6 +1092,7 @@ static uint64_t wrapCommitIbFiji(void *channel, uint8_t *info);
 // access to the wrong address. No SMU messages (the mailbox is Apple's). Levels map to MHz through the VBIOS clock
 // table.
 static uint32_t sclkCurrent[32], sclkTarget[32], sclkSamples, sclkLast, gfxVidMin = ~0U, gfxVidMax;
+static void smuReadClockTable();  // defined with the SMU loader
 
 static uint32_t smuWindowRead(uint32_t address) {
 	gpuMmio[0x19A] = address;
@@ -1223,6 +1224,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		checkGpuAlive(gpuMmio);
 		if (self->family == ChipFamily::Stoney)
 			sampleGpuClock();
+		if (self->family == ChipFamily::Stoney && t >= 60)
+			smuReadClockTable();
 		if (smuLoadOk())
 			fixRbPlus(gpuMmio, self->family == ChipFamily::Stoney);
 		if (smuLoadOk() && self->family == ChipFamily::Stoney)
@@ -2287,6 +2290,8 @@ namespace Smu8 {
 	static constexpr uint32_t MP0PUB_IND_INDEX = 0x180, MP0PUB_IND_DATA = 0x181, MSG = 0x1C0, RESP = 0x1D0, ARG = 0x1E0;
 	static constexpr uint32_t SramBase = 0x10000000, UcodeLoadStatus = 0x1FF80 + 0x18;  // SMU8_Firmware_Header
 	static constexpr uint16_t DriverDramAddrHi = 0x33, DriverDramAddrLo = 0x34, InitJobs = 0x252, ExecuteJob = 0x254;
+	static constexpr uint16_t GetMaxSclkLevel = 0x3B, SetClkTableAddrHi = 0x49, SetClkTableAddrLo = 0x4A,
+	                          ClkTableXferToDram = 0x267;  // cz_ppsmc.h
 	// UCODE_ID_* (smu_ucode_xfer_cz.h); Stoney has no SDMA1 or MEC2, Linux maps them to SDMA0 and MEC_JT1.
 	static constexpr uint8_t SDMA0 = 0, CE = 2, PFP = 3, ME = 4, MEC_JT1 = 5, RLC_G = 8, RLC_SCRATCH = 9,
 	                         RLC_SRM_ARAM = 10, RLC_SRM_DRAM = 11;
@@ -2317,7 +2322,8 @@ namespace Smu8 {
 static mach_vm_address_t orgStoneyFormatSmuDram, orgStoneyLoadRlcUcode;
 static Smu8::CailUcode **stoneyUcodeInfo;  // RLC, SDMA0, SDMA1 (skipped), CE, PFP, ME, MEC1, MEC2 (skipped)
 static uint32_t smuFormatCalls, smuCailSize, smuRegionStart;
-static uint16_t smuCpReloadTask = 0xFFFF;
+static uint16_t smuCpReloadTask = 0xFFFF, smuClkTableJob = 0xFFFF;
+static uint32_t smuClkTableAt;  // the clock table scratch buffer's offset in our region
 static struct {
 	uint32_t count, before, after, ms, resp;
 	uint64_t at;
@@ -2497,6 +2503,8 @@ static void smuLoadFirmware(void *cail) {
 	load(ME, Me, false);
 	load(MEC_JT1, Mec, false);
 	load(RLC_G, Rlc, true);
+	smuClkTableJob = used;
+	smuClkTableAt = scratchAt[ClkTable];
 	scratch(TaskInitialize, ArgInitClkTable, ClkTable, true);
 	// Not in Linux's TOC: the CP alone (CE, PFP, ME, MEC jump table), for reloading after Apple's GPU reset.
 	smuCpReloadTask = used;
@@ -2588,6 +2596,39 @@ static void smuReloadCp() {
 
 static bool smuLoadOk() {
 	return smuLoad.result && !strcmp(smuLoad.result, "loaded");
+}
+
+// The SMU's graphics clock table, read once (nvram180: the current/target DPM level never left 0 and Apple's
+// PowerPlay runs its dummy back end, so nobody started SCLK DPM). What Linux's smu8_download_pptable_settings does:
+// SetClkTableAddrHi/Lo, ExecuteJob(the clock table job), ClkTableXferToDram; then the SclkBreakdownTable
+// (SMU8_Fusion_ClkTable's first 116 bytes: 8 levels and the DPM-off level, 12 bytes each - GnbVid, GfxVid, DfsDid,
+// DeepSleepDid, DfsBypass, Frequency in 10 kHz - then SclkValidMask and MaxSclkIndex). Also GetMaxSclkLevel. Nothing
+// is written to the SMU's state. -crnoclkread disables it.
+static struct {
+	bool done;
+	uint32_t resp[5], maxLevel;
+	uint8_t table[116];
+} smuClk;
+
+static void smuReadClockTable() {
+	using namespace Smu8;
+	if (smuClk.done || !smuLoadOk() || smuClkTableJob == 0xFFFF || checkKernelArgument("-crnoclkread"))
+		return;
+	smuClk.done = true;
+	uint64_t mc = smuLoad.mc + smuClkTableAt, phys = smuLoad.phys + smuClkTableAt;
+	smuClk.resp[0] = smuSendMessage(GetMaxSclkLevel, 0);
+	smuClk.maxLevel = gpuMmio[ARG];
+	smuClk.resp[1] = smuSendMessage(SetClkTableAddrHi, static_cast<uint32_t>(mc >> 32));
+	smuClk.resp[2] = smuSendMessage(SetClkTableAddrLo, static_cast<uint32_t>(mc));
+	smuClk.resp[3] = smuSendMessage(ExecuteJob, smuClkTableJob);
+	smuClk.resp[4] = smuSendMessage(ClkTableXferToDram, 0);
+	auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, sizeof(smuClk.table), kIODirectionIn);
+	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+	if (map)
+		memcpy(smuClk.table, reinterpret_cast<const void *>(map->getVirtualAddress()), sizeof(smuClk.table));
+	OSSafeReleaseNULL(map);
+	OSSafeReleaseNULL(desc);
+	traceNote("smuclk=%x ", smuClk.resp[4]);
 }
 
 static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
@@ -6369,6 +6410,24 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 	if (sclkSamples && gfxVidMax <= 248)
 		add("; gfx %u-%u mV", (6200 - 25 * gfxVidMax) / 4, (6200 - 25 * gfxVidMin) / 4);
 	add("\n");
+	if (smuClk.done) {
+		// sclk levels: MHz/DfsDid/GfxVid/GnbVid; "off" is the level used while DPM is off.
+		add("smu clock table: resp %x %x %x %x %x, max level %u; sclk", smuClk.resp[0], smuClk.resp[1], smuClk.resp[2],
+			smuClk.resp[3], smuClk.resp[4], smuClk.maxLevel);
+		for (uint32_t level = 0; level < 9; level++) {
+			const uint8_t *l = smuClk.table + level * 12;
+			uint32_t freq = 0;
+			memcpy(&freq, l + 8, 4);
+			if (level == 8)
+				add("; off %u/%x/%x/%x", freq / 100, l[2], l[1], l[0]);
+			else
+				add(" %u/%x/%x/%x", freq / 100, l[2], l[1], l[0]);
+		}
+		uint32_t valid = 0, maxIndex = 0;
+		memcpy(&valid, smuClk.table + 108, 4);
+		memcpy(&maxIndex, smuClk.table + 112, 4);
+		add("; valid %x max %u\n", valid, maxIndex);
+	}
 	if (skippedNum) {
 		add("interp skipped:");
 		for (uint32_t q = 0; q < skippedNum; q++) {
