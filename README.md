@@ -13,14 +13,15 @@ used them), so on a hackintosh they've only had the firmware framebuffer.
 **What it does today:** on a Stoney Ridge laptop, macOS Sequoia boots to the desktop and drives the built-in panel
 through Apple's own Polaris display driver, instead of the firmware's fixed framebuffer. **Metal acceleration works
 and the desktop renders correctly:** WindowServer draws the login screen and desktop through the GPU, apps use Metal,
-and vibrancy, text, icons and the Dock draw properly. A few rarer shaders may still draw wrong, and it needs longer
-testing.
+and vibrancy, text, icons and the Dock draw properly. Folder icons still draw as flat blue squares, and it needs
+longer testing. The GPU runs at a fixed clock unless the experimental clock scaling below is turned on.
 
 | | Status |
 |---|---|
 | Built-in eDP panel | **Works** (1366×768) through Apple's `AMD9500Controller` / `AMDFramebuffer`: Recovery, the installer and an installed Sequoia 15.8.1 |
 | Display interrupts (vblank) | **Works** |
-| Acceleration / Metal (`AMDRadeonX4000`) | **Works.** The SMU loads the GPU microcode, the command processor and SDMA run, interrupts work, and WindowServer and apps render with Metal. Apple's shader compiler emits an interpolation pattern Stoney's 16-bank LDS gets wrong; CarrizoRed fixes the compiled pixel shaders before the GPU runs them (about 2–3% of one CPU core). Boot with `-crnoaccel` for an unaccelerated desktop |
+| Acceleration / Metal (`AMDRadeonX4000`) | **Works.** The SMU loads the GPU microcode, the command processor and SDMA run, interrupts work, and WindowServer and apps render with Metal. Apple's shader compiler emits an interpolation pattern Stoney's 16-bank LDS gets wrong; CarrizoRed fixes the compiled pixel shaders before the GPU runs them (about 0.1% of one CPU core). Boot with `-crnoaccel` for an unaccelerated desktop |
+| GPU clock scaling (SCLK DPM) | **Experimental, off by default.** Apple's PowerPlay runs its Dummy back end here, so nothing starts the SMU's clock scaling and the GPU stays at one fixed low clock (the SMU reports level 0, 200 MHz). `-crsclkdpm` starts it (400–847 MHz, from the SMU's own clock table). Some boots freeze with it on; under investigation |
 | Brightness, external displays (HDMI), sleep/wake, HDMI audio | Not done or untested |
 | Video decode/encode (UVD/VCE) | Not supported yet (the engines need SMU power messages; CarrizoRed only uses the SMU for microcode so far) |
 | Carrizo / Bristol Ridge | Same display engine and code paths, **untested** (no hardware) |
@@ -29,7 +30,7 @@ testing.
 
 | Machine | APU | macOS | Result |
 |---|---|---|---|
-| ASUS VivoBook 15 D509BA | A9-9425 (Stoney Ridge, Radeon R5) | Sequoia 15.4 (Recovery, installer), 15.8.1 (installed) | Display and Metal acceleration work; desktop renders correctly |
+| ASUS VivoBook 15 D509BA | A9-9425 (Stoney Ridge, Radeon R5) | Sequoia 15.4 (Recovery, installer), 15.8.1 (installed) | Display and Metal acceleration work; desktop renders correctly except folder icons |
 
 Reports from other Carrizo, Bristol Ridge or Stoney machines are welcome once it's further along; open an issue with
 the model and the black-box report (see *Installing*).
@@ -60,13 +61,20 @@ The accelerator so far needed:
 And Metal needed:
 - the compiled pixel shaders fixed for Stoney's 16-bank LDS: `v_interp_p1_f32` must not write the VGPR it reads, and
   Apple's shader compiler (even its own Stoney back end) does that for the last component of an attribute. CarrizoRed
-  rewrites those shaders in GPU memory as each command buffer is submitted, before the GPU runs them;
+  rewrites those shaders in GPU memory as each command buffer is submitted, before the GPU runs them. When the
+  broken result is part of a register block (an image coordinate), the whole block moves to fresh registers;
 - the small-primitive filter off, the 2-pipe walk fence and no delta colour compression (Polaris settings Mesa doesn't
   use on Stoney), and the Metal compiler switched to its Stoney back end (patched in the dyld shared cache);
 - the GPU and CPU named after the APU in About This Mac.
 
-Still open: a few shaders the fix has to leave alone (rare); the GPU occasionally not responding after a warm restart
-(power off fully); and stability over longer sessions. HWLibs patches not taking at boot turned out to be Lilu's
+Still open:
+- folder icons drawn as flat blue squares (the folder shape's mask isn't applied);
+- freezes on some boots with clock scaling (`-crsclkdpm`) on;
+- a few shaders the fix has to leave alone (rare);
+- the GPU occasionally not responding after a warm restart (power off fully);
+- stability over longer sessions.
+
+ HWLibs patches not taking at boot turned out to be Lilu's
 trampoline buffer running out; CarrizoRed now builds its own trampolines.
 
 Each fix is documented in the code, in [docs/TEST_MACHINES.md](docs/TEST_MACHINES.md) and in
@@ -76,7 +84,7 @@ Each fix is documented in the code, in [docs/TEST_MACHINES.md](docs/TEST_MACHINE
 
 | APU family | Examples | PCI ID | GFX | Display | Status |
 |---|---|---|---|---|---|
-| Stoney Ridge | A9-9420/9425, A6-9220/9225, A4-9120, E2-9000 | 1002:98E4 | gfx810 | DCE 11.0, 2 pipes | Display working, acceleration in progress (D509BA) |
+| Stoney Ridge | A9-9420/9425, A6-9220/9225, A4-9120, E2-9000 | 1002:98E4 | gfx810 | DCE 11.0, 2 pipes | Display and Metal working (D509BA) |
 | Carrizo / Bristol Ridge | A12-9800, A10-9700, FX-9800P, A10-8700P, FX-8800P | 1002:9870, 9874–9877 | gfx801 | DCE 11.0, 3 pipes | Untested |
 
 Older GCN 2 APUs (Kaveri, Kabini, Beema/Mullins) may follow later. Sequoia still contains AMD's init code and
@@ -207,7 +215,7 @@ and the list of affected machines.
 | `-crnohwlibsprobe` | Skip the test write into HWLibs' code at `setupCAIL` (used to check whether patches can land) |
 | `-crnotrace` | No bring-up stage tracing |
 | `-crnowatch`, `-crnowatchdog` | No periodic watcher output / no watchdog panic for a traced call that hangs |
-| `-crnobreadcrumb` | Don't write the latest trace progress to the NVRAM variable `CR-progress` (kept for boots that end in a hard reset, where no panic report is written) |
+| `-crnobreadcrumb` | Don't write the latest trace progress to the NVRAM variable `CR-progress` during start-up (kept for boots that end in a hard reset, where no panic report is written; it stops once Metal is drawing) |
 | `-crnoreglog`, `-crreglogall`, `-crreglogintsoff` | No register logging / log every access from probe / print interrupts-off lines directly |
 | `-crnoatomlog` | Don't record VBIOS command-table calls for the black box |
 | `-crnommio` | Skip the MMIO register probe |
@@ -222,6 +230,9 @@ and the list of affected machines.
 | `-crnoaudio`, `-crnotcon` | Force `CFG_NO_AUDIO` on / `CFG_USE_TCON` off |
 | `-crrestore` | Write the firmware's boot values back into pipe 0's processing chain and hold them (display bisect) |
 | `-crmacgpu` | Neutralise AGDP's board-id lookup; set `built-in` and `AAPL,slot-name` on the iGPU |
+| `-crsclkdpm` | Start the SMU's graphics clock scaling at 90 s (experimental; some boots freeze) |
+| `crsclkmin=N`, `crsclkmax=N` | With `-crsclkdpm`: the lowest and highest clock level (defaults 2 and 6: 400 and 847 MHz; levels 0–7 are 200–900 MHz) |
+| `-crnoclkread` | Don't read the SMU's clock table into the report |
 | `-crnomodel` | Leave the iGPU's `model` alone (by default it is named from the CPU brand string, e.g. "AMD Radeon R5 Graphics", or a `model` from DeviceProperties is kept) |
 
 ## Layout
