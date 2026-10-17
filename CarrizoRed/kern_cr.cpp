@@ -2672,7 +2672,8 @@ static void smuReadClockTable() {
 // SCLK DPM, opt-in (-crsclkdpm): what Linux's smu8_enable_dpm_tasks and smu8_update_sclk_limit send, once the clock
 // table has been read and holds every level (nvram181: 200-900 MHz, as in the VBIOS). Voting clients
 // (CG_FREQ_TRAN_VOTING_0), EnableAllSmuFeatures(SCLK_DPM_MASK), then hard min crsclkmin (default level 2, 400 MHz:
-// the clock the firmware boots with, so it never runs slower than without DPM), soft min 0, soft max the top level.
+// the clock the firmware boots with), soft min the same, soft max crsclkmax (default 6). crsclkmin = crsclkmax pins one
+// level: nvram183-203 froze on 5 of 11 DPM boots, so pinning separates the switching from the clock itself.
 // GetFeatureStatus before and after (SclkDpmOn 0x200000).
 static struct {
 	bool done;
@@ -2711,7 +2712,7 @@ static void smuEnableSclkDpm() {
 	gpuMmio[0x19B] = VotingRightsDefault;
 	smuDpm.resp[0] = smuSendMessage(EnableAllSmuFeatures, SclkDpmMask);
 	smuDpm.resp[1] = smuSendMessage(SetSclkHardMin, hardMin);
-	smuDpm.resp[2] = smuSendMessage(SetSclkSoftMin, 0);
+	smuDpm.resp[2] = smuSendMessage(SetSclkSoftMin, hardMin);  // = hard min: crsclkmin=crsclkmax pins one level
 	smuDpm.resp[3] = smuSendMessage(SetSclkSoftMax, top);
 	// smu8_set_power_state_tasks also sets the deep-sleep floor (SMU8_MIN_DEEP_SLEEP_SCLK, 8 MHz, when the display
 	// gives none) and the watermark frequency (the soft max clock, 10 kHz units).
