@@ -4682,6 +4682,18 @@ static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out, bool coherent =
 	// Only RAM and the carve-out (below 8.5 GB here), never the PCI hole.
 	if (!phys || (phys >= 0xC0000000ULL && phys < 0x100000000ULL) || phys + bytes > 0x220000000ULL)
 		return false;
+	// -crnocarvewb: the carve-out through its uncached mapping again, as before nvram180. Reading it through the
+	// physmap's cached mapping as well aliases two memory types on the same RAM, which x86 leaves undefined; the
+	// freezes since nvram183 can't yet be told apart from SCLK DPM, which arrived three boots later.
+	static int carveWbOff = -1;
+	if (carveWbOff < 0)
+		carveWbOff = checkKernelArgument("-crnocarvewb") ? 1 : 0;
+	if (carveWbOff) {
+		if (auto *fast = carvePtr(phys, bytes)) {
+			memcpy(out, fast, bytes);
+			return true;
+		}
+	}
 	if (auto *direct = physmapPtr(phys, bytes)) {
 		if (!coherent)
 			flushLines(direct, bytes);
