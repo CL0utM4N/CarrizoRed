@@ -4675,19 +4675,19 @@ static uint8_t *carvePtr(uint64_t phys, uint32_t bytes) {
 }
 
 // coherent: system memory the GPU snoops (PTE bits system + snooped), which the CPU caches stay coherent with: no flush
-// needed. Everything else is read through the physmap after flushing the lines, the carve-out too: its uncached
-// mapping reads 8 bytes per memory access, a cache line fill 64 (nvram179: command buffers and shader code in the
-// carve-out made most of the submit hook's time).
+// needed. Other system memory is read through the physmap after flushing the lines. The carve-out goes through its
+// uncached mapping (8 bytes per memory access) unless -crcarvewb (the physmap, a 64-byte line fill: faster, but see
+// below).
 static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out, bool coherent = false) {
 	// Only RAM and the carve-out (below 8.5 GB here), never the PCI hole.
 	if (!phys || (phys >= 0xC0000000ULL && phys < 0x100000000ULL) || phys + bytes > 0x220000000ULL)
 		return false;
-	// -crnocarvewb: the carve-out through its uncached mapping again, as before nvram180. Reading it through the
-	// physmap's cached mapping as well aliases two memory types on the same RAM, which x86 leaves undefined; the
-	// freezes since nvram183 can't yet be told apart from SCLK DPM, which arrived three boots later.
+	// The carve-out through its uncached mapping (as before nvram180) unless -crcarvewb. Reading it through the
+	// physmap's cached mapping as well aliases two memory types on the same RAM, which x86 leaves undefined, and the
+	// freezes seen since (6 of 15 boots, all with SCLK DPM on, nvram183-123) started three boots after that change.
 	static int carveWbOff = -1;
 	if (carveWbOff < 0)
-		carveWbOff = checkKernelArgument("-crnocarvewb") ? 1 : 0;
+		carveWbOff = checkKernelArgument("-crcarvewb") ? 0 : 1;
 	if (carveWbOff) {
 		if (auto *fast = carvePtr(phys, bytes)) {
 			memcpy(out, fast, bytes);
