@@ -149,7 +149,7 @@ struct TraceEvent {
 	bool exit;
 };
 
-static constexpr size_t TraceRingSize = 512, MaxTraceStages = 160;
+static constexpr size_t TraceRingSize = 512, MaxTraceStages = 192;
 static constexpr uint64_t WatchdogMs = 60000;
 static TraceEvent traceRing[TraceRingSize];
 static uint32_t traceHead;
@@ -1221,6 +1221,7 @@ static bool diskLogAppend(const char *text, size_t len) {
 
 static uint32_t hookCallCount();
 static uint32_t interpFixedCount();
+static bool videoPowered();
 static void censusLog();
 static const char *sclkDpmState();
 
@@ -1266,6 +1267,13 @@ static void diskLogTick(uint32_t t, uint32_t stallTicks) {
 			__atomic_load_n(&flipPerforms, __ATOMIC_RELAXED), __atomic_load_n(&flipIrqs, __ATOMIC_RELAXED),
 			hookCallCount(), interpFixedCount(), mmio[0x1C0], mmio[0x1D0], mmio[0x1E0], stallTicks, sclkDpmState(),
 			__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), ihStormFalseAlarms, ihStormBroken ? 1U : 0U);
+		if (videoPowered()) {
+			// UVD: STATUS, VCPU_CNTL, SOFT_RESET, LMI_STATUS, ring rptr/wptr; VCE: STATUS, VCPU_CNTL, SOFT_RESET, ring.
+			if (len)
+				len--;  // drop the newline, append to the same line
+			add(" | uvd %x %x %x %x %x/%x vce %x %x %x %x/%x\n", mmio[0x3DAF], mmio[0x3D98], mmio[0x3DA0], mmio[0x3D67],
+				mmio[0x3DA4], mmio[0x3DA5], mmio[0x8001], mmio[0x8005], mmio[0x8048], mmio[0x8063], mmio[0x8064]);
+		}
 	} else {
 		add("%llu | t=%u, GPU not up yet\n", ms, t);
 	}
@@ -1770,6 +1778,12 @@ namespace {
 		{"__ZN26AMDRadeonX4000_AMDHardware9setupCAILEv", "hw.setupCAIL", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware11powerUpCAILEv", "hw.powerUpCAIL", InAccel, true, true, 0},
 		{"__ZN32AMDRadeonX4000_AMDBaffinHardware7powerUpEv", "hw.powerUp", InAccel, true, true, 0},
+		// Video engines (docs/VIDEO.md; powered only with -crvideo): firmware load and start, results in the summary.
+		{"__ZN29AMDRadeonX4000_AMDUVDHWEngine9loadUVDFWEv", "uvd.loadFW", InAccel, true, false, 0},
+		{"__ZN29AMDRadeonX4000_AMDUVDHWEngine5startEv", "uvd.start", InAccel, true, false, 0},
+		{"__ZN29AMDRadeonX4000_AMDUVDHWEngine13startRBEngineEv", "uvd.startRB", InAccel, true, false, 0},
+		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine6loadFWEv", "vce.loadFW", InAccel, true, false, 0},
+		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine5startEv", "vce.start", InAccel, true, false, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware23allocateMemoryResourcesEv", "hw.allocateMemoryResources", InAccel, true, true, 0},
 		{"__ZN28AMDRadeonX4000_AMDVIHardware16initializeVMRegsEv", "hw.initializeVMRegs", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware27initializeHardwareRegistersEv", "hw.initializeHardwareRegisters", InAccel, true, true, 0},
@@ -2250,12 +2264,19 @@ bool CRDriver::wrapAllocateHWEngines(void *that) {
 // programming a gated block can hang the bus. Releasing the engines made AMDGraphicsAccelerator::start fail (nvram68,
 // then a NULL dereference in its clean-up path), so they stay; only their power-up is skipped: the slots are emptied
 // for the duration of AMDHardware::powerUpHWEngines, whose loop skips empty slots. -crmm powers them up too.
+// -crvideo (stage 1 of docs/VIDEO.md): first have the SMU power UVD and VCE up (UVDPowerON / VCEPowerON, as Linux
+// smu8_dpm_powergate_uvd/vce do), then let Apple power those two up; SAMU stays skipped.
+static void smuVideoPowerOn();
+
 static bool wrapPowerUpHWEngines(void *that) {
 	static const uint32_t multimedia[] {0x3D8, 0x3E8, 0x400};
 	void *saved[arrsize(multimedia)] {};
+	bool video = checkKernelArgument("-crvideo");
+	if (video)
+		smuVideoPowerOn();
 	bool skip = !checkKernelArgument("-crmm");
 	if (skip) {
-		for (size_t i = 0; i < arrsize(multimedia); i++) {
+		for (size_t i = video ? 2 : 0; i < arrsize(multimedia); i++) {
 			auto &engine = *reinterpret_cast<void **>(static_cast<uint8_t *>(that) + multimedia[i]);
 			saved[i] = engine;
 			if (engine)
@@ -2501,6 +2522,8 @@ namespace Smu8 {
 	                          SetMinDeepSleepSclk = 0x11, SetWatermarkFrequency = 0x26E;  // cz_ppsmc.h
 	static constexpr uint32_t SclkDpmMask = 0x80000, SclkDpmOn = 0x200000;  // SCLK_DPM_MASK, scoreboard SclkDpmOn
 	static constexpr uint32_t CgFreqTranVoting0 = 0xD02001A8, VotingRightsDefault = 0x3FFFC102;
+	static constexpr uint16_t UvdPowerOn = 0x8, VcePowerOn = 0xA;
+	static constexpr uint32_t UvdDpmMask = 0x10000, VceDpmMask = 0x400000;
 	// UCODE_ID_* (smu_ucode_xfer_cz.h); Stoney has no SDMA1 or MEC2, Linux maps them to SDMA0 and MEC_JT1.
 	static constexpr uint8_t SDMA0 = 0, CE = 2, PFP = 3, ME = 4, MEC_JT1 = 5, RLC_G = 8, RLC_SCRATCH = 9,
 	                         RLC_SRM_ARAM = 10, RLC_SRM_DRAM = 11;
@@ -2836,6 +2859,32 @@ static void smuReloadCp() {
 
 static bool smuLoadOk() {
 	return smuLoad.result && !strcmp(smuLoad.result, "loaded");
+}
+
+// -crvideo: UVD and VCE powered up by the SMU (static power gating off: argument 0) and their DPM on, before Apple
+// powers the engines. Their registers may only be read once this has answered (a gated block can hang the bus).
+static struct {
+	bool done;
+	uint32_t resp[3];
+	uint64_t ms;
+} smuVideo;
+
+static void smuVideoPowerOn() {
+	using namespace Smu8;
+	if (smuVideo.done || !gpuMmio)
+		return;
+	smuVideo.done = true;
+	smuVideo.ms = uptimeMs();
+	smuVideo.resp[0] = smuSendMessage(UvdPowerOn, 0);
+	smuVideo.resp[1] = smuSendMessage(VcePowerOn, 0);
+	smuVideo.resp[2] = smuSendMessage(EnableAllSmuFeatures, UvdDpmMask | VceDpmMask);
+	diskLogEvent("video power on: UVDPowerON %x, VCEPowerON %x, UVD/VCE DPM %x", smuVideo.resp[0], smuVideo.resp[1],
+		smuVideo.resp[2]);
+	traceNote("video=%x/%x/%x ", smuVideo.resp[0], smuVideo.resp[1], smuVideo.resp[2]);
+}
+
+static bool videoPowered() {
+	return smuVideo.done && smuVideo.resp[0] == 1 && smuVideo.resp[1] == 1;
 }
 
 // The SMU's graphics clock table, read once (nvram180: the current/target DPM level never left 0 and Apple's
@@ -6939,6 +6988,11 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 		memcpy(&maxIndex, smuClk.table + 112, 4);
 		add("; valid %x max %u\n", valid, maxIndex);
 	}
+	if (smuVideo.done)
+		add("video: power on at %llu ms, UVDPowerON %x VCEPowerON %x DPM %x; uvd status %x vcpu %x reset %x, vce status %x vcpu %x reset %x\n",
+			smuVideo.ms, smuVideo.resp[0], smuVideo.resp[1], smuVideo.resp[2], videoPowered() ? gpuMmio[0x3DAF] : 0,
+			videoPowered() ? gpuMmio[0x3D98] : 0, videoPowered() ? gpuMmio[0x3DA0] : 0,
+			videoPowered() ? gpuMmio[0x8001] : 0, videoPowered() ? gpuMmio[0x8005] : 0, videoPowered() ? gpuMmio[0x8048] : 0);
 	if (smuDpm.done)
 		add("sclk dpm: resp %x %x %x %x %x, L%u-L%u, features %x -> %x (SclkDpmOn %u), level changes %u, max seen L%u (before DPM), now %x; deep sleep %x watermark %x; mailbox msg %x resp %x arg %x, foreign %u:",
 			smuDpm.resp[0], smuDpm.resp[1], smuDpm.resp[2], smuDpm.resp[3], smuDpm.resp[4], smuDpm.hardMin,
