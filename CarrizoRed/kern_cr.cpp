@@ -17,6 +17,11 @@
 #include <IOKit/IODeviceTreeSupport.h>
 #include <kern/thread.h>
 #include <kern/debug.h>
+#include <kern/clock.h>
+#include <pexpert/pexpert.h>
+#include <sys/fcntl.h>
+#include <sys/vnode.h>
+#include <sys/vnode_if.h>
 #include <stdarg.h>
 
 // Lilu's createTrampoline copies a wrapped function's first instructions verbatim ("assuming it is PIC") and jumps back
@@ -1143,6 +1148,148 @@ static void sampleGpuClock() {
 	sclkSamples++;
 }
 
+// Disk log (-crnodisklog disables). A freeze stops the CPU, and kernel NVRAM writes outside a panic never reach the
+// flash (nvram183-203), so a hard freeze left nothing. Instead, every second a line of GPU, SMU and DPM state is
+// appended to /private/var/log/CarrizoRed-<boot time>.log and forced to disk (open, write, fsync, close each time: a
+// freeze loses at most the last second, and nothing stays open at shutdown). Events (every SMU message and its answer,
+// DPM steps) are queued in memory from boot and written with the next line; the full black-box report is appended at
+// t=120 s and every 300 s. One file per boot: several test boots, then copy them all off in one go.
+static char diskLogPath[96];
+static bool diskLogOff, diskLogStarted;
+static uint32_t diskLogWrites, diskLogErrors, diskLogLastError;
+static char diskLogEvents[8192];
+static uint32_t diskLogEventLen, diskLogEventsDropped;
+static volatile uint32_t diskLogEventLock;
+
+static void diskLogEvent(const char *fmt, ...) {
+	while (__atomic_exchange_n(&diskLogEventLock, 1, __ATOMIC_ACQUIRE))
+		__builtin_ia32_pause();
+	uint32_t room = sizeof(diskLogEvents) - diskLogEventLen;
+	if (room > 160) {
+		int n = snprintf(diskLogEvents + diskLogEventLen, room, "[%llu ms] ", uptimeMs());
+		if (n > 0 && static_cast<uint32_t>(n) < room) {
+			diskLogEventLen += static_cast<uint32_t>(n);
+			va_list va;
+			va_start(va, fmt);
+			n = vsnprintf(diskLogEvents + diskLogEventLen, sizeof(diskLogEvents) - diskLogEventLen - 1, fmt, va);
+			va_end(va);
+			if (n > 0)
+				diskLogEventLen += static_cast<uint32_t>(n) < sizeof(diskLogEvents) - diskLogEventLen - 1 ?
+					static_cast<uint32_t>(n) : static_cast<uint32_t>(sizeof(diskLogEvents) - diskLogEventLen - 2);
+			diskLogEvents[diskLogEventLen++] = '\n';
+			diskLogEvents[diskLogEventLen] = '\0';
+		}
+	} else {
+		diskLogEventsDropped++;
+	}
+	__atomic_store_n(&diskLogEventLock, 0, __ATOMIC_RELEASE);
+}
+
+// Append text to the log and force it to disk. False until the data volume is writable.
+static bool diskLogAppend(const char *text, size_t len) {
+	if (diskLogOff || !len)
+		return false;
+	if (!diskLogPath[0]) {
+		clock_sec_t secs = 0;
+		clock_usec_t usecs = 0;
+		clock_get_calendar_microtime(&secs, &usecs);
+		snprintf(diskLogPath, sizeof(diskLogPath), "/private/var/log/CarrizoRed-%lu.log", static_cast<unsigned long>(secs));
+	}
+	vfs_context_t ctx = vfs_context_create(nullptr);
+	if (!ctx)
+		return false;
+	vnode_t vp = nullptr;
+	int err = vnode_open(diskLogPath, O_CREAT | O_APPEND | FWRITE | O_NOFOLLOW, 0644, 0, &vp, ctx);
+	if (!err) {
+		int resid = 0;
+		err = vn_rdwr(UIO_WRITE, vp, const_cast<char *>(text), static_cast<int>(len), 0, UIO_SYSSPACE,
+			IO_APPEND | IO_SYNC | IO_NOAUTH, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+		if (!err)
+			err = VNOP_FSYNC(vp, MNT_WAIT, ctx);
+		vnode_close(vp, FWRITE, ctx);
+	}
+	vfs_context_rele(ctx);
+	if (err) {
+		diskLogErrors++;
+		diskLogLastError = static_cast<uint32_t>(err);
+		return false;
+	}
+	diskLogWrites++;
+	return true;
+}
+
+static uint32_t hookCallCount();
+static uint32_t interpFixedCount();
+static const char *sclkDpmState();
+
+// Every second from the watcher. stallTicks: the GPU stall detector's count (0.5 s ticks with the GFX ring stuck).
+static void diskLogTick(uint32_t t, uint32_t stallTicks) {
+	static uint64_t lastMs;
+	if (diskLogOff)
+		return;
+	uint64_t ms = uptimeMs();
+	if (ms - lastMs < 1000)
+		return;
+	lastMs = ms;
+	static char line[1024];
+	size_t len = 0;
+	auto add = [&](const char *fmt, ...) {
+		if (len + 1 >= sizeof(line))
+			return;
+		va_list va;
+		va_start(va, fmt);
+		int n = vsnprintf(line + len, sizeof(line) - len, fmt, va);
+		va_end(va);
+		if (n > 0)
+			len += static_cast<size_t>(n) < sizeof(line) - len ? static_cast<size_t>(n) : sizeof(line) - len - 1;
+	};
+	if (!diskLogStarted) {
+		add("CarrizoRed disk log; boot-args: %s\ncolumns: t ms | sclk cur/tgt level (profile) | vid gfx/nb | "
+			"temp C | GRBM_STATUS GRBM_STATUS2 CP_STAT | gfx rptr/wptr | sdma0 rptr/wptr | ih rptr/wptr | flips perf/irq | "
+			"submits fixed | smu msg/resp/arg | stall | dpm\n", PE_boot_args());
+	}
+	auto *mmio = gpuMmio;
+	if (mmio && smuLoadOk()) {
+		auto smc = [mmio](uint32_t address) {
+			mmio[0x19A] = address;
+			return mmio[0x19B];
+		};
+		uint32_t profile = smc(0xD0200014);
+		uint32_t vidGfx = smc(0xD8230048) >> 24, vidNb = smc(0xD8230044) >> 24;
+		uint32_t thm = smc(0xD8200CA4), raw = thm >> 21;
+		int temp = static_cast<int>(raw / 8) - ((thm >> 19) & 1 ? 49 : 0);
+		add("%llu | L%u/L%u (%x) | %u/%u | %d | %08x %08x %08x | %x/%x | %x/%x | %x/%x | %u/%u | %u %u | %x/%x/%x | %u | %s\n",
+			ms, (profile >> 16) & 0x1F, (profile >> 21) & 0x1F, profile, vidGfx, vidNb, temp, mmio[0x2004], mmio[0x2002],
+			mmio[0x21A0], mmio[0x21C0], mmio[0x3045], mmio[0x3483], mmio[0x3484], mmio[IhReg::RB_RPTR], mmio[IhReg::RB_WPTR],
+			__atomic_load_n(&flipPerforms, __ATOMIC_RELAXED), __atomic_load_n(&flipIrqs, __ATOMIC_RELAXED),
+			hookCallCount(), interpFixedCount(), mmio[0x1C0], mmio[0x1D0], mmio[0x1E0], stallTicks, sclkDpmState());
+	} else {
+		add("%llu | t=%u, GPU not up yet\n", ms, t);
+	}
+	// Queued events go in first (they happened before this sample).
+	static char events[sizeof(diskLogEvents)];
+	uint32_t eventLen = 0;
+	while (__atomic_exchange_n(&diskLogEventLock, 1, __ATOMIC_ACQUIRE))
+		__builtin_ia32_pause();
+	if (diskLogEventLen) {
+		memcpy(events, diskLogEvents, diskLogEventLen);
+		eventLen = diskLogEventLen;
+	}
+	__atomic_store_n(&diskLogEventLock, 0, __ATOMIC_RELEASE);
+	if (eventLen && !diskLogAppend(events, eventLen))
+		return;  // not writable yet: keep the events queued
+	if (eventLen) {
+		while (__atomic_exchange_n(&diskLogEventLock, 1, __ATOMIC_ACQUIRE))
+			__builtin_ia32_pause();
+		memmove(diskLogEvents, diskLogEvents + eventLen, diskLogEventLen - eventLen);
+		diskLogEventLen -= eventLen;
+		diskLogEvents[diskLogEventLen] = '\0';
+		__atomic_store_n(&diskLogEventLock, 0, __ATOMIC_RELEASE);
+	}
+	if (diskLogAppend(line, len))
+		diskLogStarted = true;
+}
+
 void CRDriver::watcherThread(void *arg, wait_result_t) {
 	auto *self = static_cast<CRDriver *>(arg);
 	static char last[1536], now[1536];
@@ -1159,6 +1306,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		checkKernelArgument("-crnodirectucode") || self->family != ChipFamily::Stoney;
 	uint32_t panicAt = 0, stallRptr = 0, stallTicks = 0;
 	bool stallPanicOff = checkKernelArgument("-crnostallpanic");
+	diskLogOff = checkKernelArgument("-crnodisklog");
 	if (!PE_parse_boot_argn("crpanicat", &panicAt, sizeof(panicAt)))
 		panicAt = 0;
 	uint32_t printed = 0;
@@ -1255,6 +1403,15 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			sampleGpuClock();
 		if (self->family == ChipFamily::Stoney)
 			watchSmuMailbox();
+		diskLogTick(t, stallTicks);
+		// The full black-box report in the log at 2 minutes and every 5 minutes after.
+		if (!diskLogOff && diskLogStarted && t >= 120 && (t - 120) % 300 == 0 && tick % 2 == 0) {
+			const char *report = self->composeReport(t, now);
+			diskLogEvent("black-box report at t=%u s follows", t);
+			diskLogTick(t, stallTicks);
+			diskLogAppend(report, strlen(report));
+			diskLogAppend("\n", 1);
+		}
 		if (self->family == ChipFamily::Stoney && t >= 60)
 			smuReadClockTable();
 		if (self->family == ChipFamily::Stoney && t >= 90)
@@ -2395,6 +2552,7 @@ static uint32_t smuSendMessage(uint16_t msg, uint32_t arg) {
 	mmio[Smu8::MSG] = msg;
 	smuLastMsg = msg;
 	uint32_t resp = wait();
+	diskLogEvent("smu msg %x arg %x -> resp %x, out arg %x", msg, arg, resp, mmio[Smu8::ARG]);
 	return resp ? resp : 0xC0000 | msg;  // never answered
 }
 
@@ -2667,6 +2825,13 @@ static void smuReadClockTable() {
 	OSSafeReleaseNULL(map);
 	OSSafeReleaseNULL(desc);
 	traceNote("smuclk=%x ", smuClk.resp[4]);
+	for (uint32_t level = 0; level < 9; level++) {
+		uint32_t freq = 0;
+		memcpy(&freq, smuClk.table + level * 12 + 8, 4);
+		diskLogEvent("smu clock table %s%u: %u MHz did %x gfxvid %x gnbvid %x", level == 8 ? "off level" : "L",
+			level == 8 ? 0 : level, freq / 100, smuClk.table[level * 12 + 2], smuClk.table[level * 12 + 1],
+			smuClk.table[level * 12]);
+	}
 }
 
 // SCLK DPM, opt-in (-crsclkdpm): what Linux's smu8_enable_dpm_tasks and smu8_update_sclk_limit send, once the clock
@@ -2723,11 +2888,20 @@ static void smuEnableSclkDpm() {
 	smuDpm.resp[4] = smuSendMessage(GetFeatureStatus, 0);
 	smuDpm.featuresAfter = gpuMmio[ARG];
 	traceNote("sclkdpm=%x/%x ", smuDpm.resp[0], smuDpm.featuresAfter);
+	diskLogEvent("sclk dpm enabled: L%u-L%u, features %x -> %x, resp %x %x %x %x %x %x %x", smuDpm.hardMin,
+		smuDpm.softMax, smuDpm.featuresBefore, smuDpm.featuresAfter, smuDpm.resp[0], smuDpm.resp[1], smuDpm.resp[2],
+		smuDpm.resp[3], smuDpm.resp[4], smuDpm.resp[5], smuDpm.resp[6]);
 }
 
 
 static bool sclkDpmRunning() {
 	return smuDpm.done && smuDpm.resp[0] == 1;
+}
+
+static const char *sclkDpmState() {
+	if (!smuDpm.done)
+		return checkKernelArgument("-crsclkdpm") ? "pending" : "off";
+	return smuDpm.resp[0] == 1 ? "on" : "failed";
 }
 
 static uint64_t wrapStoneyLoadRlcUcode(void *cail) {
@@ -5873,6 +6047,14 @@ static uint64_t absToMs(uint64_t abs) {
 	return ns / 1000000;
 }
 
+static uint32_t hookCallCount() {
+	return __atomic_load_n(&ibHookCalls, __ATOMIC_RELAXED);
+}
+
+static uint32_t interpFixedCount() {
+	return interpFix.fixed;
+}
+
 // Metal is drawing (the submit hook has seen work): the watcher's start-up diagnostics can quieten down.
 static bool desktopRunning() {
 	return __atomic_load_n(&ibHookCalls, __ATOMIC_RELAXED) > 100;
@@ -6492,6 +6674,15 @@ static void captureUserIbs(char *out, size_t size) {
 // connectors, mode), the current display/clock registers, the trace summary and the last trace events (setPixelClock,
 // setCrtcToPixelClock, framebuffer calls). Register values are read fresh (pipes only when powered).
 void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
+	const char *report = composeReport(t, tree);
+	diskLogEvent("panic: %s; black-box report follows", reason);
+	diskLogTick(t, 0);
+	diskLogAppend(report, strlen(report));
+	diskLogAppend("\n", 1);
+	panic("%s\n%s", reason, report);
+}
+
+const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 	static char report[8192];
 	size_t len = 0;
 	auto add = [&](const char *fmt, ...) {
@@ -7194,7 +7385,9 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 		auto &event = traceRing[picked[--count] % TraceRingSize];
 		add(" %s%s=%x", event.exit ? "" : ">", event.name, event.value);
 	}
-	panic("%s\n%s", reason, report);
+	add("\ndisk log: %s, %u writes, %u errors (last %d), %u events dropped\n", diskLogPath[0] ? diskLogPath : "not started",
+		diskLogWrites, diskLogErrors, diskLogLastError, diskLogEventsDropped);
+	return report;
 }
 
 void CRDriver::checkDisplayRegs(uint32_t t) {

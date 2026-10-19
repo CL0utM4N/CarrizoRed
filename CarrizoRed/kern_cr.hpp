@@ -141,6 +141,7 @@ private:
 	void initDisplayRegs();
 	void checkDisplayRegs(uint32_t t);
 	void panicReport(uint32_t t, const char *tree, const char *reason);
+	const char *composeReport(uint32_t t, const char *tree);
 	void disableKextCallbacks();
 
 	IOPCIDevice *iGPU {nullptr};
