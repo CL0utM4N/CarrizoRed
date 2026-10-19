@@ -20,6 +20,7 @@
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <sys/fcntl.h>
+#include <sys/mount.h>
 #include <sys/vnode.h>
 #include <sys/vnode_if.h>
 #include <stdarg.h>
