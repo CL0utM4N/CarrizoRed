@@ -18,6 +18,7 @@
 #include <kern/thread.h>
 #include <kern/debug.h>
 #include <kern/clock.h>
+#include <IOKit/IOMessage.h>
 #include <pexpert/pexpert.h>
 #include <sys/fcntl.h>
 #include <sys/mount.h>
@@ -966,7 +967,33 @@ void CRDriver::wrapSetCrtcToPixelClock(void *that, uint8_t crtc, uint8_t pll, vo
 // console whenever it changes, for 10 minutes. When the panel keeps showing the boot console but the GUI has started
 // elsewhere, this is the only output that can be seen. Also published as "CarrizoRed,tree". -crnowatch stops the
 // printing (the thread still requests the controller, see below).
+// System sleep and wake in the disk log: sleep (S3) powers the GPU off, and what CarrizoRed set up once per boot (SMU
+// microcode load, the FB window move, SCLK DPM, RB+, video power) has to be redone on wake. First, see the sequence.
+static void diskLogEvent(const char *fmt, ...);
+static uint32_t systemSleeps, systemWakes;
+
+static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *, void *, vm_size_t) {
+	switch (messageType) {
+		case kIOMessageSystemWillSleep:
+			systemSleeps++;
+			diskLogEvent("system will sleep (%u)", systemSleeps);
+			break;
+		case kIOMessageSystemWillPowerOn:
+			diskLogEvent("system will power on");
+			break;
+		case kIOMessageSystemHasPoweredOn:
+			systemWakes++;
+			diskLogEvent("system has powered on (%u)", systemWakes);
+			break;
+		default:
+			break;
+	}
+	return kIOReturnSuccess;
+}
+
 void CRDriver::startWatcher() {
+	if (iGPU && !iGPU->registerPrioritySleepWakeInterest(sleepWakeHandler, this))
+		SYSLOG("cr", "failed to register for sleep/wake");
 	thread_t thread;
 	if (kernel_thread_start(watcherThread, this, &thread) == KERN_SUCCESS)
 		thread_deallocate(thread);
@@ -1163,8 +1190,14 @@ static uint32_t diskLogEventLen, diskLogEventsDropped;
 static volatile uint32_t diskLogEventLock;
 
 static void diskLogEvent(const char *fmt, ...) {
-	while (__atomic_exchange_n(&diskLogEventLock, 1, __ATOMIC_ACQUIRE))
+	// Bounded: an event from a context that can't wait for the holder (preempted on this CPU) is dropped instead.
+	for (uint32_t spins = 0; __atomic_exchange_n(&diskLogEventLock, 1, __ATOMIC_ACQUIRE); spins++) {
+		if (spins > 200000) {
+			diskLogEventsDropped++;
+			return;
+		}
 		__builtin_ia32_pause();
+	}
 	uint32_t room = sizeof(diskLogEvents) - diskLogEventLen;
 	if (room > 160) {
 		int n = snprintf(diskLogEvents + diskLogEventLen, room, "[%llu ms] ", uptimeMs());
@@ -1937,6 +1970,8 @@ namespace {
 		if (calls > 1 && !strcmp(stages[N].name, "pm4.initializeMicroEngine"))
 			smuReloadCp();
 		traceEvent(stages[N].name, false, arg);
+		if (stages[N].summary)  // start-up stages (and their re-runs on wake) into the disk log
+			diskLogEvent("> %s (call %u)", stages[N].name, calls);
 		if (stopAtName[0] && !strcmp(stopAtName, stages[N].name) &&
 			__atomic_add_fetch(&stopAtHits, 1, __ATOMIC_RELAXED) == stopAtCount) {
 			__atomic_store_n(&stoppedStage, stages[N].name, __ATOMIC_RELAXED);
@@ -1967,8 +2002,10 @@ namespace {
 		if (stages[N].arg == 5 && d)
 			traceEvent("  status", true, *static_cast<uint32_t *>(d));
 		__atomic_fetch_sub(&stageOpen[N], 1, __ATOMIC_RELAXED);
-		if (stages[N].summary)
+		if (stages[N].summary) {
 			traceNote("%s=%x ", stages[N].name, static_cast<uint32_t>(ret));
+			diskLogEvent("< %s = %x", stages[N].name, static_cast<uint32_t>(ret));
+		}
 		return ret;
 	}
 
@@ -4006,8 +4043,11 @@ IOReturn CRDriver::wrapPciSetPowerState(IOPCIDevice *that, unsigned long state, 
 	uint8_t fn = that->getFunctionNumber();
 	pmLog(true, "pci.setPowerState", static_cast<uint32_t>(state), "=> PCI fn%u setPowerState(%lu) from %s", fn,
 		state, whatDevice ? whatDevice->getMetaClass()->getClassName() : "?");
+	diskLogEvent("pci fn%u setPowerState(%lu) from %s", fn, state,
+		whatDevice ? whatDevice->getMetaClass()->getClassName() : "?");
 	auto ret = org(that, state, whatDevice);
 	pmLog(true, "pci.setPowerState ret", ret, "<= PCI fn%u setPowerState(%lu) = 0x%x", fn, state, ret);
+	diskLogEvent("pci fn%u setPowerState(%lu) = %x", fn, state, ret);
 	return ret;
 }
 
