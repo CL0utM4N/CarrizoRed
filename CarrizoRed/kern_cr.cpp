@@ -442,7 +442,7 @@ static void *ihManager;                 // BaffinInterruptManager *
 static mach_vm_address_t ihGetWptrWbAddress, ihIsUsingVram, ihSetRingBufferLocation;
 static bool ihStormBroken;
 static uint64_t ihWindowStart;
-static uint32_t ihWindowCalls;
+static uint32_t ihWindowCalls, ihWindowWptr, ihStormFalseAlarms;
 static struct {
 	uint64_t ms;
 	uint32_t calls, rbCntl, rbBase, rptr, wptr, wptrAddrHi, wptrAddrLo, cntl, status, wbValue, size;
@@ -1247,7 +1247,7 @@ static void diskLogTick(uint32_t t, uint32_t stallTicks) {
 	if (!diskLogStarted) {
 		add("CarrizoRed disk log; boot-args: %s\ncolumns: t ms | sclk cur/tgt level (profile) | vid gfx/nb | "
 			"temp C | GRBM_STATUS GRBM_STATUS2 CP_STAT | gfx rptr/wptr | sdma0 rptr/wptr | ih rptr/wptr | flips perf/irq | "
-			"submits fixed | smu msg/resp/arg | stall | dpm\n", PE_boot_args());
+			"submits fixed | smu msg/resp/arg | stall | dpm | ih calls/false alarms/broken\n", PE_boot_args());
 	}
 	auto *mmio = gpuMmio;
 	if (mmio && smuLoadOk()) {
@@ -1259,11 +1259,12 @@ static void diskLogTick(uint32_t t, uint32_t stallTicks) {
 		uint32_t vidGfx = smc(0xD8230048) >> 24, vidNb = smc(0xD8230044) >> 24;
 		uint32_t thm = smc(0xD8200CA4), raw = thm >> 21;
 		int temp = static_cast<int>(raw / 8) - ((thm >> 19) & 1 ? 49 : 0);
-		add("%llu | L%u/L%u (%x) | %u/%u | %d | %08x %08x %08x | %x/%x | %x/%x | %x/%x | %u/%u | %u %u | %x/%x/%x | %u | %s\n",
+		add("%llu | L%u/L%u (%x) | %u/%u | %d | %08x %08x %08x | %x/%x | %x/%x | %x/%x | %u/%u | %u %u | %x/%x/%x | %u | %s | %u/%u/%u\n",
 			ms, (profile >> 16) & 0x1F, (profile >> 21) & 0x1F, profile, vidGfx, vidNb, temp, mmio[0x2004], mmio[0x2002],
 			mmio[0x21A0], mmio[0x21C0], mmio[0x3045], mmio[0x3483], mmio[0x3484], mmio[IhReg::RB_RPTR], mmio[IhReg::RB_WPTR],
 			__atomic_load_n(&flipPerforms, __ATOMIC_RELAXED), __atomic_load_n(&flipIrqs, __ATOMIC_RELAXED),
-			hookCallCount(), interpFixedCount(), mmio[0x1C0], mmio[0x1D0], mmio[0x1E0], stallTicks, sclkDpmState());
+			hookCallCount(), interpFixedCount(), mmio[0x1C0], mmio[0x1D0], mmio[0x1E0], stallTicks, sclkDpmState(),
+			__atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED), ihStormFalseAlarms, ihStormBroken ? 1U : 0U);
 	} else {
 		add("%llu | t=%u, GPU not up yet\n", ms, t);
 	}
@@ -1404,6 +1405,14 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			sampleGpuClock();
 		if (self->family == ChipFamily::Stoney)
 			watchSmuMailbox();
+		{
+			static bool stormLogged;
+			if (ihStormBroken && !stormLogged) {
+				stormLogged = true;
+				diskLogEvent("IH storm breaker tripped at %llu ms after %u calls (false alarms before: %u): interrupts off",
+					ihSnapshot.ms, ihSnapshot.calls, ihStormFalseAlarms);
+			}
+		}
 		diskLogTick(t, stallTicks);
 		// The full black-box report in the log at 2 minutes and every 5 minutes after.
 		if (!diskLogOff && diskLogStarted && t >= 120 && (t - 120) % 300 == 0 && tick % 2 == 0) {
@@ -3757,10 +3766,13 @@ void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
 	}
 }
 
-// Storm breaker: more than 500 handler calls within 100 ms means the IH keeps re-raising an interrupt the driver
-// believes it has consumed. Disable the ring and interrupts directly (so the machine survives instead of freezing),
-// record the IH state and the write-pointer write-back the CPU sees, and ignore further calls. -crnostormbreak
-// disables this.
+// Storm breaker: more than 500 handler calls within 100 ms *with no new entries in the ring* means the IH keeps
+// re-raising an interrupt the driver believes it has consumed. Disable the ring and interrupts directly (so the
+// machine survives instead of freezing), record the IH state and the write-pointer write-back the CPU sees, and ignore
+// further calls. -crnostormbreak disables this. If the ring's write pointer moved during the window, the calls were
+// real work (a busy GPU at a higher clock finishes command buffers fast): count a false alarm and carry on. Disk log
+// 1792383022: the old test (calls alone) tripped on such a burst at 847 MHz and turned interrupts off for good; the
+// screen froze with the kernel running, which is what every "freeze" with SCLK DPM since nvram183 was.
 void CRDriver::wrapIhHandler(void *that, void *owner, void *arg, void *nub, int source) {
 	uint32_t calls = __atomic_add_fetch(&ihHandlerCalls, 1, __ATOMIC_RELAXED);
 	if (ihStormBroken)
@@ -3769,9 +3781,20 @@ void CRDriver::wrapIhHandler(void *that, void *owner, void *arg, void *nub, int 
 	if (ms - ihWindowStart > 100) {
 		ihWindowStart = ms;
 		ihWindowCalls = 0;
+		ihWindowWptr = gpuMmio ? gpuMmio[IhReg::RB_WPTR] : 0;
 	}
 	if (++ihWindowCalls > 500 && gpuMmio && callback->stormBreak) {
 		auto *mmio = gpuMmio;
+		uint32_t wptr = mmio[IhReg::RB_WPTR];
+		if (wptr != ihWindowWptr) {
+			// New entries arrived: a burst, not a storm.
+			ihStormFalseAlarms++;
+			ihWindowStart = ms;
+			ihWindowCalls = 0;
+			ihWindowWptr = wptr;
+			FunctionCast(wrapIhHandler, callback->orgIhHandler)(that, owner, arg, nub, source);
+			return;
+		}
 		ihSnapshot.ms = ms;
 		ihSnapshot.calls = calls;
 		ihSnapshot.rbCntl = mmio[IhReg::RB_CNTL];
