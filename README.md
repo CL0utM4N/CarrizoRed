@@ -77,6 +77,7 @@ And Metal needed:
 | GPU clock scaling | Works, on by default, up to the chip's top level |
 | Freezes with clock scaling | Fixed: CarrizoRed's own interrupt-storm breaker was tripping on real interrupt bursts at higher clocks |
 | Folder icons (flat squares: shape mask not applied) | Being diagnosed with the disk log's draw census |
+| OpenGL | Expected to work, untested: Apple's AMD GL driver compiles through the same `libSC` CarrizoRed patches for Stoney (its `ATIRadeonX4000SCLib` wraps it), and the shader fix works on every submission whatever the API |
 | Video decode/encode | Stage 1 (power and engine start) in testing behind `-crvideo`; then Stoney firmware and codec limits ([docs/VIDEO.md](docs/VIDEO.md)) |
 | Carrizo / Bristol Ridge | Code paths written (SMU loader, clock scaling, caps), untested: no hardware |
 | External displays, brightness, sleep/wake, HDMI audio | Not started / untested |
