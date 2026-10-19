@@ -1221,6 +1221,7 @@ static bool diskLogAppend(const char *text, size_t len) {
 
 static uint32_t hookCallCount();
 static uint32_t interpFixedCount();
+static void censusLog();
 static const char *sclkDpmState();
 
 // Every second from the watcher. stallTicks: the GPU stall detector's count (0.5 s ticks with the GFX ring stuck).
@@ -1413,6 +1414,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 					ihSnapshot.ms, ihSnapshot.calls, ihStormFalseAlarms);
 			}
 		}
+		censusLog();
 		diskLogTick(t, stallTicks);
 		// The full black-box report in the log at 2 minutes and every 5 minutes after.
 		if (!diskLogOff && diskLogStarted && t >= 120 && (t - 120) % 300 == 0 && tick % 2 == 0) {
@@ -6250,6 +6252,84 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 	return withRaise(vmid, psVa, rsrc1);
 }
 
+// Draw census (-crnocensus disables): every distinct draw set-up the GPU is given, with when it was first seen, so a
+// visual bug can be matched to the draws that appear when it does (the folder icons: flat squares, their shape mask
+// not applied). Per draw: the pixel shader, render targets 0/1 (CB_COLORn_INFO, CB_COLOR0_ATTRIB), CB_TARGET_MASK,
+// CB_COLOR_CONTROL, CB_BLEND0_CONTROL, DB_DEPTH_CONTROL, DB_STENCIL_CONTROL, DB_STENCILREFMASK, DB_STENCIL_INFO,
+// DB_Z_INFO, DB_SHADER_CONTROL, SPI_SHADER_COL_FORMAT and the PS user data 0-3; if user data 0/1 look like a GPU
+// address, the first two 8-dword texture descriptors there (dwords 1 and 3: format, swizzle). Context registers are
+// tracked across command buffers (state set by context loads from memory isn't seen). Written by the submit hook (under
+// interpLock: one writer), published with censusNum, logged by the watcher.
+struct CensusEntry {
+	uint64_t ps;
+	uint32_t regs[13], userData[4], tex[4];
+	uint64_t firstMs;
+	uint32_t count;
+	bool logged;
+};
+static constexpr uint16_t censusRegs[13] {0x31C, 0x31D, 0x32B, 0x08E, 0x202, 0x1E0, 0x200, 0x10B, 0x10C, 0x011, 0x010,
+	0x203, 0x1C5};
+static CensusEntry census[384];
+static uint32_t censusNum, censusFull;
+static uint32_t censusCtx[0x400], censusUserData[4];
+static uint64_t censusPs;
+static int censusOff = -1;
+
+static void censusDraw(uint32_t vmid) {
+	CensusEntry e {};
+	e.ps = censusPs;
+	for (uint32_t r = 0; r < arrsize(censusRegs); r++)
+		e.regs[r] = censusCtx[censusRegs[r]];
+	memcpy(e.userData, censusUserData, sizeof(e.userData));
+	uint32_t n = censusNum;
+	for (uint32_t i = 0; i < n; i++) {
+		if (census[i].ps == e.ps && !memcmp(census[i].regs, e.regs, sizeof(e.regs)) &&
+			!memcmp(census[i].userData, e.userData, sizeof(e.userData))) {
+			census[i].count++;
+			return;
+		}
+	}
+	if (n == arrsize(census)) {
+		censusFull++;
+		return;
+	}
+	uint64_t va = static_cast<uint64_t>(e.userData[1]) << 32 | e.userData[0];
+	if (e.userData[0] && !(e.userData[0] & 0xFF) && e.userData[1] && e.userData[1] < 0x10000) {
+		uint32_t desc[16] {};
+		if (readGpuVa(vmid, va, 16, desc, false) == 16) {
+			e.tex[0] = desc[1];
+			e.tex[1] = desc[3];
+			e.tex[2] = desc[9];
+			e.tex[3] = desc[11];
+		}
+	}
+	e.firstMs = uptimeMs();
+	e.count = 1;
+	census[n] = e;
+	__atomic_store_n(&censusNum, n + 1, __ATOMIC_RELEASE);
+}
+
+// New draw-census entries to the disk log (watcher thread).
+static void censusLog() {
+	uint32_t n = __atomic_load_n(&censusNum, __ATOMIC_ACQUIRE);
+	for (uint32_t i = 0; i < n; i++) {
+		auto &e = census[i];
+		if (e.logged)
+			continue;
+		e.logged = true;
+		diskLogEvent("draw #%u first %llu ms: ps %llx cb0 %x attr %x cb1 %x tmask %x cc %x blend %x depth %x stencil %x "
+			"ref %x sinfo %x zinfo %x dbsh %x colfmt %x ud %x %x %x %x tex %x %x %x %x", i, e.firstMs, e.ps,
+			e.regs[0], e.regs[1], e.regs[2], e.regs[3], e.regs[4], e.regs[5], e.regs[6], e.regs[7], e.regs[8],
+			e.regs[9], e.regs[10], e.regs[11], e.regs[12], e.userData[0], e.userData[1], e.userData[2], e.userData[3],
+			e.tex[0], e.tex[1], e.tex[2], e.tex[3]);
+	}
+	static uint32_t loggedFull;
+	if (censusFull && !loggedFull) {
+		loggedFull = 1;
+		diskLogEvent("draw census full (%u entries)", n);
+	}
+}
+
 // Walk one user command buffer: every pixel shader it binds (SET_SH_REG SPI_SHADER_PGM_LO/HI_PS, RSRC1_PS) gets
 // fixed; with allowBump (before submission) a raised RSRC1_PS is written back into the command buffer.
 // Where the submit hook's time goes (nvram178: ~146 us per command buffer): reading command buffers vs checking the
@@ -6276,6 +6356,8 @@ static void processUserIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords, bool al
 			ibPagesPlain++;
 	}
 	uint32_t psLo = 0, psHi = 0, rsrc1 = 0, rsrc1At = 0xFFFFFFFF;
+	if (censusOff < 0)
+		censusOff = checkKernelArgument("-crnocensus") ? 1 : 0;
 	for (uint32_t j = 0; j < got;) {
 		uint32_t header = buf[j], type = header >> 30;
 		if (type == 2) {
@@ -6283,11 +6365,23 @@ static void processUserIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords, bool al
 			continue;
 		}
 		uint32_t count = ((header >> 16) & 0x3FFF) + 1;
-		if (type == 3 && ((header >> 8) & 0xFF) == 0x76 && j + 1 < got) {
+		uint32_t op = (header >> 8) & 0xFF;
+		if (type == 3 && !censusOff) {
+			if (op == 0x69 && j + 1 < got) {  // SET_CONTEXT_REG
+				uint32_t start = buf[j + 1] & 0xFFFF;
+				for (uint32_t k = 0; k + 1 < count && j + 2 + k < got && start + k < arrsize(censusCtx); k++)
+					censusCtx[start + k] = buf[j + 2 + k];
+			} else if (op == 0x27 || op == 0x2D || op == 0x35 || op == 0x25 || op == 0x38 || op == 0x24) {
+				censusDraw(vmid);
+			}
+		}
+		if (type == 3 && op == 0x76 && j + 1 < got) {
 			uint32_t start = buf[j + 1] & 0xFFFF;
 			bool touched = false;
 			for (uint32_t k = 0; k + 1 < count && j + 2 + k < got; k++) {
 				uint32_t reg = start + k, v = buf[j + 2 + k];
+				if (reg >= 0x0C && reg <= 0x0F)
+					censusUserData[reg - 0x0C] = v;
 				if (reg == 0x08) {
 					psLo = v;
 					touched = true;
@@ -6300,6 +6394,8 @@ static void processUserIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords, bool al
 					touched = true;
 				}
 			}
+			if (psLo)
+				censusPs = (static_cast<uint64_t>(psHi & 0xFF) << 40) | (static_cast<uint64_t>(psLo) << 8);
 			if (touched && psLo && rsrc1) {
 				uint64_t psVa = (static_cast<uint64_t>(psHi & 0xFF) << 40) | (static_cast<uint64_t>(psLo) << 8);
 				// A shader bound again in the same submission was checked (and fixed) moments ago: reuse the answer
