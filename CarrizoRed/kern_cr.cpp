@@ -6304,13 +6304,14 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 struct CensusEntry {
 	uint64_t ps;
 	uint32_t regs[13], userData[4], tex[4];
+	uint32_t mimgCount, mimg[4];  // the shader's image instructions: op << 16 | dmask << 8 | first resource SGPR
 	uint64_t firstMs;
 	uint32_t count;
 	bool logged;
 };
 static constexpr uint16_t censusRegs[13] {0x31C, 0x31D, 0x32B, 0x08E, 0x202, 0x1E0, 0x200, 0x10B, 0x10C, 0x011, 0x010,
 	0x203, 0x1C5};
-static CensusEntry census[384];
+static CensusEntry census[1024];
 static uint32_t censusNum, censusFull;
 static uint32_t censusCtx[0x400], censusUserData[4];
 static uint64_t censusPs;
@@ -6324,8 +6325,7 @@ static void censusDraw(uint32_t vmid) {
 	memcpy(e.userData, censusUserData, sizeof(e.userData));
 	uint32_t n = censusNum;
 	for (uint32_t i = 0; i < n; i++) {
-		if (census[i].ps == e.ps && !memcmp(census[i].regs, e.regs, sizeof(e.regs)) &&
-			!memcmp(census[i].userData, e.userData, sizeof(e.userData))) {
+		if (census[i].ps == e.ps && !memcmp(census[i].regs, e.regs, sizeof(e.regs))) {
 			census[i].count++;
 			return;
 		}
@@ -6344,6 +6344,21 @@ static void censusDraw(uint32_t vmid) {
 			e.tex[3] = desc[11];
 		}
 	}
+	// The pixel shader's image instructions (MIMG: op, the channels it reads, the resource descriptor's first SGPR).
+	if (e.ps) {
+		static uint32_t code[1024];
+		uint32_t got = readGpuVa(vmid, e.ps, arrsize(code), code, true);
+		uint32_t end = gcn3ProgramEnd(code, got);
+		for (uint32_t i = 0; i < (end ? end : got);) {
+			uint32_t w = code[i];
+			if ((w >> 26) == 0x3C && i + 1 < got) {
+				if (e.mimgCount < arrsize(e.mimg))
+					e.mimg[e.mimgCount] = ((w >> 18) & 0x7F) << 16 | ((w >> 8) & 0xF) << 8 | (((code[i + 1] >> 16) & 0x1F) * 4);
+				e.mimgCount++;
+			}
+			i += gcn3InstLength(code + i, got - i);
+		}
+	}
 	e.firstMs = uptimeMs();
 	e.count = 1;
 	census[n] = e;
@@ -6360,10 +6375,10 @@ static void censusLog() {
 		batch++;
 		e.logged = true;
 		diskLogEvent("draw #%u first %llu ms: ps %llx cb0 %x attr %x cb1 %x tmask %x cc %x blend %x depth %x stencil %x "
-			"ref %x sinfo %x zinfo %x dbsh %x colfmt %x ud %x %x %x %x tex %x %x %x %x", i, e.firstMs, e.ps,
+			"ref %x sinfo %x zinfo %x dbsh %x colfmt %x ud %x %x %x %x tex %x %x %x %x mimg %u: %x %x %x %x", i, e.firstMs, e.ps,
 			e.regs[0], e.regs[1], e.regs[2], e.regs[3], e.regs[4], e.regs[5], e.regs[6], e.regs[7], e.regs[8],
 			e.regs[9], e.regs[10], e.regs[11], e.regs[12], e.userData[0], e.userData[1], e.userData[2], e.userData[3],
-			e.tex[0], e.tex[1], e.tex[2], e.tex[3]);
+			e.tex[0], e.tex[1], e.tex[2], e.tex[3], e.mimgCount, e.mimg[0], e.mimg[1], e.mimg[2], e.mimg[3]);
 	}
 	static uint32_t loggedFull;
 	if (censusFull && !loggedFull) {
