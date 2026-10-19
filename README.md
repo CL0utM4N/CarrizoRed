@@ -23,7 +23,7 @@ longer testing. The GPU clock now scales with load (400 MHz idle, up to the chip
 | Acceleration / Metal (`AMDRadeonX4000`) | **Works.** The SMU loads the GPU microcode, the command processor and SDMA run, interrupts work, and WindowServer and apps render with Metal. Apple's shader compiler emits an interpolation pattern Stoney's 16-bank LDS gets wrong; CarrizoRed fixes the compiled pixel shaders before the GPU runs them (about 0.1% of one CPU core). Boot with `-crnoaccel` for an unaccelerated desktop |
 | GPU clock scaling (SCLK DPM) | **Works, on by default.** Apple's PowerPlay runs its Dummy back end here, so nothing would start the SMU's clock scaling and the GPU would stay at its lowest clock. CarrizoRed starts it 90 s after boot, from the SMU's own clock table: 400 MHz minimum, up to the top level (900 MHz on an A9-9425, 800 MHz on an A9-9420). `-crnosclkdpm` turns it off |
 | Brightness, external displays (HDMI), sleep/wake, HDMI audio | Not done or untested |
-| Video decode/encode (UVD/VCE) | Not supported yet (the engines need SMU power messages; CarrizoRed only uses the SMU for microcode so far) |
+| Video decode/encode (UVD/VCE) | **In development.** Stoney's UVD 6.2 / VCE 3.4 are close to Polaris's UVD 6.3 / VCE 3.4, which Apple's driver supports. Stage 1 (`-crvideo`, opt-in): the SMU powers both engines and Apple's driver starts them; firmware and codec work follow. Plan in [docs/VIDEO.md](docs/VIDEO.md) |
 | Carrizo / Bristol Ridge | Same display engine and code paths; the SMU microcode loader, clock scaling and shader-engine fix include Carrizo's differences (second SDMA engine, second MEC), following Linux. **Untested** (no hardware): reports from owners are very welcome |
 
 **Tested on:**
@@ -67,14 +67,28 @@ And Metal needed:
   use on Stoney), and the Metal compiler switched to its Stoney back end (patched in the dyld shared cache);
 - the GPU and CPU named after the APU in About This Mac.
 
-Still open:
-- folder icons drawn as flat blue squares (the folder shape's mask isn't applied);
-- a few shaders the fix has to leave alone (rare);
-- the GPU occasionally not responding after a warm restart (power off fully);
-- stability over longer sessions.
+## Development status
 
-HWLibs patches not taking at boot turned out to be Lilu's
-trampoline buffer running out; CarrizoRed now builds its own trampolines.
+| Area | State |
+|---|---|
+| Display (built-in eDP panel) | Works |
+| Metal acceleration | Works; the desktop renders correctly except folder icons |
+| Stoney's 16-bank LDS shader fix | Works, about 0.1% of one CPU core |
+| GPU clock scaling | Works, on by default, up to the chip's top level |
+| Freezes with clock scaling | Fixed: CarrizoRed's own interrupt-storm breaker was tripping on real interrupt bursts at higher clocks |
+| Folder icons (flat squares: shape mask not applied) | Being diagnosed with the disk log's draw census |
+| Video decode/encode | Stage 1 (power and engine start) in testing behind `-crvideo`; then Stoney firmware and codec limits ([docs/VIDEO.md](docs/VIDEO.md)) |
+| Carrizo / Bristol Ridge | Code paths written (SMU loader, clock scaling, caps), untested: no hardware |
+| External displays, brightness, sleep/wake, HDMI audio | Not started / untested |
+| Rare shaders the fix leaves alone | Open (a handful per session, none visibly wrong so far) |
+| GPU occasionally not responding after a warm restart | Open (power off fully) |
+
+**Testing:** every boot writes `/private/var/log/CarrizoRed-<time>.log`: GPU, SMU and clock state every second, all SMU
+messages, a census of draw set-ups and the black-box report, written straight to disk so it survives a freeze. Copy
+these files off after a few boots and attach them to an issue; no NVRAM dumps or forced panics needed.
+
+HWLibs patches not taking at boot turned out to be Lilu's trampoline buffer running out; CarrizoRed builds its own
+trampolines.
 
 Each fix is documented in the code, in [docs/TEST_MACHINES.md](docs/TEST_MACHINES.md) and in
 [docs/APPLE_KEXTS.md](docs/APPLE_KEXTS.md).
@@ -171,6 +185,7 @@ and the list of affected machines.
 | `-crnoppdummy` | Stoney/Carrizo: don't set `PP_PhmUseDummyBackEnd` (PowerPlay has no back end for these APUs; without the Dummy one, `initializePowerPlay` fails and the accelerator never powers up); also turns PowerPlay off |
 | `-crnosoftpptable` | Stoney/Carrizo: don't hand PowerPlay the VBIOS's PowerPlayInfo table as `PP_PhmSoftPowerPlayTable` (HWLibs' own VBIOS lookup appears to fail on the APU, and PowerPlay then fails to initialise) |
 | `-crnodirectucode` | Stoney/Carrizo: leave CAIL's `DisableCailLoadUcode` on (the default). CarrizoRed clears it so CAIL reserves its micro-engine VRAM block, which the SMU microcode loader extends and uses; with the flag on, nothing loads the microcode and the accelerator's power-up waits forever |
+| `-crvideo` | Video stage 1 (in development): have the SMU power UVD and VCE up, then let Apple's driver start them (SAMU stays off) |
 | `-crmm` | Also power up the accelerator's UVD, VCE and SAMU engines. On the APU those blocks stay power-gated without a real PowerPlay back end, and programming them can hang the bus, so by default their power-up is skipped (the engines themselves stay) |
 | `-crnosmuload` | Stoney: don't have the SMU load the RLC/CP/SDMA microcode (CarrizoRed builds the SMU's task table in VRAM from the images in HWLibs, as Linux `smu8_smumgr` does); direct register loading alone doesn't work on these APUs |
 | `-crnoihmove` | With the accelerator: leave the interrupt ring in system memory, where the GPU can no longer reach it once VRAM is moved to GPU address 0 (an interrupt storm, and the accelerator's work never completes) |

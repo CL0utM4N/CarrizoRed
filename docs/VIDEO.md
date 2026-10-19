@@ -63,3 +63,17 @@ Linux drives UVD 6.0/6.2/6.3 with one file (`uvd_v6_0.c`); the only 6.2/6.3 diff
 Decode first (the bigger win: the CPU is two slow cores; 1080p H.264/HEVC playback and DRM need UVD), then encode
 (H.264 only; screen recording, FaceTime, export). Each step is verified by counters in the black box (power-on
 answers, firmware loaded, ring tests) before any playback test.
+
+## Progress
+
+- **Stage 1, implemented (opt-in `-crvideo`, untested):** before `AMDHardware::powerUpHWEngines`, the SMU gets
+  `UVDPowerON` (static gating), `VCEPowerON` and `EnableAllSmuFeatures(UVD_DPM | VCE_DPM)`; Apple's power-up then
+  includes UVD and VCE (SAMU stays skipped). Apple's `loadUVDFW`, UVD `start`/`startRBEngine`, VCE `loadFW`/`start`
+  are traced (results in the trace summary), and once the SMU has answered, UVD/VCE status, VCPU control, soft reset,
+  LMI status and ring pointers go into the disk log every second and into the report's `video:` line. Apple's
+  power-gating calls are not hooked: the Dummy back end's `PhwDummy_PowerGateUVD`/`VCE` are 11-byte stubs packed back
+  to back, too small for a jump; the engines simply stay powered.
+- **Next, from the stage 1 log:** whether Apple's UVD 6.3 / VCE 3.4 firmware starts on Stoney (UVD_STATUS, VCPU
+  running, ring test). If not, stage 2 replaces the firmware in the engine's buffer (`AMDUVDHWEngine::loadUVDFW` asks
+  the shared multimedia layer for the image, `this+0x160`, then decrypts it when a flag says so) with Linux's
+  `stoney_uvd.bin` / `stoney_vce.bin`, fetched by CI rather than committed.
