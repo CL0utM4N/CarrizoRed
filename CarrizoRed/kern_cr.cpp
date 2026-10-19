@@ -6355,6 +6355,9 @@ struct CensusEntry {
 	uint64_t ps;
 	uint32_t regs[13], userData[4], tex[4];
 	uint32_t mimgCount, mimg[4];  // the shader's image instructions: op << 16 | dmask << 8 | first resource SGPR
+	// The resource descriptors (T#) the first two image instructions use, read from memory at the draw: how they were
+	// found (0 not found, 1 from a user-data pointer, 2 through one more pointer) and their 8 dwords.
+	uint32_t descHow[2], desc[2][8];
 	uint64_t firstMs;
 	uint32_t count;
 	bool logged;
@@ -6363,7 +6366,7 @@ static constexpr uint16_t censusRegs[13] {0x31C, 0x31D, 0x32B, 0x08E, 0x202, 0x1
 	0x203, 0x1C5};
 static CensusEntry census[1024];
 static uint32_t censusNum, censusFull;
-static uint32_t censusCtx[0x400], censusUserData[4];
+static uint32_t censusCtx[0x400], censusUserData[16];
 static uint64_t censusPs;
 static int censusOff = -1;
 
@@ -6372,7 +6375,7 @@ static void censusDraw(uint32_t vmid) {
 	e.ps = censusPs;
 	for (uint32_t r = 0; r < arrsize(censusRegs); r++)
 		e.regs[r] = censusCtx[censusRegs[r]];
-	memcpy(e.userData, censusUserData, sizeof(e.userData));
+	memcpy(e.userData, censusUserData, sizeof(e.userData));  // the first four
 	uint32_t n = censusNum;
 	for (uint32_t i = 0; i < n; i++) {
 		if (census[i].ps == e.ps && !memcmp(census[i].regs, e.regs, sizeof(e.regs))) {
@@ -6399,14 +6402,66 @@ static void censusDraw(uint32_t vmid) {
 		static uint32_t code[1024];
 		uint32_t got = readGpuVa(vmid, e.ps, arrsize(code), code, true);
 		uint32_t end = gcn3ProgramEnd(code, got);
-		for (uint32_t i = 0; i < (end ? end : got);) {
+		uint32_t mimgAt[2] {};
+		if (!end)
+			end = got;
+		for (uint32_t i = 0; i < end;) {
 			uint32_t w = code[i];
 			if ((w >> 26) == 0x3C && i + 1 < got) {
 				if (e.mimgCount < arrsize(e.mimg))
 					e.mimg[e.mimgCount] = ((w >> 18) & 0x7F) << 16 | ((w >> 8) & 0xF) << 8 | (((code[i + 1] >> 16) & 0x1F) * 4);
+				if (e.mimgCount < 2)
+					mimgAt[e.mimgCount] = i;
 				e.mimgCount++;
 			}
 			i += gcn3InstLength(code + i, got - i);
+		}
+		// Where an SGPR's value came from before instruction `at`: the last S_LOAD_DWORD{,X2,X4,X8,X16} with an
+		// immediate offset that wrote it (SMEM: sbase [5:0] x2, sdata [12:6], imm [17], op [25:18], offset dword 1
+		// [19:0], bytes). Returns false if none (then it is a user SGPR, s0-s15, from SPI_SHADER_USER_DATA_PS).
+		auto findLoad = [&](uint32_t at, uint32_t sgpr, uint32_t &base, uint32_t &offset) {
+			bool found = false;
+			for (uint32_t i = 0; i < at && i < end;) {
+				uint32_t w = code[i];
+				if ((w >> 26) == 0x30 && i + 1 < end && ((w >> 17) & 1)) {
+					uint32_t op = (w >> 18) & 0xFF, sdata = (w >> 6) & 0x7F;
+					uint32_t n = op <= 4 ? 1U << op : 0;
+					if (n && sdata <= sgpr && sgpr < sdata + n) {
+						base = (w & 0x3F) * 2;
+						offset = (code[i + 1] & 0xFFFFF) + (sgpr - sdata) * 4;
+						found = true;
+					}
+				}
+				i += gcn3InstLength(code + i, end - i);
+			}
+			return found;
+		};
+		// The 64-bit value of an SGPR pair at `at`: user data, or loaded through one pointer that is user data.
+		auto pairValue = [&](uint32_t at, uint32_t sgpr, uint32_t &how, uint64_t &value) {
+			uint32_t base = 0, offset = 0;
+			if (!findLoad(at, sgpr, base, offset)) {
+				if (sgpr + 1 >= arrsize(censusUserData))
+					return false;
+				value = static_cast<uint64_t>(censusUserData[sgpr + 1] & 0xFFFF) << 32 | censusUserData[sgpr];
+				how = 1;
+				return value != 0;
+			}
+			if (base + 1 >= arrsize(censusUserData))
+				return false;
+			uint64_t table = static_cast<uint64_t>(censusUserData[base + 1] & 0xFFFF) << 32 | censusUserData[base];
+			uint32_t pair[2] {};
+			if (!table || readGpuVa(vmid, table + offset, 2, pair, false) != 2)
+				return false;
+			value = static_cast<uint64_t>(pair[1] & 0xFFFF) << 32 | pair[0];
+			how = 2;
+			return value != 0;
+		};
+		for (uint32_t k = 0; k < 2 && k < e.mimgCount; k++) {
+			uint32_t at = mimgAt[k], srsrc = ((code[at + 1] >> 16) & 0x1F) * 4, base = 0, offset = 0, how = 0;
+			uint64_t ptr = 0;
+			if (findLoad(at, srsrc, base, offset) && pairValue(at, base, how, ptr) &&
+				readGpuVa(vmid, ptr + offset, 8, e.desc[k], false) == 8)
+				e.descHow[k] = how;
 		}
 	}
 	e.firstMs = uptimeMs();
@@ -6425,10 +6480,14 @@ static void censusLog() {
 		batch++;
 		e.logged = true;
 		diskLogEvent("draw #%u first %llu ms: ps %llx cb0 %x attr %x cb1 %x tmask %x cc %x blend %x depth %x stencil %x "
-			"ref %x sinfo %x zinfo %x dbsh %x colfmt %x ud %x %x %x %x tex %x %x %x %x mimg %u: %x %x %x %x", i, e.firstMs, e.ps,
+			"ref %x sinfo %x zinfo %x dbsh %x colfmt %x ud %x %x %x %x tex %x %x %x %x mimg %u: %x %x %x %x "
+			"T0(%u) %08x %08x %08x %08x %08x %08x %08x %08x T1(%u) %08x %08x %08x %08x %08x %08x %08x %08x", i, e.firstMs, e.ps,
 			e.regs[0], e.regs[1], e.regs[2], e.regs[3], e.regs[4], e.regs[5], e.regs[6], e.regs[7], e.regs[8],
 			e.regs[9], e.regs[10], e.regs[11], e.regs[12], e.userData[0], e.userData[1], e.userData[2], e.userData[3],
-			e.tex[0], e.tex[1], e.tex[2], e.tex[3], e.mimgCount, e.mimg[0], e.mimg[1], e.mimg[2], e.mimg[3]);
+			e.tex[0], e.tex[1], e.tex[2], e.tex[3], e.mimgCount, e.mimg[0], e.mimg[1], e.mimg[2], e.mimg[3],
+			e.descHow[0], e.desc[0][0], e.desc[0][1], e.desc[0][2], e.desc[0][3], e.desc[0][4], e.desc[0][5], e.desc[0][6],
+			e.desc[0][7], e.descHow[1], e.desc[1][0], e.desc[1][1], e.desc[1][2], e.desc[1][3], e.desc[1][4], e.desc[1][5],
+			e.desc[1][6], e.desc[1][7]);
 	}
 	static uint32_t loggedFull;
 	if (censusFull && !loggedFull) {
@@ -6487,7 +6546,7 @@ static void processUserIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords, bool al
 			bool touched = false;
 			for (uint32_t k = 0; k + 1 < count && j + 2 + k < got; k++) {
 				uint32_t reg = start + k, v = buf[j + 2 + k];
-				if (reg >= 0x0C && reg <= 0x0F)
+				if (reg >= 0x0C && reg <= 0x1B)  // SPI_SHADER_USER_DATA_PS_0-15: s0-s15 in the pixel shader
 					censusUserData[reg - 0x0C] = v;
 				if (reg == 0x08) {
 					psLo = v;
