@@ -1158,7 +1158,7 @@ static void sampleGpuClock() {
 static char diskLogPath[96];
 static bool diskLogOff, diskLogStarted;
 static uint32_t diskLogWrites, diskLogErrors, diskLogLastError;
-static char diskLogEvents[8192];
+static char diskLogEvents[65536];
 static uint32_t diskLogEventLen, diskLogEventsDropped;
 static volatile uint32_t diskLogEventLock;
 
@@ -6311,11 +6311,12 @@ static void censusDraw(uint32_t vmid) {
 
 // New draw-census entries to the disk log (watcher thread).
 static void censusLog() {
-	uint32_t n = __atomic_load_n(&censusNum, __ATOMIC_ACQUIRE);
-	for (uint32_t i = 0; i < n; i++) {
+	uint32_t n = __atomic_load_n(&censusNum, __ATOMIC_ACQUIRE), batch = 0;
+	for (uint32_t i = 0; i < n && batch < 40; i++) {  // at most 40 per tick, so the event buffer can't overflow
 		auto &e = census[i];
 		if (e.logged)
 			continue;
+		batch++;
 		e.logged = true;
 		diskLogEvent("draw #%u first %llu ms: ps %llx cb0 %x attr %x cb1 %x tmask %x cc %x blend %x depth %x stencil %x "
 			"ref %x sinfo %x zinfo %x dbsh %x colfmt %x ud %x %x %x %x tex %x %x %x %x", i, e.firstMs, e.ps,
