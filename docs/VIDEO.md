@@ -1,7 +1,7 @@
 # Video decode and encode (UVD / VCE) on Stoney
 
-Research notes (2026-10-17): what Apple's Polaris stack has, how Stoney differs, and a plan. Nothing here is
-implemented yet: CarrizoRed skips the video engines' power-up (`-crmm` lets Apple try it, which can hang the bus).
+Research notes (2026-10-17): what Apple's Polaris stack has, how Stoney differs, and a plan. Stage 1 is
+implemented behind `-crvideo` (see Progress); without it CarrizoRed skips the video engines' power-up.
 
 ## The engines
 
