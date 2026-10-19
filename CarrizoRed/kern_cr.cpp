@@ -1306,7 +1306,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 	// that console) would vanish too. A panic screen (debug=0x100) and the panic text in NVRAM prove the kernel was
 	// still running; no panic means a real hang.
 	bool autoPanicOff = checkKernelArgument("-crnoautopanic") || checkKernelArgument("-crnosmuload") ||
-		checkKernelArgument("-crnodirectucode") || self->family != ChipFamily::Stoney;
+		checkKernelArgument("-crnodirectucode") ||
+		(self->family != ChipFamily::Stoney && self->family != ChipFamily::Carrizo);
 	uint32_t panicAt = 0, stallRptr = 0, stallTicks = 0;
 	bool stallPanicOff = checkKernelArgument("-crnostallpanic");
 	diskLogOff = checkKernelArgument("-crnodisklog");
@@ -1402,9 +1403,10 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		checkGpuAlive(gpuMmio);
 		// Not while SCLK DPM runs: nvram183/188 froze with it on (both without a report, so the CPU stopped too), and
 		// these SMU register reads every 500 ms are the one thing we do that Linux doesn't (it reads them on request).
-		if (self->family == ChipFamily::Stoney && !sclkDpmRunning())
+		bool smu8 = self->family == ChipFamily::Stoney || self->family == ChipFamily::Carrizo;
+		if (smu8 && !sclkDpmRunning())
 			sampleGpuClock();
-		if (self->family == ChipFamily::Stoney)
+		if (smu8)
 			watchSmuMailbox();
 		{
 			static bool stormLogged;
@@ -1424,9 +1426,9 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			diskLogAppend(report, strlen(report));
 			diskLogAppend("\n", 1);
 		}
-		if (self->family == ChipFamily::Stoney && t >= 60)
+		if (smu8 && t >= 60)
 			smuReadClockTable();
-		if (self->family == ChipFamily::Stoney && t >= 90)
+		if (smu8 && t >= 90)
 			smuEnableSclkDpm();
 		if (smuLoadOk())
 			fixRbPlus(gpuMmio, self->family == ChipFamily::Stoney);
@@ -2211,7 +2213,8 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			}
 		}
 	}
-	if (family == ChipFamily::Stoney && !checkKernelArgument("-crnocapsfix")) {
+	// Stoney and Carrizo both have one shader engine with one shader array (Linux gfx_v8_0), against Polaris 11's two.
+	if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crnocapsfix")) {
 		static const char *const capsChecks[] {"c7476402000000", "c7476c01000000", "c787a000000008000000", nullptr};
 		route("__ZN32AMDRadeonX4000_AMDBaffinHardware32setupAndInitializeHWCapabilitiesEv",
 			reinterpret_cast<mach_vm_address_t>(wrapSetupHWCapabilities), orgSetupHWCapabilities, capsChecks, 0x30,
@@ -2502,6 +2505,9 @@ namespace Smu8 {
 	static constexpr uint8_t SDMA0 = 0, CE = 2, PFP = 3, ME = 4, MEC_JT1 = 5, RLC_G = 8, RLC_SCRATCH = 9,
 	                         RLC_SRM_ARAM = 10, RLC_SRM_DRAM = 11;
 	static constexpr uint32_t StoneyLoadMask = 1U << SDMA0 | 1U << CE | 1U << PFP | 1U << ME | 1U << MEC_JT1 | 1U << RLC_G;
+	// Carrizo / Bristol Ridge also have SDMA1 and a second MEC (its own jump table), as in Linux smu8_smumgr.
+	static constexpr uint8_t SDMA1 = 1, MEC_JT2 = 6;
+	static constexpr uint32_t CarrizoLoadMask = StoneyLoadMask | 1U << SDMA1 | 1U << MEC_JT2;
 	static constexpr uint8_t TaskUcodeLoad = 1, TaskUcodeSave = 2, TaskInitialize = 5;  // TASK_TYPE_*
 	static constexpr uint8_t ArgInitMmPwrLog = 0, ArgInitClkTable = 1;                 // TASK_ARG_INIT_*
 	static constexpr uint32_t JobListEntries = 32;                                     // NUM_JOBLIST_ENTRIES
@@ -2526,7 +2532,10 @@ namespace Smu8 {
 }
 
 static mach_vm_address_t orgStoneyFormatSmuDram, orgStoneyLoadRlcUcode;
-static Smu8::CailUcode **stoneyUcodeInfo;  // RLC, SDMA0, SDMA1 (skipped), CE, PFP, ME, MEC1, MEC2 (skipped)
+// CAIL's Stoney_UcodeInfo or Carrizo_UcodeInfo: RLC, SDMA0, SDMA1, CE, PFP, ME, MEC1, MEC2 (Stoney's SDMA1 and MEC2 are
+// "SkipLoading" entries with no data).
+static Smu8::CailUcode **stoneyUcodeInfo;
+static bool smuCarrizo;  // the SMU load is for Carrizo / Bristol Ridge (SDMA1, MEC_JT2)
 static uint32_t smuFormatCalls, smuCailSize, smuRegionStart;
 static uint16_t smuCpReloadTask = 0xFFFF, smuClkTableJob = 0xFFFF;
 static uint32_t smuClkTableAt;  // the clock table scratch buffer's offset in our region
@@ -2592,7 +2601,7 @@ static void smuLoadFirmware(void *cail) {
 	auto *base = static_cast<uint8_t *>(cail);
 	smuLoad.blockOffset = *reinterpret_cast<uint64_t *>(base + 0xCE8);
 	if (!stoneyUcodeInfo) {
-		smuLoad.result = "no Stoney_UcodeInfo";
+		smuLoad.result = "no UcodeInfo";
 		return;
 	}
 	if (!smuRegionStart || !smuLoad.blockOffset || *reinterpret_cast<uint32_t *>(base + 0xCD8) != smuCailSize) {
@@ -2610,10 +2619,12 @@ static void smuLoadFirmware(void *cail) {
 		return;
 	}
 
-	// The images: RLC, SDMA0, CE, PFP, ME, MEC1 (Stoney_UcodeInfo slots 0, 1, 3, 4, 5, 6).
-	static const uint8_t slots[] {0, 1, 3, 4, 5, 6};
-	const CailUcode *ucode[arrsize(slots)];
-	for (size_t i = 0; i < arrsize(slots); i++) {
+	// The images: RLC, SDMA0, CE, PFP, ME, MEC1 (UcodeInfo slots 0, 1, 3, 4, 5, 6); on Carrizo also SDMA1 (slot 2) and
+	// MEC2 (slot 7), whose jump table alone is loaded (the MEC runs from the image at CP_CPC_IC_BASE).
+	static const uint8_t slots[] {0, 1, 3, 4, 5, 6, 2, 7};
+	const uint32_t slotNum = smuCarrizo ? 8 : 6, imageNum = smuCarrizo ? 7 : 6;
+	const CailUcode *ucode[arrsize(slots)] {};
+	for (size_t i = 0; i < slotNum; i++) {
 		ucode[i] = stoneyUcodeInfo[slots[i]];
 		if (!ucode[i] || !ucode[i]->data || !ucode[i]->dwords || ucode[i]->dwords > 0x20000) {
 			smuLoad.result = "bad microcode descriptor";
@@ -2632,9 +2643,10 @@ static void smuLoadFirmware(void *cail) {
 
 	// Images, as amdgpu_ucode_init_bo lays them out: each 4 KB aligned; the MEC's jump table also copied to the next
 	// 4 KB boundary after the MEC image (amdgpu_ucode_patch_jt), where the SMU's MEC_JT1 task loads it from.
-	uint32_t offset = UcodeOffset, ucodeAt[arrsize(slots)], ucodeSize[arrsize(slots)], jtAt = 0, jtSize = 0;
+	uint32_t offset = UcodeOffset, ucodeAt[arrsize(slots)] {}, ucodeSize[arrsize(slots)] {}, jtAt = 0, jtSize = 0, jt2At = 0,
+		jt2Size = 0;
 	bool fits = true;
-	for (size_t i = 0; i < arrsize(slots) && fits; i++) {
+	for (size_t i = 0; i < imageNum && fits; i++) {
 		ucodeAt[i] = offset;
 		ucodeSize[i] = ucode[i]->dwords * 4;
 		offset = (offset + ucodeSize[i] + 0xFFF) & ~0xFFFU;
@@ -2650,13 +2662,23 @@ static void smuLoadFirmware(void *cail) {
 		if (fits)
 			memcpy(region + jtAt, mec->data + mec->jtOffset, jtSize);
 	}
-	if (!fits || !jtSize) {
+	if (fits && smuCarrizo) {
+		auto *mec2 = ucode[7];
+		if (mec2->jtSize && mec2->jtOffset + mec2->jtSize <= mec2->dwords) {
+			jt2At = (jtAt + jtSize + 0xFFF) & ~0xFFFU;
+			jt2Size = mec2->jtSize * 4;
+			fits = jt2At + jt2Size <= IhOffset;
+			if (fits)
+				memcpy(region + jt2At, mec2->data + mec2->jtOffset, jt2Size);
+		}
+	}
+	if (!fits || !jtSize || (smuCarrizo && !jt2Size)) {
 		OSSafeReleaseNULL(map);
 		OSSafeReleaseNULL(desc);
 		smuLoad.result = fits ? "MEC has no jump table" : "images don't fit";
 		return;
 	}
-	enum { Rlc, Sdma0, Ce, Pfp, Me, Mec };
+	enum { Rlc, Sdma0, Ce, Pfp, Me, Mec, Sdma1 };
 
 	// Scratch buffers (smu8_smu_init): RLC scratch, SRM ARAM and DRAM save areas, the multimedia power log
 	// (SMU8_MultimediaPowerLogData) and the clock table (SMU8_Fusion_ClkTable), 32-byte aligned.
@@ -2681,6 +2703,8 @@ static void smuLoadFirmware(void *cail) {
 	auto load = [&](uint8_t arg, int image, bool last) {
 		if (arg == MEC_JT1)
 			task(TaskUcodeLoad, arg, jtAt, jtSize, last);
+		else if (arg == MEC_JT2)
+			task(TaskUcodeLoad, arg, jt2At, jt2Size, last);
 		else
 			task(TaskUcodeLoad, arg, ucodeAt[image], ucodeSize[image], last);
 	};
@@ -2697,7 +2721,7 @@ static void smuLoadFirmware(void *cail) {
 	load(PFP, Pfp, false);
 	load(ME, Me, false);
 	load(MEC_JT1, Mec, false);
-	load(MEC_JT1, Mec, false);  // MEC_JT2 on Carrizo
+	load(smuCarrizo ? MEC_JT2 : MEC_JT1, Mec, false);  // Linux loads JT1 twice on Stoney
 	load(RLC_G, Rlc, false);
 	scratch(TaskUcodeLoad, RLC_SCRATCH, Scratch, false);
 	scratch(TaskUcodeLoad, RLC_SRM_ARAM, Aram, false);
@@ -2706,10 +2730,14 @@ static void smuLoadFirmware(void *cail) {
 	scratch(TaskInitialize, ArgInitMmPwrLog, PowerLog, true);
 	uint16_t bootupJob = used;
 	load(SDMA0, Sdma0, false);
+	if (smuCarrizo)
+		load(SDMA1, Sdma1, false);
 	load(CE, Ce, false);
 	load(PFP, Pfp, false);
 	load(ME, Me, false);
 	load(MEC_JT1, Mec, false);
+	if (smuCarrizo)
+		load(MEC_JT2, Mec, false);
 	load(RLC_G, Rlc, true);
 	smuClkTableJob = used;
 	smuClkTableAt = scratchAt[ClkTable];
@@ -2719,7 +2747,9 @@ static void smuLoadFirmware(void *cail) {
 	load(CE, Ce, false);
 	load(PFP, Pfp, false);
 	load(ME, Me, false);
-	load(MEC_JT1, Mec, true);
+	load(MEC_JT1, Mec, !smuCarrizo);
+	if (smuCarrizo)
+		load(MEC_JT2, Mec, true);
 	smuLoad.tasks = used;
 	__sync_synchronize();
 	(void)*reinterpret_cast<volatile uint32_t *>(region + TocOffset);
@@ -2740,9 +2770,10 @@ static void smuLoadFirmware(void *cail) {
 	smuStep(4);
 	smuLoad.resp[5] = smuSendMessage(ExecuteJob, bootupJob);
 	uint32_t status = 0;
+	const uint32_t loadMask = smuCarrizo ? CarrizoLoadMask : StoneyLoadMask;
 	for (uint32_t i = 0; i < 100000; i++) {  // 1 s
 		status = smuReadSram(UcodeLoadStatus);
-		if ((status & StoneyLoadMask) == StoneyLoadMask)
+		if ((status & loadMask) == loadMask)
 			break;
 		IODelay(10);
 	}
@@ -2766,7 +2797,7 @@ static void smuLoadFirmware(void *cail) {
 
 	OSSafeReleaseNULL(map);
 	OSSafeReleaseNULL(desc);
-	smuLoad.result = (status & StoneyLoadMask) == StoneyLoadMask ? "loaded" : "timed out";
+	smuLoad.result = (status & loadMask) == loadMask ? "loaded" : "timed out";
 	traceNote("smuload=%x->%x ", smuLoad.before, smuLoad.after);
 }
 
@@ -2780,7 +2811,8 @@ static void smuReloadCp() {
 	if (!mmio || !smuLoad.result || strcmp(smuLoad.result, "loaded") || smuCpReloadTask == 0xFFFF ||
 		checkKernelArgument("-crnosmureload"))
 		return;
-	constexpr uint32_t CP_ME_CNTL = 0x21B6, mask = 1U << CE | 1U << PFP | 1U << ME | 1U << MEC_JT1;
+	constexpr uint32_t CP_ME_CNTL = 0x21B6;
+	const uint32_t mask = 1U << CE | 1U << PFP | 1U << ME | 1U << MEC_JT1 | (smuCarrizo ? 1U << MEC_JT2 : 0);
 	mmio[CP_ME_CNTL] = mmio[CP_ME_CNTL] | 0x15000000;  // CE, PFP, ME halted
 	uint64_t start = uptimeMs();
 	uint32_t before = smuReadSram(UcodeLoadStatus);
@@ -2860,7 +2892,7 @@ static struct {
 
 static void smuEnableSclkDpm() {
 	using namespace Smu8;
-	if (smuDpm.done || !smuClk.done || !checkKernelArgument("-crsclkdpm"))
+	if (smuDpm.done || !smuClk.done || checkKernelArgument("-crnosclkdpm"))
 		return;
 	smuDpm.done = true;
 	uint32_t top = smuClk.maxLevel;
@@ -2874,8 +2906,9 @@ static void smuEnableSclkDpm() {
 		smuDpm.resp[0] = 0xDEAD;
 		return;
 	}
-	// Ceiling: crsclkmax, default level 6 (847 MHz) while a freeze with DPM on (nvram183, no report) is unexplained.
-	uint32_t ceiling = 6;
+	// Ceiling: crsclkmax, default the top level the SMU reports (900 MHz on the D509BA's A9-9425, 800 MHz on an
+	// A9-9420). The "DPM freezes" were the IH storm breaker (disk log 1792383022), not the clock.
+	uint32_t ceiling = top;
 	PE_parse_boot_argn("crsclkmax", &ceiling, sizeof(ceiling));
 	if (ceiling < top)
 		top = ceiling;
@@ -2912,7 +2945,7 @@ static bool sclkDpmRunning() {
 
 static const char *sclkDpmState() {
 	if (!smuDpm.done)
-		return checkKernelArgument("-crsclkdpm") ? "pending" : "off";
+		return checkKernelArgument("-crnosclkdpm") ? "off" : "pending";
 	return smuDpm.resp[0] == 1 ? "on" : "failed";
 }
 
@@ -3254,13 +3287,17 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crnodirectucode")) {
 			// The flags word store, and the RLC loader's test of the flag (test byte [rbx+0x6F2], 0x20).
 			auto fn = patcher.solveSymbol(index, "_CailReadinOverrideRegistrySetting", slide, size);
-			auto rlc = patcher.solveSymbol(index, "_Stoney_LoadRlcUcode", slide, size);
+			bool carrizo = family == ChipFamily::Carrizo;
+			const char *loadRlcName = carrizo ? "_Carrizo_LoadRlcUcode" : "_Stoney_LoadRlcUcode";
+			const char *formatName = carrizo ? "_Carrizo_FormatSmuDramDataBuffer" : "_Stoney_FormatSmuDramDataBuffer";
+			auto rlc = patcher.solveSymbol(index, loadRlcName, slide, size);
 			patcher.clearError();
 			KernelPatcher::RouteRequest request {"_CailReadinOverrideRegistrySetting",
 				wrapCailReadinOverrideRegistrySetting, orgCailReadinOverrideRegistrySetting};
 			if (!checkKernelArgument("-crnorlcreset")) {
-				KernelPatcher::RouteRequest halt {"_stoney_halt_rlc", wrapStoneyHaltRlc, orgStoneyHaltRlc};
-				auto haltFn = patcher.solveSymbol(index, "_stoney_halt_rlc", slide, size);
+				const char *haltName = carrizo ? "_carrizo_halt_rlc" : "_stoney_halt_rlc";
+				KernelPatcher::RouteRequest halt {haltName, wrapStoneyHaltRlc, orgStoneyHaltRlc};
+				auto haltFn = patcher.solveSymbol(index, haltName, slide, size);
 				patcher.clearError();
 				// RLC_CNTL = 0 (mov esi, 0xEC00), then the serdes idle wait.
 				if (!codeHas(haltFn, 0x20, "be00ec0000"))
@@ -3268,23 +3305,27 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				else
 					routeHwlibs(patcher, index, halt, slide, size, HookHaltRlc);
 			}
-			if (!codeHas(fn, 0x100, "8983f0060000") || !codeHas(rlc, 0x60, "f683f206000020")) {
+			// Stoney's RLC loader tests DisableCailLoadUcode ([cail+0x6F2] bit 0x20) near its start; Carrizo's has a
+			// different flow (the KDK's Carrizo_LoadRlcUcode doesn't test that bit), so only the registry reader is checked.
+			if (!codeHas(fn, 0x100, "8983f0060000") || (!carrizo && !codeHas(rlc, 0x60, "f683f206000020")) || !rlc) {
 				traceNote("directucode=nomatch ");
-			} else if (routeHwlibs(patcher, index, request, slide, size, HookFlags) && family == ChipFamily::Stoney &&
-				!checkKernelArgument("-crnosmuload")) {
+			} else if (routeHwlibs(patcher, index, request, slide, size, HookFlags) && !checkKernelArgument("-crnosmuload")) {
 				// See smuLoadFirmware. The size function must end by storing its total at [cail+0xCD8]
 				// (mov [rbx+0xCD8], eax), which the wrapper relies on.
-				auto info = patcher.solveSymbol(index, "_Stoney_UcodeInfo", slide, size);
-				auto format = patcher.solveSymbol(index, "_Stoney_FormatSmuDramDataBuffer", slide, size);
+				// The size function must store its total at [cail+0xCD8]: Stoney mov [rbx+0xCD8], eax; Carrizo
+				// mov [rbx+0xCD8], r14d.
+				auto info = patcher.solveSymbol(index, carrizo ? "_Carrizo_UcodeInfo" : "_Stoney_UcodeInfo", slide, size);
+				auto format = patcher.solveSymbol(index, formatName, slide, size);
 				patcher.clearError();
-				if (!info || !codeHas(format, 0x120, "8983d80c0000")) {
+				if (!info || !codeHas(format, 0x130, carrizo ? "4489b3d80c0000" : "8983d80c0000")) {
 					traceNote("smuload=nomatch ");
 				} else {
 					stoneyUcodeInfo = reinterpret_cast<Smu8::CailUcode **>(info);
+					smuCarrizo = carrizo;
 					PE_parse_boot_argn("crsmustep", &smuStepLimit, sizeof(smuStepLimit));
 					KernelPatcher::RouteRequest smu[] {
-						{"_Stoney_FormatSmuDramDataBuffer", wrapStoneyFormatSmuDram, orgStoneyFormatSmuDram},
-						{"_Stoney_LoadRlcUcode", wrapStoneyLoadRlcUcode, orgStoneyLoadRlcUcode},
+						{formatName, wrapStoneyFormatSmuDram, orgStoneyFormatSmuDram},
+						{loadRlcName, wrapStoneyLoadRlcUcode, orgStoneyLoadRlcUcode},
 					};
 					if (routeHwlibs(patcher, index, smu[0], slide, size, HookSmuFormat))
 						routeHwlibs(patcher, index, smu[1], slide, size, HookSmuLoad);
