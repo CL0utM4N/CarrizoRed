@@ -4678,9 +4678,41 @@ static uint8_t *carvePtr(uint64_t phys, uint32_t bytes) {
 // needed. Other system memory is read through the physmap after flushing the lines. The carve-out goes through its
 // uncached mapping (8 bytes per memory access) unless -crcarvewb (the physmap, a 64-byte line fill: faster, but see
 // below).
+// Physical memory we may touch: RAM (below TOP_MEM, or from 4 GB up to TOM2: AMD's MSRs C001_001A / C001_001D) and the
+// carve-out (MC_VM_FB_OFFSET, the size of the FB window), never the MMIO hole or anything above. These used to be the
+// D509BA's numbers (3 GB / 8.5 GB): a tester's A9 with more RAM has its 1 GB carve-out at 0x2EF000000, so the
+// interpolation fix read none of its command buffers.
+static uint64_t ramTopLow, ramTopHigh;
+
+static bool physRangeOk(uint64_t phys, uint32_t bytes) {
+	if (!phys || phys + bytes < phys)
+		return false;
+	if (!ramTopLow) {
+		auto rdmsr = [](uint32_t msr) {
+			uint32_t lo, hi;
+			asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+			return static_cast<uint64_t>(hi) << 32 | lo;
+		};
+		uint64_t topMem = rdmsr(0xC001001A) & 0xFFFFFF800000ULL;
+		uint64_t tom2 = rdmsr(0xC001001D) & 0xFFFFFF800000ULL;
+		ramTopHigh = tom2 > 0x100000000ULL ? tom2 : 0;
+		__atomic_store_n(&ramTopLow, topMem ? topMem : 0xC0000000ULL, __ATOMIC_RELEASE);
+	}
+	if (phys + bytes <= ramTopLow)
+		return true;
+	if (phys >= 0x100000000ULL && phys + bytes <= ramTopHigh)
+		return true;
+	auto *mmio = gpuMmio;
+	if (!mmio)
+		return false;
+	uint32_t location = mmio[Reg::MC_VM_FB_LOCATION];
+	uint64_t carve = static_cast<uint64_t>(mmio[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22;
+	uint64_t size = ((static_cast<uint64_t>(location >> 16) + 1) << 24) - (static_cast<uint64_t>(location & 0xFFFF) << 24);
+	return location != 0xFFFFFFFF && carve && phys >= carve && phys + bytes <= carve + size;
+}
+
 static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out, bool coherent = false) {
-	// Only RAM and the carve-out (below 8.5 GB here), never the PCI hole.
-	if (!phys || (phys >= 0xC0000000ULL && phys < 0x100000000ULL) || phys + bytes > 0x220000000ULL)
+	if (!physRangeOk(phys, bytes))
 		return false;
 	// The carve-out through its uncached mapping (as before nvram180) unless -crcarvewb. Reading it through the
 	// physmap's cached mapping as well aliases two memory types on the same RAM, which x86 leaves undefined, and the
@@ -4953,7 +4985,7 @@ struct InterpFixStats {
 static InterpFixStats interpFix;
 
 static bool ibWritePhys(uint64_t phys, uint32_t bytes, const void *in) {
-	if (!phys || (phys >= 0xC0000000ULL && phys < 0x100000000ULL) || phys + bytes > 0x220000000ULL)
+	if (!physRangeOk(phys, bytes))
 		return false;
 	if (auto *fast = carvePtr(phys, bytes)) {
 		memcpy(fast, in, bytes);
