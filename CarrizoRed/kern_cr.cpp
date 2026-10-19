@@ -19,6 +19,7 @@
 #include <kern/debug.h>
 #include <kern/clock.h>
 #include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
 #include <pexpert/pexpert.h>
 #include <sys/fcntl.h>
 #include <sys/mount.h>
@@ -992,7 +993,8 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 }
 
 void CRDriver::startWatcher() {
-	if (iGPU && !iGPU->registerPrioritySleepWakeInterest(sleepWakeHandler, this))
+	auto *root = IOService::getPMRootDomain();
+	if (!root || !root->registerPrioritySleepWakeInterest(sleepWakeHandler, this))
 		SYSLOG("cr", "failed to register for sleep/wake");
 	thread_t thread;
 	if (kernel_thread_start(watcherThread, this, &thread) == KERN_SUCCESS)
