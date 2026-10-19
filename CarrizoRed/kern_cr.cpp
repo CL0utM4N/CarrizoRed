@@ -992,7 +992,8 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 }
 
 void CRDriver::startWatcher() {
-	if (!registerPrioritySleepWakeInterest(sleepWakeHandler, this))
+	auto *root = IOService::getPMRootDomain();
+	if (!root || !root->registerInterest(gIOGeneralInterest, sleepWakeHandler, this))
 		SYSLOG("cr", "failed to register for sleep/wake");
 	thread_t thread;
 	if (kernel_thread_start(watcherThread, this, &thread) == KERN_SUCCESS)
