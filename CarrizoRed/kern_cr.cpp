@@ -635,10 +635,17 @@ void CRDriver::init() {
 }
 
 static uint64_t *physmapBaseVar, *physmapMaxVar;  // see physmapPtr
+// The kernel's message buffer (bsd/sys/msgbuf.h), for mirrorKernelLog.
+struct KernelMsgBuf {
+	int magic, size, bufx, bufr;
+	char *bufc;
+};
+static KernelMsgBuf **msgbufVar;
 
 void CRDriver::processPatcher(KernelPatcher &patcher) {
 	physmapBaseVar = reinterpret_cast<uint64_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_base"));
 	physmapMaxVar = reinterpret_cast<uint64_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_max"));
+	msgbufVar = reinterpret_cast<KernelMsgBuf **>(patcher.solveSymbol(KernelPatcher::KernelID, "_msgbufp"));
 	patcher.clearError();
 	bool anyPagePatch = false;
 	for (auto &patch : pagePatches) {
@@ -993,6 +1000,46 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			break;
 	}
 	return kIOReturnSuccess;
+}
+
+// Kernel log lines about sleep and wake into the disk log (watcher thread). The 15:46 and 21:04 sleeps: "system will
+// sleep", then 30 s of normal ticks and the log ends; 30 s is the power manager's acknowledgement timeout, and its
+// "PM response took ... / notification timeout" lines name the driver or app that held sleep up.
+static void mirrorKernelLog() {
+	static int seen = -1;
+	static char line[200];
+	static uint32_t lineLen, mirrored;
+	auto *mb = msgbufVar ? *msgbufVar : nullptr;
+	if (!mb || mb->magic != 0x63061 || !mb->bufc || mb->size <= 0 || mirrored >= 3000)
+		return;
+	int size = mb->size, x = mb->bufx;
+	if (x < 0 || x >= size)
+		return;
+	if (seen < 0 || seen >= size) {
+		seen = x;
+		return;
+	}
+	static const char *const keys[] {"PM ", "PMRD", "leep", "ake", "imeout", "ibernat", "IOPCI", "Radeon", "AMD", "ATI",
+		"GPU", "isplay", "AGDC", "AGDP"};
+	for (int n = 0; seen != x && n < size; n++, seen = (seen + 1) % size) {
+		char c = mb->bufc[seen];
+		if (c != '\n' && lineLen + 1 < sizeof(line)) {
+			line[lineLen++] = c;
+			continue;
+		}
+		if (c != '\n')
+			continue;  // overlong: cut, the rest dropped until the newline
+		line[lineLen] = '\0';
+		bool want = strncmp(line, "CarrizoRed", 10) != 0;
+		bool hit = false;
+		for (size_t k = 0; want && !hit && k < arrsize(keys); k++)
+			hit = strnstr(line, keys[k], lineLen) != nullptr;
+		if (want && hit) {
+			diskLogEvent("klog: %s", line);
+			mirrored++;
+		}
+		lineLen = 0;
+	}
 }
 
 void CRDriver::startWatcher() {
@@ -1374,10 +1421,11 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		panicAt = 0;
 	uint32_t printed = 0;
 	last[0] = '\0';
-	// Tick every 500 ms for 30 minutes.
-	for (uint32_t tick = 0, t = 0; t <= 1800; tick++, t = tick / 2) {
+	// Tick every 500 ms (a sleep late in a session needs the log too: no end any more).
+	for (uint32_t tick = 0, t = 0;; tick++, t = tick / 2) {
 		if (!gpuMmio)
 			self->probeMMIO();  // start-up couldn't map the registers: keep trying
+		mirrorKernelLog();
 		// After each wake: the power manager's sleep/wake properties (wake reason, sleep failure), into the disk log.
 		{
 			static uint32_t wakesLogged;
@@ -1509,7 +1557,9 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			}
 		}
 		censusLog();
-		diskLogTick(t, stallTicks);
+		// After 30 minutes the status line every 10 s; events still go out within the tick.
+		if (t <= 1800 || tick % 20 == 0 || __atomic_load_n(&diskLogEventLen, __ATOMIC_RELAXED))
+			diskLogTick(t, stallTicks);
 		// The full black-box report in the log at 2 minutes and every 5 minutes after.
 		if (!diskLogOff && diskLogStarted && t >= 120 && (t - 120) % 300 == 0 && tick % 2 == 0) {
 			const char *report = self->composeReport(t, now);
@@ -2706,12 +2756,27 @@ static void smuStep(uint32_t step) {
 		IOSleep(1000);
 }
 
+static void smuResetAfterPowerLoss();
+static uint32_t smuLoadCalls, smuPowerLosses;
+
 static void smuLoadFirmware(void *cail) {
 	using namespace Smu8;
 	CRDriver::ensureMmio();
 	auto *mmio = gpuMmio;
-	if (smuLoad.result || !mmio)
+	if (!mmio)
 		return;
+	smuLoadCalls++;
+	if (smuLoad.result) {
+		// CAIL initialises the ASIC again after a wake. S3 powers the APU's GPU off, SMU included: its firmware has
+		// forgotten our load (UcodeLoadStatus no longer shows the engines) and the clock levels, so load it again.
+		uint32_t status = smuReadSram(UcodeLoadStatus), mask = smuCarrizo ? CarrizoLoadMask : StoneyLoadMask;
+		bool lost = !strcmp(smuLoad.result, "loaded") && (status & mask) != mask;
+		diskLogEvent("smu load call %u: load status %x (%s)", smuLoadCalls, status, lost ? "lost: loading again" : "kept");
+		if (!lost)
+			return;
+		smuPowerLosses++;
+		smuResetAfterPowerLoss();
+	}
 	auto *base = static_cast<uint8_t *>(cail);
 	smuLoad.blockOffset = *reinterpret_cast<uint64_t *>(base + 0xCE8);
 	if (!stoneyUcodeInfo) {
@@ -3078,6 +3143,14 @@ static void smuEnableSclkDpm() {
 		smuDpm.resp[3], smuDpm.resp[4], smuDpm.resp[5], smuDpm.resp[6]);
 }
 
+
+// After the SMU lost power: our load, SCLK DPM and the video power-up are done again (the load now, the others by
+// their usual triggers).
+static void smuResetAfterPowerLoss() {
+	smuLoad = {};
+	smuDpm.done = false;
+	smuVideo.done = false;
+}
 
 static bool sclkDpmRunning() {
 	return smuDpm.done && smuDpm.resp[0] == 1;
