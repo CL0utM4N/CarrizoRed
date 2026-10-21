@@ -429,6 +429,7 @@ namespace IhReg {
 static volatile uint32_t *gpuMmio;  // BAR5, mapped by probeMMIO
 static uint32_t probeValues[4];       // CONFIG_MEMSIZE, MC_VM_FB_LOCATION, MC_VM_FB_OFFSET, GRBM_STATUS at the mapping
 static uint64_t probeMs, probePhys;
+static uint32_t mmioMapMethod, mmioMapFailures;  // 1 IOKit, 2 BAR5 from config space; failed attempts
 // crsmustep=N: stop the SMU load (smuLoadFirmware) after step N and have the watcher panic with the report. nvram74:
 // the full load froze the whole machine (no crpanicat panic); a boot that freezes without a report points at the step.
 static uint32_t smuStepLimit = 0xFF, smuStoppedAt;
@@ -1375,6 +1376,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 	last[0] = '\0';
 	// Tick every 500 ms for 30 minutes.
 	for (uint32_t tick = 0, t = 0; t <= 1800; tick++, t = tick / 2) {
+		if (!gpuMmio)
+			self->probeMMIO();  // start-up couldn't map the registers: keep trying
 		// New trace events (written lock-free by the wrappers).
 		uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
 		if (head - printed > TraceRingSize) {
@@ -2506,6 +2509,7 @@ static mach_vm_address_t orgStoneyHaltRlc;
 static uint32_t rlcResets, rlcCgcgBefore, rlcPgBefore, rlcMgcgBefore;
 
 static uint64_t wrapStoneyHaltRlc(void *cail) {
+	CRDriver::ensureMmio();
 	auto ret = FunctionCast(wrapStoneyHaltRlc, orgStoneyHaltRlc)(cail);
 	if (auto *mmio = gpuMmio) {
 		constexpr uint32_t GRBM_SOFT_RESET = 0x2008, RLC_PG_CNTL = 0xEC43, RLC_CGCG_CGLS_CTRL = 0xEC49;
@@ -2673,6 +2677,7 @@ static void smuStep(uint32_t step) {
 
 static void smuLoadFirmware(void *cail) {
 	using namespace Smu8;
+	CRDriver::ensureMmio();
 	auto *mmio = gpuMmio;
 	if (smuLoad.result || !mmio)
 		return;
@@ -4668,14 +4673,43 @@ void CRDriver::logPCIInfo() {
 	}
 }
 
+// The GPU's registers (BAR5). IOKit's mapDeviceMemoryWithRegister can fail when CarrizoRed starts before the PCI
+// family has registered the device's memory ranges (nvram4-6: black screens, gpuMmio never set, so no SMU microcode
+// load, no FB move, nothing): then map BAR5 straight from config space (256 KB, uncached). Retried on demand
+// (ensureMmio) from the watcher, the SMU loader and the RLC halt hook.
+static volatile uint32_t *mapGpuMmio(IOPCIDevice *dev) {
+	if (auto *map = dev->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5)) {
+		mmioMapMethod = 1;
+		probePhys = map->getPhysicalAddress();
+		return reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
+	}
+	mmioMapFailures++;
+	uint32_t bar = dev->configRead32(kIOPCIConfigBaseAddress5) & ~0xFU;
+	if (!bar || bar == 0xFFFFFFF0U)
+		return nullptr;
+	if (!(dev->configRead16(kIOPCIConfigCommand) & 2))
+		dev->configWrite16(kIOPCIConfigCommand, dev->configRead16(kIOPCIConfigCommand) | 2);  // memory space on
+	auto *desc = IOMemoryDescriptor::withPhysicalAddress(bar, 0x40000, kIODirectionInOut);
+	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+	OSSafeReleaseNULL(desc);
+	if (!map)
+		return nullptr;
+	mmioMapMethod = 2;
+	probePhys = bar;
+	return reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
+}
+
+void CRDriver::ensureMmio() {
+	if (!gpuMmio && callback && callback->iGPU)
+		callback->probeMMIO();
+}
+
 void CRDriver::probeMMIO() {
-	auto *map = iGPU->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5);
-	if (!map) {
-		SYSLOG("cr", "failed to map MMIO BAR, skipping register probe");
+	auto *mmio = mapGpuMmio(iGPU);
+	if (!mmio) {
+		SYSLOG("cr", "failed to map MMIO BAR, skipping register probe (will retry)");
 		return;
 	}
-
-	auto *mmio = reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress());
 	// Keep the mapping: the IH storm breaker writes registers directly (see wrapIhHandler), and the watcher reads the
 	// display registers (checkDisplayRegs).
 	gpuMmio = mmio;
@@ -4688,7 +4722,6 @@ void CRDriver::probeMMIO() {
 	probeValues[2] = fbOffset;
 	probeValues[3] = grbmStatus;
 	probeMs = uptimeMs();
-	probePhys = map->getPhysicalAddress();
 	if (gpuRegistersDead(mmio)) {
 		gpuDeadAtStart = true;
 		checkGpuAlive(mmio);
@@ -7049,12 +7082,12 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 	if (iGPU) {
 		uint16_t pm = iGPU->findPCICapability(kIOPCIPowerManagementCapability);
 		add("early: pci %04x:%04x rev %x cmd %x status %x pmcsr %x bar0 %x bar2 %x bar5 %x; mmio phys %llx mapped at %llu ms: "
-			"memsize %x fbloc %x fboff %x grbm %x\n", iGPU->configRead16(kIOPCIConfigVendorID),
+			"method %u failures %u memsize %x fbloc %x fboff %x grbm %x\n", iGPU->configRead16(kIOPCIConfigVendorID),
 			iGPU->configRead16(kIOPCIConfigDeviceID), iGPU->configRead8(kIOPCIConfigRevisionID),
 			iGPU->configRead16(kIOPCIConfigCommand), iGPU->configRead16(kIOPCIConfigStatus),
 			pm ? iGPU->configRead16(static_cast<uint8_t>(pm + 4)) : 0xFFFF, iGPU->configRead32(kIOPCIConfigBaseAddress0),
 			iGPU->configRead32(kIOPCIConfigBaseAddress2), iGPU->configRead32(kIOPCIConfigBaseAddress5), probePhys, probeMs,
-			probeValues[0], probeValues[1], probeValues[2], probeValues[3]);
+			mmioMapMethod, mmioMapFailures, probeValues[0], probeValues[1], probeValues[2], probeValues[3]);
 	}
 	if (auto *m = gpuMmio) {
 		uint32_t smuVersion = smuWindowRead(0x10000000 + 0x1FF80), smuLoadStatus = smuWindowRead(0x10000000 + 0x1FF98);

@@ -14,6 +14,8 @@
 
 class CRDriver {
 public:
+	// Map the GPU's registers if start-up couldn't (see probeMMIO); cheap once mapped.
+	static void ensureMmio();
 	void init();
 
 private:
