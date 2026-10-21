@@ -993,7 +993,20 @@ static thread_call_t wakeWatchdogCall;
 static uint32_t wakeWakesAtStart, wakeBeatAtStart;
 
 static void wakeWatchdog(thread_call_param_t, thread_call_param_t) {
-	CRDriver::wakeWatchdogFired(systemWakes == wakeWakesAtStart, watcherBeat - wakeBeatAtStart);
+	CRDriver::wakeWatchdogFired("45 s after kIOMessageSystemWillPowerOn", systemWakes == wakeWakesAtStart,
+		watcherBeat - wakeBeatAtStart);
+}
+
+// nvram8: black screen on wake and no panic, so the wake never reached kIOMessageSystemWillPowerOn (platform, ACPI or
+// PCI restore) or the kernel never ran again. This one is armed at "will sleep": thread call deadlines count awake
+// time only, so it fires about 150 s of awake time later, ~30 s before sleep (wifip2pd's timeout) plus ~2 min after
+// the CPU resumes. Disarmed by the wake completing (or the sleep being cancelled).
+static thread_call_t sleepWatchdogCall;
+static uint32_t sleepWakesAtStart;
+
+static void sleepWatchdog(thread_call_param_t, thread_call_param_t) {
+	CRDriver::wakeWatchdogFired("150 s of awake time after kIOMessageSystemWillSleep", systemWakes == sleepWakesAtStart,
+		20);
 }
 
 static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *, void *, vm_size_t) {
@@ -1001,6 +1014,12 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 		case kIOMessageSystemWillSleep:
 			systemSleeps++;
 			diskLogEvent("system will sleep (%u)", systemSleeps);
+			if (sleepWatchdogCall) {
+				sleepWakesAtStart = systemWakes;
+				uint64_t deadline = 0;
+				clock_interval_to_deadline(150, kSecondScale, &deadline);
+				thread_call_enter_delayed(sleepWatchdogCall, deadline);
+			}
 			break;
 		case kIOMessageSystemWillPowerOn:
 			diskLogEvent("system will power on");
@@ -1063,19 +1082,20 @@ static void mirrorKernelLog() {
 	}
 }
 
-void CRDriver::wakeWatchdogFired(bool notPoweredOn, uint32_t beats) {
+void CRDriver::wakeWatchdogFired(const char *when, bool notPoweredOn, uint32_t beats) {
 	if (!notPoweredOn && beats >= 20)
 		return;
-	char reason[160];
-	snprintf(reason, sizeof(reason), "CarrizoRed: wake stuck 45 s after kIOMessageSystemWillPowerOn: %s, watcher ticks %u "
-		"(sleep %u, wake %u).", notPoweredOn ? "system never powered on" : "the watcher stopped", beats, systemSleeps,
-		systemWakes);
+	char reason[200];
+	snprintf(reason, sizeof(reason), "CarrizoRed: wake stuck %s: %s, watcher ticks %u (sleep %u, wake %u).", when,
+		notPoweredOn ? "system never powered on" : "the watcher stopped", beats, systemSleeps, systemWakes);
 	panic("%s\n%s", reason, callback->composeReport(0, ""));
 }
 
 void CRDriver::startWatcher() {
-	if (!checkKernelArgument("-crnowakepanic"))
+	if (!checkKernelArgument("-crnowakepanic")) {
 		wakeWatchdogCall = thread_call_allocate(wakeWatchdog, nullptr);
+		sleepWatchdogCall = thread_call_allocate(sleepWatchdog, nullptr);
+	}
 	auto *root = IOService::getPMRootDomain();
 	if (!root || !root->registerInterest(gIOGeneralInterest, sleepWakeHandler, this))
 		SYSLOG("cr", "failed to register for sleep/wake");
@@ -1462,7 +1482,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		mirrorKernelLog();
 		// After each wake: the power manager's sleep/wake properties (wake reason, sleep failure), into the disk log.
 		{
-			static uint32_t wakesLogged;
+			static uint32_t wakesLogged = 0xFFFFFFFF;  // also once at boot: the last sleep's failure record
 			if (systemWakes != wakesLogged) {
 				wakesLogged = systemWakes;
 				auto *root = IOService::getPMRootDomain();
@@ -1484,8 +1504,13 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 						diskLogEvent("pm %s = %llx", name, num->unsigned64BitValue());
 					else if (auto *b = OSDynamicCast(OSBoolean, value))
 						diskLogEvent("pm %s = %s", name, b->isTrue() ? "true" : "false");
-					else if (auto *data = OSDynamicCast(OSData, value))
-						diskLogEvent("pm %s = data[%u]", name, data->getLength());
+					else if (auto *data = OSDynamicCast(OSData, value)) {
+						auto *bytes = static_cast<const uint8_t *>(data->getBytesNoCopy());
+						char hex[100] {};
+						for (uint32_t q = 0; q < data->getLength() && q < 48; q++)
+							snprintf(hex + q * 2, 3, "%02x", bytes[q]);
+						diskLogEvent("pm %s = data[%u] %s", name, data->getLength(), hex);
+					}
 				}
 				OSSafeReleaseNULL(keys);
 				OSSafeReleaseNULL(props);
