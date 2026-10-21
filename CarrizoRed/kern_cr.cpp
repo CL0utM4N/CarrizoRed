@@ -6483,7 +6483,7 @@ struct CensusEntry {
 	uint32_t regs[13], userData[4], tex[4];
 	uint32_t mimgCount, mimg[4];  // the shader's image instructions: op << 16 | dmask << 8 | first resource SGPR
 	// The resource descriptors (T#) the first two image instructions use, read from memory at the draw: how they were
-	// found (0 not found, 1 from a user-data pointer, 2 through one more pointer) and their 8 dwords.
+	// found (0 not found, 3 by running the scalar code before the instruction) and their 8 dwords.
 	uint32_t descHow[2], desc[2][8];
 	uint64_t firstMs;
 	uint32_t count;
@@ -6493,7 +6493,7 @@ static constexpr uint16_t censusRegs[13] {0x31C, 0x31D, 0x32B, 0x08E, 0x202, 0x1
 	0x203, 0x1C5};
 static CensusEntry census[1024];
 static uint32_t censusNum, censusFull;
-static uint32_t censusCtx[0x400], censusUserData[16];
+static uint32_t censusCtx[0x400], censusUserData[16], censusRsrc2;  // RSRC2_PS: the user SGPR count
 static uint64_t censusPs;
 static int censusOff = -1;
 static struct {
@@ -6549,52 +6549,185 @@ static void censusDraw(uint32_t vmid) {
 			}
 			i += gcn3InstLength(code + i, got - i);
 		}
-		// Where an SGPR's value came from before instruction `at`: the last S_LOAD_DWORD{,X2,X4,X8,X16} with an
-		// immediate offset that wrote it (SMEM: sbase [5:0] x2, sdata [12:6], imm [17], op [25:18], offset dword 1
-		// [19:0], bytes). Returns false if none (then it is a user SGPR, s0-s15, from SPI_SHADER_USER_DATA_PS).
-		auto findLoad = [&](uint32_t at, uint32_t sgpr, uint32_t &base, uint32_t &offset) {
-			bool found = false;
-			for (uint32_t i = 0; i < at && i < end;) {
-				uint32_t w = code[i];
-				if ((w >> 26) == 0x30 && i + 1 < end && ((w >> 17) & 1)) {
-					uint32_t op = (w >> 18) & 0xFF, sdata = (w >> 6) & 0x7F;
-					uint32_t n = op <= 4 ? 1U << op : 0;
-					if (n && sdata <= sgpr && sgpr < sdata + n) {
-						base = (w & 0x3F) * 2;
-						offset = (code[i + 1] & 0xFFFFF) + (sgpr - sdata) * 4;
-						found = true;
-					}
+		// The resource descriptors: run the scalar code before each image instruction (straight through, branches not
+		// taken) on the draw's user SGPRs, doing its scalar loads from memory, so the T# SGPRs end up known however the
+		// shader builds their address (8:59 log: the folder mask's T# is 32 bytes at a loaded table + user s8 * 32).
+		static uint32_t sv[128];
+		static bool sk[128];
+		auto run = [&](uint32_t at) {
+			memset(sk, 0, sizeof(sk));
+			uint32_t users = (censusRsrc2 >> 1) & 0x1F;
+			for (uint32_t r = 0; r < users && r < arrsize(censusUserData); r++) {
+				sv[r] = censusUserData[r];
+				sk[r] = true;
+			}
+			bool scc = false, sccKnown = false;
+			auto drop = [&](uint32_t r, uint32_t n) {
+				for (uint32_t q = r; q < r + n && q < 128; q++)
+					sk[q] = false;
+			};
+			auto set = [&](uint32_t r, uint32_t v) {
+				if (r < 128) {
+					sv[r] = v;
+					sk[r] = true;
 				}
-				i += gcn3InstLength(code + i, end - i);
+			};
+			for (uint32_t i = 0; i < at && i < end;) {
+				uint32_t w = code[i], len = gcn3InstLength(code + i, end - i), lit = i + 1 < end ? code[i + 1] : 0;
+				auto src = [&](uint32_t s, uint32_t &v) {
+					if (s < 128) {
+						v = sv[s];
+						return sk[s];
+					}
+					if (s <= 192)
+						v = s - 128;
+					else if (s <= 208)
+						v = static_cast<uint32_t>(192 - static_cast<int32_t>(s));
+					else if (s == 255)
+						v = lit;
+					else
+						return false;
+					return true;
+				};
+				uint32_t top9 = w >> 23;
+				if ((w >> 30) == 2 && top9 == 0x17D) {  // SOP1
+					uint32_t op = (w >> 8) & 0xFF, d = (w >> 16) & 0x7F, a = 0, b = 0;
+					if (op == 0 && src(w & 0xFF, a)) {  // s_mov_b32
+						set(d, a);
+					} else if (op == 1 && (w & 0xFF) < 127 && src(w & 0xFF, a) && src((w & 0xFF) + 1, b)) {  // s_mov_b64
+						set(d, a);
+						set(d + 1, b);
+					} else if (op == 28) {  // s_getpc_b64: the next instruction's address
+						uint64_t pc = e.ps + (i + 1) * 4ULL;
+						set(d, static_cast<uint32_t>(pc));
+						set(d + 1, static_cast<uint32_t>(pc >> 32));
+					} else {
+						drop(d, 2);
+						drop(126, 2);
+						sccKnown = false;
+					}
+				} else if ((w >> 30) == 2 && top9 == 0x17E) {  // SOPC: compares (eq, lg, gt, ge, lt, le; i32 then u32)
+					uint32_t op = (w >> 16) & 0x7F, a = 0, b = 0;
+					sccKnown = op <= 11 && src(w & 0xFF, a) && src((w >> 8) & 0xFF, b);
+					if (sccKnown) {
+						int32_t x = static_cast<int32_t>(a), y = static_cast<int32_t>(b);
+						bool u = op >= 6;
+						switch (op % 6) {
+							case 0: scc = a == b; break;
+							case 1: scc = a != b; break;
+							case 2: scc = u ? a > b : x > y; break;
+							case 3: scc = u ? a >= b : x >= y; break;
+							case 4: scc = u ? a < b : x < y; break;
+							default: scc = u ? a <= b : x <= y; break;
+						}
+					}
+				} else if ((w >> 30) == 2 && top9 == 0x17F) {  // SOPP: branches not followed
+				} else if ((w >> 28) == 0xB) {  // SOPK
+					uint32_t op = (w >> 23) & 0x1F, d = (w >> 16) & 0x7F, a = 0;
+					uint32_t imm = static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(w & 0xFFFF)));
+					if (op == 0)  // s_movk_i32
+						set(d, imm);
+					else if (op == 14 && src(d, a))  // s_addk_i32
+						set(d, a + imm);
+					else if (op < 2 || (op > 13 && (op < 18 || op > 20)))  // writes d (not s_cmpk_*, s_setreg*)
+						drop(d, 1);
+					if (op >= 2 && op <= 14)
+						sccKnown = false;
+				} else if ((w >> 30) == 2) {  // SOP2
+					uint32_t op = (w >> 23) & 0x7F, d = (w >> 16) & 0x7F, a = 0, b = 0;
+					bool ok = src(w & 0xFF, a) && src((w >> 8) & 0xFF, b);
+					uint64_t wide = static_cast<uint64_t>(a) + b;
+					switch (ok ? op : 0xFF) {
+						case 0:  // s_add_u32
+							set(d, a + b);
+							scc = wide >> 32;
+							sccKnown = true;
+							break;
+						case 1:  // s_sub_u32
+							set(d, a - b);
+							scc = b > a;
+							sccKnown = true;
+							break;
+						case 4:  // s_addc_u32
+							if (sccKnown) {
+								wide += scc;
+								set(d, static_cast<uint32_t>(wide));
+								scc = wide >> 32;
+							} else {
+								drop(d, 1);
+							}
+							break;
+						case 10:  // s_cselect_b32
+							if (sccKnown)
+								set(d, scc ? a : b);
+							else
+								drop(d, 1);
+							break;
+						case 12: case 14: case 16: case 28: case 30: {  // s_and/or/xor/lshl/lshr_b32
+							uint32_t v = op == 12 ? a & b : op == 14 ? a | b : op == 16 ? a ^ b : op == 28 ? a << (b & 31) : a >> (b & 31);
+							set(d, v);
+							scc = v != 0;
+							sccKnown = true;
+							break;
+						}
+						case 36:  // s_mul_i32
+							set(d, a * b);
+							break;
+						default:
+							drop(d, 2);
+							drop(126, 2);
+							sccKnown = false;
+							break;
+					}
+				} else if ((w >> 26) == 0x30) {  // SMEM: s_load_dword* (0-4), s_buffer_load_dword* (8-12) done from memory
+					uint32_t op = (w >> 18) & 0xFF, d = (w >> 6) & 0x7F, base = (w & 0x3F) * 2, off = 0;
+					bool imm = (w >> 17) & 1;
+					uint32_t n = op <= 4 ? 1U << op : op >= 8 && op <= 12 ? 1U << (op - 8) : 0;
+					if (n) {
+						uint32_t lo = 0, hi = 0, got = 0;
+						bool ok = d + n <= 128 && src(base, lo) && src(base + 1, hi);
+						if (ok && imm)
+							off = lit & 0xFFFFF;
+						else if (ok)
+							ok = src(lit & 0xFF, off);
+						if (ok) {
+							uint64_t va = ((static_cast<uint64_t>(hi & 0xFFFF) << 32 | lo) + off) & ~3ULL;
+							got = readGpuVa(vmid, va, n, sv + d, false);
+						}
+						for (uint32_t q = 0; q < n && d + q < 128; q++)
+							sk[d + q] = q < got;
+					} else if (!(op >= 16 && op <= 18) && !(op >= 24 && op <= 26)) {  // not a store
+						drop(d, 2);
+					}
+				} else if ((w >> 25) == 0x3F) {  // VOP1: v_readfirstlane_b32 writes an SGPR
+					if (((w >> 9) & 0xFF) == 2)
+						drop((w >> 17) & 0xFF, 1);
+				} else if ((w >> 25) == 0x3E) {  // VOPC: vcc
+					drop(106, 2);
+				} else if (!(w >> 31)) {  // VOP2: v_add/sub/subrev/addc/subb/subbrev_u32 write vcc
+					uint32_t op = (w >> 25) & 0x3F;
+					if (op >= 25 && op <= 30)
+						drop(106, 2);
+				} else if ((w >> 26) == 0x34) {  // VOP3: compares and readlane write [7:0], VOP3b carries to [14:8]
+					uint32_t op = (w >> 16) & 0x3FF;
+					if (op < 0x100 || op == 0x289)
+						drop(w & 0xFF, op < 0x100 ? 2 : 1);
+					else if ((op >= 0x119 && op <= 0x11E) || op == 0x1E0 || op == 0x1E1)
+						drop((w >> 8) & 0x7F, 2);
+				}
+				i += len;
 			}
-			return found;
-		};
-		// The 64-bit value of an SGPR pair at `at`: user data, or loaded through one pointer that is user data.
-		auto pairValue = [&](uint32_t at, uint32_t sgpr, uint32_t &how, uint64_t &value) {
-			uint32_t base = 0, offset = 0;
-			if (!findLoad(at, sgpr, base, offset)) {
-				if (sgpr + 1 >= arrsize(censusUserData))
-					return false;
-				value = static_cast<uint64_t>(censusUserData[sgpr + 1] & 0xFFFF) << 32 | censusUserData[sgpr];
-				how = 1;
-				return value != 0;
-			}
-			if (base + 1 >= arrsize(censusUserData))
-				return false;
-			uint64_t table = static_cast<uint64_t>(censusUserData[base + 1] & 0xFFFF) << 32 | censusUserData[base];
-			uint32_t pair[2] {};
-			if (!table || readGpuVa(vmid, table + offset, 2, pair, false) != 2)
-				return false;
-			value = static_cast<uint64_t>(pair[1] & 0xFFFF) << 32 | pair[0];
-			how = 2;
-			return value != 0;
 		};
 		for (uint32_t k = 0; k < 2 && k < e.mimgCount; k++) {
-			uint32_t at = mimgAt[k], srsrc = ((code[at + 1] >> 16) & 0x1F) * 4, base = 0, offset = 0, how = 0;
-			uint64_t ptr = 0;
-			if (findLoad(at, srsrc, base, offset) && pairValue(at, base, how, ptr) &&
-				readGpuVa(vmid, ptr + offset, 8, e.desc[k], false) == 8)
-				e.descHow[k] = how;
+			uint32_t at = mimgAt[k], srsrc = ((code[at + 1] >> 16) & 0x1F) * 4;
+			run(at);
+			bool all = srsrc + 8 <= 128;
+			for (uint32_t q = 0; q < 8 && all; q++)
+				all = sk[srsrc + q];
+			if (all) {
+				memcpy(e.desc[k], sv + srsrc, sizeof(e.desc[k]));
+				e.descHow[k] = 3;
+			}
 		}
 		// An alpha-only sample (a mask, like the folder icon's) whose descriptor couldn't be traced: keep the code that
 		// sets it up (up to 96 dwords before the sample), for 8 shaders, to see how its resource SGPRs are built.
@@ -6713,6 +6846,8 @@ static void processUserIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords, bool al
 				uint32_t reg = start + k, v = buf[j + 2 + k];
 				if (reg >= 0x0C && reg <= 0x1B)  // SPI_SHADER_USER_DATA_PS_0-15: s0-s15 in the pixel shader
 					censusUserData[reg - 0x0C] = v;
+				if (reg == 0x0B)  // SPI_SHADER_PGM_RSRC2_PS
+					censusRsrc2 = v;
 				if (reg == 0x08) {
 					psLo = v;
 					touched = true;
