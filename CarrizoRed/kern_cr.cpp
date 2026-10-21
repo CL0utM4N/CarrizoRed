@@ -16,6 +16,7 @@
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <kern/debug.h>
 #include <kern/clock.h>
 #include <IOKit/IOMessage.h>
@@ -982,6 +983,18 @@ void CRDriver::wrapSetCrtcToPixelClock(void *that, uint8_t crtc, uint8_t pll, vo
 // microcode load, the FB window move, SCLK DPM, RB+, video power) has to be redone on wake. First, see the sequence.
 static void diskLogEvent(const char *fmt, ...);
 static uint32_t systemSleeps, systemWakes;
+static volatile uint32_t watcherBeat;  // watcher ticks, for the wake watchdog
+
+// Wake watchdog (21:34 sleep: the log ends at "sleep params" and the machine never came back, nothing in NVRAM). 45 s
+// after "system will power on", panic with the report if the wake never completed or the watcher (which writes the
+// disk log) stopped ticking: the panic log is the one thing that survives the forced restart. It runs on a thread
+// call, not the watcher, which may itself be stuck on a disk that didn't wake. -crnowakepanic disables it.
+static thread_call_t wakeWatchdogCall;
+static uint32_t wakeWakesAtStart, wakeBeatAtStart;
+
+static void wakeWatchdog(thread_call_param_t, thread_call_param_t) {
+	CRDriver::wakeWatchdogFired(systemWakes == wakeWakesAtStart, watcherBeat - wakeBeatAtStart);
+}
 
 static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *, void *, vm_size_t) {
 	switch (messageType) {
@@ -991,6 +1004,13 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			break;
 		case kIOMessageSystemWillPowerOn:
 			diskLogEvent("system will power on");
+			if (wakeWatchdogCall) {
+				wakeWakesAtStart = systemWakes;
+				wakeBeatAtStart = watcherBeat;
+				uint64_t deadline = 0;
+				clock_interval_to_deadline(45, kSecondScale, &deadline);
+				thread_call_enter_delayed(wakeWatchdogCall, deadline);
+			}
 			break;
 		case kIOMessageSystemHasPoweredOn:
 			systemWakes++;
@@ -1030,7 +1050,8 @@ static void mirrorKernelLog() {
 		if (c != '\n')
 			continue;  // overlong: cut, the rest dropped until the newline
 		line[lineLen] = '\0';
-		bool want = strncmp(line, "CarrizoRed", 10) != 0;
+		bool want = !strnstr(line, "CarrizoRed", lineLen) && !strnstr(line, "CapabilityChange[", lineLen) &&
+			!strnstr(line, "display_change_handler", lineLen);
 		bool hit = false;
 		for (size_t k = 0; want && !hit && k < arrsize(keys); k++)
 			hit = strnstr(line, keys[k], lineLen) != nullptr;
@@ -1042,7 +1063,19 @@ static void mirrorKernelLog() {
 	}
 }
 
+void CRDriver::wakeWatchdogFired(bool notPoweredOn, uint32_t beats) {
+	if (!notPoweredOn && beats >= 20)
+		return;
+	char reason[160];
+	snprintf(reason, sizeof(reason), "CarrizoRed: wake stuck 45 s after kIOMessageSystemWillPowerOn: %s, watcher ticks %u "
+		"(sleep %u, wake %u).", notPoweredOn ? "system never powered on" : "the watcher stopped", beats, systemSleeps,
+		systemWakes);
+	panic("%s\n%s", reason, callback->composeReport(0, ""));
+}
+
 void CRDriver::startWatcher() {
+	if (!checkKernelArgument("-crnowakepanic"))
+		wakeWatchdogCall = thread_call_allocate(wakeWatchdog, nullptr);
 	auto *root = IOService::getPMRootDomain();
 	if (!root || !root->registerInterest(gIOGeneralInterest, sleepWakeHandler, this))
 		SYSLOG("cr", "failed to register for sleep/wake");
@@ -1423,6 +1456,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 	last[0] = '\0';
 	// Tick every 500 ms (a sleep late in a session needs the log too: no end any more).
 	for (uint32_t tick = 0, t = 0;; tick++, t = tick / 2) {
+		watcherBeat++;
 		if (!gpuMmio)
 			self->probeMMIO();  // start-up couldn't map the registers: keep trying
 		mirrorKernelLog();
@@ -7373,6 +7407,8 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 			m[Reg::CONFIG_MEMSIZE], m[0xEC00], m[0xEC05], m[0xEC04], m[0x21C0], m[0x3045], m[0x21B6], smuVersion, smuLoadStatus,
 			m[0x1C0], m[0x1D0], m[0x1E0]);
 	}
+	add("early sleep: sleeps %u wakes %u, smu load calls %u, power losses %u; ", systemSleeps, systemWakes, smuLoadCalls,
+		smuPowerLosses);
 	add("early smuload: %s, resp %x %x %x %x %x %x, status %x -> %x in %u ms; ", smuLoad.result ? smuLoad.result : "not run",
 		smuLoad.resp[0], smuLoad.resp[1], smuLoad.resp[2], smuLoad.resp[3], smuLoad.resp[4], smuLoad.resp[5], smuLoad.before,
 		smuLoad.after, smuLoad.ms);

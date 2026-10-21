@@ -16,6 +16,8 @@ class CRDriver {
 public:
 	// Map the GPU's registers if start-up couldn't (see probeMMIO); cheap once mapped.
 	static void ensureMmio();
+	// The wake watchdog's verdict (see wakeWatchdog): panics with the report unless the wake went through.
+	static void wakeWatchdogFired(bool notPoweredOn, uint32_t beats);
 	void init();
 
 private:
