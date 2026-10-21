@@ -427,6 +427,8 @@ namespace IhReg {
 	                          RB_WPTR_ADDR_LO = 0xE35, CNTL = 0xE36, STATUS = 0xE38;
 }
 static volatile uint32_t *gpuMmio;  // BAR5, mapped by probeMMIO
+static uint32_t probeValues[4];       // CONFIG_MEMSIZE, MC_VM_FB_LOCATION, MC_VM_FB_OFFSET, GRBM_STATUS at the mapping
+static uint64_t probeMs, probePhys;
 // crsmustep=N: stop the SMU load (smuLoadFirmware) after step N and have the watcher panic with the report. nvram74:
 // the full load froze the whole machine (no crpanicat panic); a boot that freezes without a report points at the step.
 static uint32_t smuStepLimit = 0xFF, smuStoppedAt;
@@ -1188,6 +1190,9 @@ static char diskLogPath[96];
 static bool diskLogOff, diskLogStarted;
 static uint32_t diskLogWrites, diskLogErrors, diskLogLastError;
 static char diskLogEvents[65536];
+// The last events, kept for the report's early block (the panic log keeps the start of the report).
+static char diskLogRecent[24][120];
+static uint32_t diskLogRecentNext;
 static uint32_t diskLogEventLen, diskLogEventsDropped;
 static volatile uint32_t diskLogEventLock;
 
@@ -1214,6 +1219,16 @@ static void diskLogEvent(const char *fmt, ...) {
 					static_cast<uint32_t>(n) : static_cast<uint32_t>(sizeof(diskLogEvents) - diskLogEventLen - 2);
 			diskLogEvents[diskLogEventLen++] = '\n';
 			diskLogEvents[diskLogEventLen] = '\0';
+			// The line just queued, from its timestamp: into the recent ring.
+			char *line = diskLogEvents + diskLogEventLen - 1;
+			while (line > diskLogEvents && line[-1] != '\n')
+				line--;
+			auto &slot = diskLogRecent[diskLogRecentNext++ % arrsize(diskLogRecent)];
+			size_t n = static_cast<size_t>(diskLogEvents + diskLogEventLen - 1 - line);
+			if (n >= sizeof(slot))
+				n = sizeof(slot) - 1;
+			memcpy(slot, line, n);
+			slot[n] = '\0';
 		}
 	} else {
 		diskLogEventsDropped++;
@@ -4668,6 +4683,12 @@ void CRDriver::probeMMIO() {
 	auto fbLocation = mmio[Reg::MC_VM_FB_LOCATION];
 	auto fbOffset = mmio[Reg::MC_VM_FB_OFFSET];
 	auto grbmStatus = mmio[Reg::GRBM_STATUS];
+	probeValues[0] = memSize;
+	probeValues[1] = fbLocation;
+	probeValues[2] = fbOffset;
+	probeValues[3] = grbmStatus;
+	probeMs = uptimeMs();
+	probePhys = map->getPhysicalAddress();
 	if (gpuRegistersDead(mmio)) {
 		gpuDeadAtStart = true;
 		checkGpuAlive(mmio);
@@ -7023,6 +7044,40 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 		if (n > 0)
 			len += static_cast<size_t>(n) < sizeof(report) - len ? static_cast<size_t>(n) : sizeof(report) - len - 1;
 	};
+	// Early block first: the panic log keeps the start of the report and drops the middle, and a start-up that fails
+	// before the display or the accelerator is up needs these (nvram4/5: registers reading 0 before the SMU load).
+	if (iGPU) {
+		uint16_t pm = iGPU->findPCICapability(kIOPCIPowerManagementCapability);
+		add("early: pci %04x:%04x rev %x cmd %x status %x pmcsr %x bar0 %x bar2 %x bar5 %x; mmio phys %llx mapped at %llu ms: "
+			"memsize %x fbloc %x fboff %x grbm %x\n", iGPU->configRead16(kIOPCIConfigVendorID),
+			iGPU->configRead16(kIOPCIConfigDeviceID), iGPU->configRead8(kIOPCIConfigRevisionID),
+			iGPU->configRead16(kIOPCIConfigCommand), iGPU->configRead16(kIOPCIConfigStatus),
+			pm ? iGPU->configRead16(static_cast<uint8_t>(pm + 4)) : 0xFFFF, iGPU->configRead32(kIOPCIConfigBaseAddress0),
+			iGPU->configRead32(kIOPCIConfigBaseAddress2), iGPU->configRead32(kIOPCIConfigBaseAddress5), probePhys, probeMs,
+			probeValues[0], probeValues[1], probeValues[2], probeValues[3]);
+	}
+	if (auto *m = gpuMmio) {
+		uint32_t smuVersion = smuWindowRead(0x10000000 + 0x1FF80), smuLoadStatus = smuWindowRead(0x10000000 + 0x1FF98);
+		add("early now: grbm %x fbloc %x fboff %x memsize %x rlc cntl %x safe %x stat %x cp rptr %x wptr %x me cntl %x; "
+			"smu ver %x load %x mbox %x/%x/%x\n", m[Reg::GRBM_STATUS], m[Reg::MC_VM_FB_LOCATION], m[Reg::MC_VM_FB_OFFSET],
+			m[Reg::CONFIG_MEMSIZE], m[0xEC00], m[0xEC05], m[0xEC04], m[0x21C0], m[0x3045], m[0x21B6], smuVersion, smuLoadStatus,
+			m[0x1C0], m[0x1D0], m[0x1E0]);
+	}
+	add("early smuload: %s, resp %x %x %x %x %x %x, status %x -> %x in %u ms; ", smuLoad.result ? smuLoad.result : "not run",
+		smuLoad.resp[0], smuLoad.resp[1], smuLoad.resp[2], smuLoad.resp[3], smuLoad.resp[4], smuLoad.resp[5], smuLoad.before,
+		smuLoad.after, smuLoad.ms);
+	add("cail waits %u, %u failed:", cailWaits, cailWaitFailures);
+	for (uint32_t i = 0; i < cailWaitFailures && i < 2; i++)
+		add(" [%x]&%x!=%x(%x @%llu)", cailWaitFails[i].reg, cailWaitFails[i].mask, cailWaitFails[i].value, cailWaitFails[i].read,
+			cailWaitFails[i].ms);
+	add("; RLC at halt: cgcg %x pg %x\n", rlcCgcgBefore, rlcPgBefore);
+	add("early events:");
+	for (uint32_t i = 0; i < arrsize(diskLogRecent); i++) {
+		auto &line = diskLogRecent[(diskLogRecentNext + i) % arrsize(diskLogRecent)];
+		if (line[0])
+			add(" | %s", line);
+	}
+	add("\n");
 	add("boot DP lanes %u (lane cap %s), LB size fixes %u%s, boot DP depth %u, bpc caps %u%s\n", bootDpLanes,
 		checkKernelArgument("-crnolanecap") ? "off" : "on", lbFixes, lbFixOff ? " (off)" : "", bootDpDepth, bpcCaps,
 		bpcCapOff ? " (off)" : "");
