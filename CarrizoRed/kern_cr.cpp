@@ -1378,6 +1378,37 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 	for (uint32_t tick = 0, t = 0; t <= 1800; tick++, t = tick / 2) {
 		if (!gpuMmio)
 			self->probeMMIO();  // start-up couldn't map the registers: keep trying
+		// After each wake: the power manager's sleep/wake properties (wake reason, sleep failure), into the disk log.
+		{
+			static uint32_t wakesLogged;
+			if (systemWakes != wakesLogged) {
+				wakesLogged = systemWakes;
+				auto *root = IOService::getPMRootDomain();
+				auto *props = root ? root->dictionaryWithProperties() : nullptr;
+				auto *keys = props ? OSCollectionIterator::withCollection(props) : nullptr;
+				while (keys) {
+					auto *key = OSDynamicCast(OSSymbol, keys->getNextObject());
+					if (!key)
+						break;
+					const char *name = key->getCStringNoCopy();
+					if (!strnstr(const_cast<char *>(name), "Wake", strlen(name)) &&
+						!strnstr(const_cast<char *>(name), "Sleep", strlen(name)) &&
+						!strnstr(const_cast<char *>(name), "Failure", strlen(name)))
+						continue;
+					auto *value = props->getObject(key);
+					if (auto *str = OSDynamicCast(OSString, value))
+						diskLogEvent("pm %s = %s", name, str->getCStringNoCopy());
+					else if (auto *num = OSDynamicCast(OSNumber, value))
+						diskLogEvent("pm %s = %llx", name, num->unsigned64BitValue());
+					else if (auto *b = OSDynamicCast(OSBoolean, value))
+						diskLogEvent("pm %s = %s", name, b->isTrue() ? "true" : "false");
+					else if (auto *data = OSDynamicCast(OSData, value))
+						diskLogEvent("pm %s = data[%u]", name, data->getLength());
+				}
+				OSSafeReleaseNULL(keys);
+				OSSafeReleaseNULL(props);
+			}
+		}
 		// New trace events (written lock-free by the wrappers).
 		uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
 		if (head - printed > TraceRingSize) {
@@ -6465,6 +6496,12 @@ static uint32_t censusNum, censusFull;
 static uint32_t censusCtx[0x400], censusUserData[16];
 static uint64_t censusPs;
 static int censusOff = -1;
+static struct {
+	uint64_t ps;
+	uint32_t mimgAt, start, count, words[96];
+	bool logged;
+} censusCode[8];
+static uint32_t censusCodeNum;
 
 static void censusDraw(uint32_t vmid) {
 	CensusEntry e {};
@@ -6559,6 +6596,26 @@ static void censusDraw(uint32_t vmid) {
 				readGpuVa(vmid, ptr + offset, 8, e.desc[k], false) == 8)
 				e.descHow[k] = how;
 		}
+		// An alpha-only sample (a mask, like the folder icon's) whose descriptor couldn't be traced: keep the code that
+		// sets it up (up to 96 dwords before the sample), for 8 shaders, to see how its resource SGPRs are built.
+		for (uint32_t k = 0; k < 2 && k < e.mimgCount; k++) {
+			uint32_t at = mimgAt[k];
+			if (((code[at] >> 8) & 0xF) != 0x8 || e.descHow[k] || censusCodeNum >= arrsize(censusCode))
+				continue;
+			bool known = false;
+			for (uint32_t c = 0; c < censusCodeNum && !known; c++)
+				known = censusCode[c].ps == e.ps;
+			if (known)
+				break;
+			auto &dump = censusCode[censusCodeNum];
+			dump.ps = e.ps;
+			dump.mimgAt = at;
+			dump.start = at + 2 > arrsize(dump.words) ? at + 2 - arrsize(dump.words) : 0;
+			dump.count = at + 2 - dump.start;
+			memcpy(dump.words, code + dump.start, dump.count * 4);
+			__atomic_store_n(&censusCodeNum, censusCodeNum + 1, __ATOMIC_RELEASE);
+			break;
+		}
 	}
 	e.firstMs = uptimeMs();
 	e.count = 1;
@@ -6568,6 +6625,18 @@ static void censusDraw(uint32_t vmid) {
 
 // New draw-census entries to the disk log (watcher thread).
 static void censusLog() {
+	uint32_t codes = __atomic_load_n(&censusCodeNum, __ATOMIC_ACQUIRE);
+	for (uint32_t c = 0; c < codes; c++) {
+		auto &dump = censusCode[c];
+		if (dump.logged)
+			continue;
+		dump.logged = true;
+		static char hex[96 * 9 + 1];
+		size_t len = 0;
+		for (uint32_t w = 0; w < dump.count; w++)
+			len += static_cast<size_t>(snprintf(hex + len, sizeof(hex) - len, "%08x ", dump.words[w]));
+		diskLogEvent("shader %llx code from dword %u (sample at %u): %s", dump.ps, dump.start, dump.mimgAt, hex);
+	}
 	uint32_t n = __atomic_load_n(&censusNum, __ATOMIC_ACQUIRE), batch = 0;
 	for (uint32_t i = 0; i < n && batch < 40; i++) {  // at most 40 per tick, so the event buffer can't overflow
 		auto &e = census[i];
