@@ -136,7 +136,8 @@ similar machines. It includes:
 - the ACPI fixes (`SSDT-XOSI`, EC/USBX) and a USB map;
 - VoodooPS2 and VoodooI2C (touchpad);
 - [FCHXHCIFix](https://github.com/CL0utM4N/FCHXHCIFix) (USB, see below);
-- with `--carrizored --spoof`, CarrizoRed and the iGPU spoof below.
+- CarrizoRed and the iGPU spoof below, when the script is run with `--carrizored --spoof` (options of the script,
+  not boot-args).
 
 The pieces CarrizoRed needs:
 1. **Kexts:** add `Lilu.kext`, then `CarrizoRed.kext`, to `EFI/OC/Kexts` and to `config.plist` (Lilu first).
