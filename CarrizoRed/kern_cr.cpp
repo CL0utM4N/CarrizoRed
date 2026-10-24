@@ -8,6 +8,7 @@
 
 #include "kern_cr.hpp"
 #include "kern_vbios.hpp"
+#include "kern_sigs.hpp"
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_devinfo.hpp>
@@ -50,10 +51,71 @@ static size_t routePoolUsed;
 static uint32_t routesOk, routesFailed, routesUnverified;
 static const char *routeLastFailed;
 
+// HWLibs functions by signature (kern_sigs.hpp) where the symbol is missing: builds before Sequoia ship HWLibs
+// stripped. Each signature is searched once per load address; the occurrence-th match is the function.
+static uint32_t hwsigResolved, hwsigMissed;
+static mach_vm_address_t hwlibsTextStart;  // HWLibs' __TEXT_EXEC (found when it loads)
+static uint64_t hwlibsTextSize;
+
+static mach_vm_address_t hwsigFind(const char *symbol, mach_vm_address_t start, size_t size) {
+	static mach_vm_address_t found[arrsize(hwlibsSignatures)];
+	static mach_vm_address_t foundStart;
+	if (foundStart != start) {
+		memset(found, 0, sizeof(found));
+		foundStart = start;
+	}
+	// Only HWLibs' executable segment, which must lie in the kext being patched.
+	if (!hwlibsTextStart || hwlibsTextStart < start || hwlibsTextStart + hwlibsTextSize > start + size)
+		return 0;
+	for (size_t s = 0; s < arrsize(hwlibsSignatures); s++) {
+		auto &sig = hwlibsSignatures[s];
+		if (strcmp(sig.symbol, symbol))
+			continue;
+		if (found[s])
+			return found[s];
+		mach_vm_address_t textStart = hwlibsTextStart;
+		size = hwlibsTextSize;
+		auto *base = reinterpret_cast<const uint8_t *>(textStart);
+		uint32_t seen = 0;
+		for (size_t i = 0; i + sig.size <= size; i++) {
+			size_t k = 0;
+			while (k < sig.size && (base[i + k] & sig.mask[k]) == (sig.pattern[k] & sig.mask[k]))
+				k++;
+			if (k == sig.size && seen++ == sig.occurrence) {
+				found[s] = textStart + i;
+				hwsigResolved++;
+				return found[s];
+			}
+		}
+		hwsigMissed++;
+		return 0;
+	}
+	return 0;
+}
+
+// The symbol, else its signature (for HWLibs functions on stripped builds).
+static mach_vm_address_t solveOrSignature(KernelPatcher &patcher, size_t index, const char *symbol,
+	mach_vm_address_t slide, size_t size) {
+	auto addr = patcher.solveSymbol(index, symbol, slide, size);
+	if (addr)
+		return addr;
+	addr = hwsigFind(symbol, slide, size);
+	if (addr)
+		patcher.clearError();
+	return addr;
+}
+
 static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::RouteRequest &request,
 	mach_vm_address_t slide, size_t size) {
 	if (request.org) {
 		auto func = patcher.solveSymbol(index, request.symbol, slide, size);
+		bool bySignature = false;
+		if (!func) {
+			func = hwsigFind(request.symbol, slide, size);
+			bySignature = func != 0;
+			if (bySignature)
+				patcher.clearError();
+		}
 		if (!func) {
 			SYSLOG("cr", "route: %s not found (error %d)", request.symbol, patcher.getError());
 			return false;
@@ -105,7 +167,18 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 		routePoolUsed += (copied + 14 + 15) & ~static_cast<size_t>(15);
 		*request.org = reinterpret_cast<mach_vm_address_t>(tramp);
 		KernelPatcher::RouteRequest jump {request.symbol, request.to};
-		if (!patcher.routeMultipleLong(index, &jump, 1, slide, size)) {
+		bool written;
+		if (bySignature) {
+			// No symbol for Lilu to resolve: write the jump at the address.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+			patcher.routeFunctionLong(func, request.to, false, true, false);
+#pragma clang diagnostic pop
+			written = patcher.getError() == KernelPatcher::Error::NoError;
+		} else {
+			written = patcher.routeMultipleLong(index, &jump, 1, slide, size);
+		}
+		if (!written) {
 			SYSLOG("cr", "route: %s: failed to write the jump (error %d)", request.symbol, patcher.getError());
 			*request.org = 0;
 			routesFailed++;
@@ -2757,6 +2830,7 @@ static mach_vm_address_t orgStoneyFormatSmuDram, orgStoneyLoadRlcUcode;
 // CAIL's Stoney_UcodeInfo or Carrizo_UcodeInfo: RLC, SDMA0, SDMA1, CE, PFP, ME, MEC1, MEC2 (Stoney's SDMA1 and MEC2 are
 // "SkipLoading" entries with no data).
 static Smu8::CailUcode **stoneyUcodeInfo;
+static mach_vm_address_t ucodeGoldenSettings;  // stripped HWLibs: GetGpuGoldenSettings(cail), whose +0x10 is the table
 static bool smuCarrizo;  // the SMU load is for Carrizo / Bristol Ridge (SDMA1, MEC_JT2)
 static uint32_t smuFormatCalls, smuCailSize, smuRegionStart;
 static uint16_t smuCpReloadTask = 0xFFFF, smuClkTableJob = 0xFFFF;
@@ -2772,6 +2846,11 @@ static struct {
 } smuLoad;
 
 static uint64_t wrapStoneyFormatSmuDram(void *cail) {
+	if (!stoneyUcodeInfo && ucodeGoldenSettings) {
+		auto *golden = reinterpret_cast<uint8_t *(*)(void *)>(ucodeGoldenSettings)(cail);
+		if (golden)
+			stoneyUcodeInfo = *reinterpret_cast<Smu8::CailUcode ***>(golden + 0x10);
+	}
 	auto size = static_cast<uint32_t>(FunctionCast(wrapStoneyFormatSmuDram, orgStoneyFormatSmuDram)(cail));
 	smuFormatCalls++;
 	smuCailSize = size;
@@ -3347,8 +3426,6 @@ static mach_vm_address_t hwlibsSlide, hwlibsEarlyInit, hwlibsLiveEarlyInit;
 static uint32_t hwlibsRepatches, hwlibsLiveChecks;
 static IOMemoryDescriptor *hwlibsWired;
 static IOReturn hwlibsWireResult = kIOReturnNotReady;
-static mach_vm_address_t hwlibsTextStart;
-static uint64_t hwlibsTextSize;
 static uint8_t hwlibsAfterBytes[8];  // earlyInitialize's first bytes right after re-patching
 // Physical page behind earlyInitialize when we patched it and at setupCAIL (pmap_find_phys on the kernel pmap, solved at
 // run time), and a test write: did a byte written there read back? (nvram133: re-patch reported success but the bytes
@@ -3470,7 +3547,9 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		// every patch). Locked pages can't be.
 		// Only the executable segment (nvram130: wiring the whole image failed, it includes __LINKEDIT, which the
 		// kernel discards after linking).
-		if (!hwlibsWired && !checkKernelArgument("-crnohwlibswire")) {
+		// The executable segment: wired below, and the range hwsigFind searches (a kext's range in a kernel collection
+		// isn't one mapping, so the whole of it can't be read).
+		{
 			mach_vm_address_t text = 0;
 			uint64_t textSize = 0;
 			auto *header = reinterpret_cast<const mach_header_64 *>(slide);
@@ -3498,6 +3577,10 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			}
 			hwlibsTextStart = text;
 			hwlibsTextSize = textSize;
+		}
+		if (!hwlibsWired && !checkKernelArgument("-crnohwlibswire")) {
+			mach_vm_address_t text = hwlibsTextStart;
+			uint64_t textSize = hwlibsTextSize;
 			if (text && textSize) {
 				// Touch every page first, then wire.
 				volatile uint8_t sink = 0;
@@ -3515,7 +3598,7 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		hwlibsIndex = index;
 		hwlibsSize = size;
 		hwlibsSlide = slide;
-		hwlibsEarlyInit = patcher.solveSymbol(index,
+		hwlibsEarlyInit = solveOrSignature(patcher, index,
 			"__ZN15AmdCailServices15earlyInitializeEP23_MCIL_SERVICE_CALLBACKSP15_CailInitialize", slide, size);
 		patcher.clearError();
 		if (!kernelPmapFindPhys) {
@@ -3558,18 +3641,18 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		}
 		if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crnodirectucode")) {
 			// The flags word store, and the RLC loader's test of the flag (test byte [rbx+0x6F2], 0x20).
-			auto fn = patcher.solveSymbol(index, "_CailReadinOverrideRegistrySetting", slide, size);
+			auto fn = solveOrSignature(patcher, index, "_CailReadinOverrideRegistrySetting", slide, size);
 			bool carrizo = family == ChipFamily::Carrizo;
 			const char *loadRlcName = carrizo ? "_Carrizo_LoadRlcUcode" : "_Stoney_LoadRlcUcode";
 			const char *formatName = carrizo ? "_Carrizo_FormatSmuDramDataBuffer" : "_Stoney_FormatSmuDramDataBuffer";
-			auto rlc = patcher.solveSymbol(index, loadRlcName, slide, size);
+			auto rlc = solveOrSignature(patcher, index, loadRlcName, slide, size);
 			patcher.clearError();
 			KernelPatcher::RouteRequest request {"_CailReadinOverrideRegistrySetting",
 				wrapCailReadinOverrideRegistrySetting, orgCailReadinOverrideRegistrySetting};
 			if (!checkKernelArgument("-crnorlcreset")) {
 				const char *haltName = carrizo ? "_carrizo_halt_rlc" : "_stoney_halt_rlc";
 				KernelPatcher::RouteRequest halt {haltName, wrapStoneyHaltRlc, orgStoneyHaltRlc};
-				auto haltFn = patcher.solveSymbol(index, haltName, slide, size);
+				auto haltFn = solveOrSignature(patcher, index, haltName, slide, size);
 				patcher.clearError();
 				// RLC_CNTL = 0 (mov esi, 0xEC00), then the serdes idle wait.
 				if (!codeHas(haltFn, 0x20, "be00ec0000"))
@@ -3587,9 +3670,18 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				// The size function must store its total at [cail+0xCD8]: Stoney mov [rbx+0xCD8], eax; Carrizo
 				// mov [rbx+0xCD8], r14d.
 				auto info = patcher.solveSymbol(index, carrizo ? "_Carrizo_UcodeInfo" : "_Stoney_UcodeInfo", slide, size);
-				auto format = patcher.solveSymbol(index, formatName, slide, size);
 				patcher.clearError();
-				if (!info || !codeHas(format, 0x130, carrizo ? "4489b3d80c0000" : "8983d80c0000")) {
+				auto format = solveOrSignature(patcher, index, formatName, slide, size);
+				patcher.clearError();
+				// Stripped builds: no symbol for the microcode table. The format function starts with
+				// mov rbx, rdi; call GetGpuGoldenSettings; mov rax, [rax+0x10] (the table, as GoldenSettings+0x10
+				// holds it in 15.8.1), so take the call's target and ask it in wrapStoneyFormatSmuDram.
+				if (!info && format && codeHas(format, 0x12, "4889fbe8") && codeHas(format + 0x16, 4, "488b4010")) {
+					int32_t rel;
+					memcpy(&rel, reinterpret_cast<const void *>(format + 0x12), sizeof(rel));
+					ucodeGoldenSettings = format + 0x16 + rel;
+				}
+				if ((!info && !ucodeGoldenSettings) || !codeHas(format, 0x130, carrizo ? "4489b3d80c0000" : "8983d80c0000")) {
 					traceNote("smuload=nomatch ");
 				} else {
 					stoneyUcodeInfo = reinterpret_cast<Smu8::CailUcode **>(info);
@@ -3606,6 +3698,8 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 		}
 		if (!checkKernelArgument("-crnotrace"))
 			routeStages(patcher, index, slide, size, InHWLibs);
+		if (hwsigResolved || hwsigMissed)
+			traceNote("hwsig=%u/%u ", hwsigResolved, hwsigMissed);  // HWLibs functions found by signature / not found
 	}
 }
 
