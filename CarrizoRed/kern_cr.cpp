@@ -3682,10 +3682,16 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				for (uint64_t off = 0; off < textSize; off += PAGE_SIZE)
 					sink = sink + *reinterpret_cast<volatile const uint8_t *>(text + off);
 				(void)sink;
-				hwlibsWired = IOMemoryDescriptor::withAddressRange(text, textSize, kIODirectionInOut, kernel_task);
-				hwlibsWireResult = hwlibsWired ? hwlibsWired->prepare() : kIOReturnNoMemory;
-				if (hwlibsWireResult != kIOReturnSuccess)
+				// Read-only first: the code is mapped r-x, and asking for write access (InOut) fails on it since the range is
+				// the __text section (Sequoia and Ventura logs: hwlibs=notwired). Wiring only needs the pages resident.
+				static const IODirection directions[] {kIODirectionOut, kIODirectionInOut};
+				for (auto direction : directions) {
+					hwlibsWired = IOMemoryDescriptor::withAddressRange(text, textSize, direction, kernel_task);
+					hwlibsWireResult = hwlibsWired ? hwlibsWired->prepare() : kIOReturnNoMemory;
+					if (hwlibsWireResult == kIOReturnSuccess)
+						break;
 					OSSafeReleaseNULL(hwlibsWired);
+				}
 			}
 			traceNote("hwlibs=%s ", hwlibsWired ? "wired" : "notwired");
 		}
