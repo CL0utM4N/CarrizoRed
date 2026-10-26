@@ -300,6 +300,9 @@ static void checkLiveHwlibs(void *hardware);
 // (context register indices 0x1D4-0x1DF) and set SX_BLEND_OPT_CONTROL (0x1D6) to every MRT's colour and alpha
 // optimisation off plus PIXEN_ZERO_OPT_DISABLE (0xB3333333). -crnorbplusfix only records.
 static bool rbplusDone;
+// Every context register the clear-state buffer sets (what a context starts with before Metal sets anything), for the
+// one-time context dump (censusLog).
+static uint32_t csbCtx[0x400], csbCtxSet[0x400 / 32];
 static uint32_t rbplusValues[12], rbplusSeen, rbplusPatched, rbplusCsibDwords;
 static uint64_t rbplusCsib;
 
@@ -334,6 +337,10 @@ static void fixRbPlus(volatile uint32_t *mmio, bool stoney) {
 				uint32_t start = buf[i + 1];
 				for (uint32_t k = 0; k + 1 < count; k++) {
 					uint32_t reg = start + k;
+					if (reg < 0x400) {
+						csbCtx[reg] = buf[i + 2 + k];
+						csbCtxSet[reg / 32] |= 1U << (reg % 32);
+					}
 					if (reg >= 0x1D4 && reg <= 0x1DF) {
 						rbplusValues[reg - 0x1D4] = buf[i + 2 + k];
 						rbplusSeen |= 1U << (reg - 0x1D4);
@@ -6582,11 +6589,43 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 // Seen pixel shaders: VMID, address, hash of the code as we last saw (or left) it, the VGPRS field it needs when we
 // gave it more registers (0: its own), and whether a fix is still pending (no register without raising the allocation,
 // which only the submit hook can do).
+// GPU copies seen in command buffers (DMA_DATA, WRITE_DATA, COPY_DATA to memory): the shader fixer patches a shader at
+// submission, from the CPU, but the GPU runs the command buffers queued before it later. A copy that lands on the
+// shader after the patch (in an earlier command buffer still queued, or in the same one before the draw) puts the
+// unfixed code back for that submission, and the fixer finds it reverted at the next bind: a glitch in some frames
+// only (Sequoia: 24 reverts in a boot). Each GPU cache is invalidated at the start of every submission (Apple's frame
+// template: SURFACE_SYNC with CP_COHER_CNTL 0xFEEFFFCF, I$ K$ TCL1 TC WB), so stale caches aren't the problem; the
+// order is. These record the copies so a bind or a revert can be matched to one.
+struct GpuCopy {
+	uint64_t dst, src, ms;
+	uint32_t bytes, op, vmid, ctrl;
+};
+static GpuCopy gpuCopies[64];
+static uint32_t gpuCopyNext, gpuCopyPackets, gpuCopyBindHits, gpuCopyRevertHits, gpuCopyLogged;
+
+static void noteGpuCopy(uint32_t vmid, uint32_t op, uint32_t ctrl, uint64_t src, uint64_t dst, uint32_t bytes) {
+	gpuCopyPackets++;
+	gpuCopies[gpuCopyNext++ % arrsize(gpuCopies)] = {dst & 0xFFFFFFFFFFFFULL, src & 0xFFFFFFFFFFFFULL, uptimeMs(), bytes,
+		op, vmid, ctrl};
+}
+
+// The most recent copy (within 200 ms) whose destination overlaps the shader's first 4 KB.
+static const GpuCopy *recentCopyTo(uint32_t vmid, uint64_t va) {
+	uint64_t now = uptimeMs();
+	const GpuCopy *best = nullptr;
+	for (auto &c : gpuCopies)
+		if (c.bytes && c.vmid == vmid && now - c.ms <= 200 && c.dst < va + 0x1000 && va < c.dst + c.bytes &&
+			(!best || c.ms >= best->ms))
+			best = &c;
+	return best;
+}
+
 struct SeenShader {
 	uint64_t va;
 	uint32_t vmid, hash, vgprs;
 	bool pending;
 	uint32_t probeAt, probeVal;  // a fixed instruction and its fixed value (probeAt 0xFFFFFFFF: none)
+	uint64_t fixedMs;            // when it was (last) fixed
 };
 static SeenShader seenShaders[512];
 static uint32_t seenNum, seenNext;
@@ -6713,6 +6752,13 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 			(readGpuVa(vmid, psVa + entry->probeAt * 4ULL, 1, &now, false) == 1 && now == entry->probeVal))
 			return withRaise(vmid, psVa, rsrc1);
 		interpFix.probeReverts++;
+		auto *c = recentCopyTo(vmid, psVa);
+		if (c)
+			gpuCopyRevertHits++;
+		if (interpFix.probeReverts <= 60)
+			diskLogEvent("interp revert: ps %llx vmid %u, fixed %llu ms before; copy to it: %s op %x src %llx %u bytes "
+				"%llu ms ago", psVa, vmid, uptimeMs() - entry->fixedMs, c ? "yes" : "no", c ? c->op : 0, c ? c->src : 0,
+				c ? c->bytes : 0, c ? uptimeMs() - c->ms : 0);
 	}
 	uint32_t have = readGpuVa(vmid, psVa, arrsize(code), code, true);
 	while (have && have < arrsize(code) && !gcn3ProgramEnd(code, have)) {
@@ -6774,7 +6820,7 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 		}
 	}
 	SeenShader fresh {psVa, vmid, codeHash(print, 16), ok ? newVgprs : 0,
-		skip == SkipNoFreeVgpr && !allowBump, probeAt, probeVal};
+		skip == SkipNoFreeVgpr && !allowBump, probeAt, probeVal, uptimeMs()};
 	if (entry) {
 		*entry = fresh;
 	} else if (seenNum < arrsize(seenShaders)) {
@@ -6809,7 +6855,11 @@ static constexpr uint16_t censusRegs[13] {0x31C, 0x31D, 0x32B, 0x08E, 0x202, 0x1
 	0x203, 0x1C5};
 static CensusEntry census[1024];
 static uint32_t censusNum, censusFull;
-static uint32_t censusCtx[0x400], censusUserData[16], censusRsrc2;  // RSRC2_PS: the user SGPR count
+static uint32_t censusCtx[0x400], censusUserData[16], censusRsrc2;
+// Which context / uconfig registers Metal has set (the dump tells "set to 0" from "never set").
+static uint32_t censusCtxSet[0x400 / 32], censusUcfg[0x400], censusUcfgSet[0x400 / 32];
+static bool ctxDumped;
+  // RSRC2_PS: the user SGPR count
 static uint64_t censusPs;
 static int censusOff = -1;
 static struct {
@@ -7072,8 +7122,41 @@ static void censusDraw(uint32_t vmid) {
 	__atomic_store_n(&censusNum, n + 1, __ATOMIC_RELEASE);
 }
 
+// One-time dump of the context state: every context register Metal has set (last values), every uconfig register it set,
+// and the clear-state buffer's context registers (the defaults under them), 8 per line, to compare with what Mesa
+// programs for Stoney.
+static void ctxDump() {
+	auto dump = [](const char *what, uint32_t base, const uint32_t *val, const uint32_t *set, uint32_t n) {
+		char line[200];
+		size_t len = 0;
+		uint32_t total = 0;
+		for (uint32_t r = 0; r < n; r++) {
+			if (!(set[r / 32] & (1U << (r % 32))))
+				continue;
+			total++;
+			len += snprintf(line + len, sizeof(line) - len, " %x=%x", base + r * 4, val[r]);
+			if (len > 150) {
+				diskLogEvent("%s:%s", what, line);
+				len = 0;
+			}
+		}
+		if (len)
+			diskLogEvent("%s:%s", what, line);
+		diskLogEvent("%s: %u registers", what, total);
+	};
+	dump("ctx metal", 0x28000, censusCtx, censusCtxSet, 0x400);
+	dump("ctx clearstate", 0x28000, csbCtx, csbCtxSet, 0x400);
+	dump("uconfig metal", 0x30000, censusUcfg, censusUcfgSet, 0x400);
+	diskLogEvent("gpu copies: %u packets, %u binds and %u reverts right after a copy to the shader", gpuCopyPackets,
+		gpuCopyBindHits, gpuCopyRevertHits);
+}
+
 // New draw-census entries to the disk log (watcher thread).
 static void censusLog() {
+	if (!ctxDumped && __atomic_load_n(&censusNum, __ATOMIC_ACQUIRE) >= 40) {
+		ctxDumped = true;
+		ctxDump();
+	}
 	uint32_t codes = __atomic_load_n(&censusCodeNum, __ATOMIC_ACQUIRE);
 	for (uint32_t c = 0; c < codes; c++) {
 		auto &dump = censusCode[c];
@@ -7149,11 +7232,36 @@ static void processUserIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords, bool al
 		if (type == 3 && !censusOff) {
 			if (op == 0x69 && j + 1 < got) {  // SET_CONTEXT_REG
 				uint32_t start = buf[j + 1] & 0xFFFF;
-				for (uint32_t k = 0; k + 1 < count && j + 2 + k < got && start + k < arrsize(censusCtx); k++)
+				for (uint32_t k = 0; k + 1 < count && j + 2 + k < got && start + k < arrsize(censusCtx); k++) {
 					censusCtx[start + k] = buf[j + 2 + k];
+					censusCtxSet[(start + k) / 32] |= 1U << ((start + k) % 32);
+				}
+			} else if (op == 0x79 && j + 1 < got) {  // SET_UCONFIG_REG
+				uint32_t start = buf[j + 1] & 0xFFFF;
+				for (uint32_t k = 0; k + 1 < count && j + 2 + k < got && start + k < arrsize(censusUcfg); k++) {
+					censusUcfg[start + k] = buf[j + 2 + k];
+					censusUcfgSet[(start + k) / 32] |= 1U << ((start + k) % 32);
+				}
 			} else if (op == 0x27 || op == 0x2D || op == 0x35 || op == 0x25 || op == 0x38 || op == 0x24) {
 				censusDraw(vmid);
 			}
+		}
+		// GPU copies to memory (see GpuCopy): DMA_DATA (DST_SEL [21:20] 0/3 = address, SRC_SEL [30:29] 0/3 = address, 2 =
+		// data), WRITE_DATA (DST_SEL [11:8] 1/2/5 = memory), COPY_DATA (DST_SEL [11:8] 1/2/5, COUNT_SEL [16]: 64-bit).
+		if (type == 3 && op == 0x50 && j + 6 < got) {
+			uint32_t ctrl = buf[j + 1], dstSel = (ctrl >> 20) & 3;
+			if (dstSel == 0 || dstSel == 3)
+				noteGpuCopy(vmid, op, ctrl, static_cast<uint64_t>(buf[j + 3]) << 32 | buf[j + 2],
+					static_cast<uint64_t>(buf[j + 5]) << 32 | buf[j + 4], buf[j + 6] & 0x1FFFFF);
+		} else if (type == 3 && op == 0x37 && j + 3 < got && count > 3) {
+			uint32_t ctrl = buf[j + 1], dstSel = (ctrl >> 8) & 0xF;
+			if (dstSel == 1 || dstSel == 2 || dstSel == 5)
+				noteGpuCopy(vmid, op, ctrl, 0, static_cast<uint64_t>(buf[j + 3]) << 32 | buf[j + 2], (count - 3) * 4);
+		} else if (type == 3 && op == 0x40 && j + 5 < got) {
+			uint32_t ctrl = buf[j + 1], dstSel = (ctrl >> 8) & 0xF;
+			if (dstSel == 1 || dstSel == 2 || dstSel == 5)
+				noteGpuCopy(vmid, op, ctrl, static_cast<uint64_t>(buf[j + 3]) << 32 | buf[j + 2],
+					static_cast<uint64_t>(buf[j + 5]) << 32 | buf[j + 4], (ctrl >> 16) & 1 ? 8 : 4);
 		}
 		if (type == 3 && op == 0x76 && j + 1 < got) {
 			uint32_t start = buf[j + 1] & 0xFFFF;
@@ -7180,6 +7288,14 @@ static void processUserIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords, bool al
 				censusPs = (static_cast<uint64_t>(psHi & 0xFF) << 40) | (static_cast<uint64_t>(psLo) << 8);
 			if (touched && psLo && rsrc1) {
 				uint64_t psVa = (static_cast<uint64_t>(psHi & 0xFF) << 40) | (static_cast<uint64_t>(psLo) << 8);
+				if (auto *c = recentCopyTo(vmid, psVa)) {
+					gpuCopyBindHits++;
+					if (gpuCopyLogged < 40) {
+						gpuCopyLogged++;
+						diskLogEvent("copy before bind: ps %llx vmid %u; op %x ctrl %x src %llx dst %llx %u bytes, %llu ms "
+							"earlier", psVa, vmid, c->op, c->ctrl, c->src, c->dst, c->bytes, uptimeMs() - c->ms);
+					}
+				}
 				// A shader bound again in the same submission was checked (and fixed) moments ago: reuse the answer
 				// instead of reading its fingerprint and probe again.
 				ibHookBinds++;
