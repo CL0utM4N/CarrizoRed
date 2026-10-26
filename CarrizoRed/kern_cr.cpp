@@ -67,10 +67,13 @@ static mach_vm_address_t hwsigFind(const char *symbol, mach_vm_address_t start, 
 	// Only HWLibs' executable segment, which must lie in the kext being patched.
 	if (!hwlibsTextStart || hwlibsTextStart < start || hwlibsTextStart + hwlibsTextSize > start + size)
 		return 0;
+	bool tried = false;
 	for (size_t s = 0; s < arrsize(hwlibsSignatures); s++) {
 		auto &sig = hwlibsSignatures[s];
-		if (strcmp(sig.symbol, symbol))
+		// Only the entries checked against this macOS version (an occurrence-th match is build specific).
+		if (strcmp(sig.symbol, symbol) || sig.darwin != static_cast<uint32_t>(getKernelVersion()))
 			continue;
+		tried = true;
 		if (found[s])
 			return found[s];
 		mach_vm_address_t textStart = hwlibsTextStart;
@@ -87,9 +90,9 @@ static mach_vm_address_t hwsigFind(const char *symbol, mach_vm_address_t start, 
 				return found[s];
 			}
 		}
-		hwsigMissed++;
-		return 0;
 	}
+	if (tried)
+		hwsigMissed++;
 	return 0;
 }
 
@@ -2349,10 +2352,18 @@ static struct {
 	uint8_t kind;  // 'D' sDMA update, 'T' getPTEValue, 'P' getPDEValue
 } vmSamples[4];
 
+// hex may list alternatives, "a|b": the same instruction as different builds encode it (Ventura's compiler allocates
+// other registers, e.g. mov [rbx+0x3B8], r14 there is mov [r15+0x3B8], rbx).
 static bool codeHas(mach_vm_address_t fn, size_t len, const char *hex) {
+	if (const char *bar = strchr(hex, '|')) {
+		char first[40] {};
+		size_t n = static_cast<size_t>(bar - hex) < sizeof(first) - 1 ? static_cast<size_t>(bar - hex) : sizeof(first) - 1;
+		memcpy(first, hex, n);
+		return codeHas(fn, len, first) || codeHas(fn, len, bar + 1);
+	}
 	uint8_t pattern[16];
 	size_t n = 0;
-	for (; hex[2 * n] && n < sizeof(pattern); n++) {
+	for (; hex[2 * n] && hex[2 * n] != '|' && n < sizeof(pattern); n++) {
 		auto nib = [](char c) { return static_cast<uint8_t>(c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10); };
 		pattern[n] = static_cast<uint8_t>(nib(hex[2 * n]) << 4 | nib(hex[2 * n + 1]));
 	}
@@ -2452,8 +2463,10 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 	}
 
 	if (family == ChipFamily::Stoney && !checkKernelArgument("-crnosdmafix")) {
-		static const char *const allocChecks[] {"4c89b3b8030000", "4c89b3c0030000", nullptr};
-		static const char *const startChecks[] {"4a8bbcf3b8030000", "ff9048010000", "488b7b18", "ff9078010000",
+		// Each "a|b": Sequoia/Sonoma's encoding, then Ventura's (other registers, same offsets).
+		static const char *const allocChecks[] {"4c89b3b8030000|49899fb8030000", "4c89b3c0030000|49899fc0030000", nullptr};
+		static const char *const startChecks[] {"4a8bbcf3b8030000|498bbcdfb8030000", "ff9048010000", "488b7b18|498b7f18",
+			"ff9078010000",
 			"66895008", nullptr};
 		if (route("__ZN32AMDRadeonX4000_AMDBaffinHardware17allocateHWEnginesEv",
 				reinterpret_cast<mach_vm_address_t>(wrapAllocateHWEngines), orgAllocateHWEngines, allocChecks, 0x100,
@@ -2462,7 +2475,7 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 				reinterpret_cast<mach_vm_address_t>(wrapStartHWEngines), orgStartHWEngines, startChecks, 0xA0,
 				"startHWEngines");
 		}
-		static const char *const powerUpChecks[] {"4b8bbcfeb0030000", nullptr};
+		static const char *const powerUpChecks[] {"4b8bbcfeb0030000|498bbcdeb0030000", nullptr};
 		route("__ZN26AMDRadeonX4000_AMDHardware16powerUpHWEnginesEv",
 			reinterpret_cast<mach_vm_address_t>(wrapPowerUpHWEngines), orgPowerUpHWEngines, powerUpChecks, 0x30,
 			"powerUpHWEngines");
@@ -3662,7 +3675,8 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			}
 			// Stoney's RLC loader tests DisableCailLoadUcode ([cail+0x6F2] bit 0x20) near its start; Carrizo's has a
 			// different flow (the KDK's Carrizo_LoadRlcUcode doesn't test that bit), so only the registry reader is checked.
-			if (!codeHas(fn, 0x100, "8983f0060000") || (!carrizo && !codeHas(rlc, 0x60, "f683f206000020")) || !rlc) {
+			if (!codeHas(fn, 0x100, "8983f0060000|41898424f0060000") ||
+				(!carrizo && !codeHas(rlc, 0x60, "f683f206000020|41f68424f206000020")) || !rlc) {
 				traceNote("directucode=nomatch ");
 			} else if (routeHwlibs(patcher, index, request, slide, size, HookFlags) && !checkKernelArgument("-crnosmuload")) {
 				// See smuLoadFirmware. The size function must end by storing its total at [cail+0xCD8]
@@ -3676,12 +3690,13 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 				// Stripped builds: no symbol for the microcode table. The format function starts with
 				// mov rbx, rdi; call GetGpuGoldenSettings; mov rax, [rax+0x10] (the table, as GoldenSettings+0x10
 				// holds it in 15.8.1), so take the call's target and ask it in wrapStoneyFormatSmuDram.
-				if (!info && format && codeHas(format, 0x12, "4889fbe8") && codeHas(format + 0x16, 4, "488b4010")) {
+				if (!info && format && codeHas(format, 0x12, "4889fbe8|4989fee8") && codeHas(format + 0x16, 4, "488b4010")) {
 					int32_t rel;
 					memcpy(&rel, reinterpret_cast<const void *>(format + 0x12), sizeof(rel));
 					ucodeGoldenSettings = format + 0x16 + rel;
 				}
-				if ((!info && !ucodeGoldenSettings) || !codeHas(format, 0x130, carrizo ? "4489b3d80c0000" : "8983d80c0000")) {
+				if ((!info && !ucodeGoldenSettings) ||
+					!codeHas(format, 0x130, carrizo ? "4489b3d80c0000|4589a6d80c0000" : "8983d80c0000|418986d80c0000")) {
 					traceNote("smuload=nomatch ");
 				} else {
 					stoneyUcodeInfo = reinterpret_cast<Smu8::CailUcode **>(info);
