@@ -660,7 +660,15 @@ static const uint8_t dccFind[] {
 	0x41, 0x89, 0x45, 0x00, 0x4D, 0x89, 0xE1, 0x49, 0x8B, 0x04, 0x24, 0x4C, 0x8B, 0x45, 0xA0, 0x48, 0x8B, 0x55, 0xA8, 0xF6,
 	0x45, 0xD4, 0x01, 0x0F, 0x84, 0x78, 0x01, 0x00, 0x00, 0x4D, 0x89, 0xCC, 0x48, 0x8D, 0xB5, 0x40, 0xFE, 0xFF, 0xFF, 0x48,
 };
-static const uint8_t isaReplace[] {0x1E}, smallPrimReplace[] {0x00}, walkFenceReplace[] {0xA8}, dccReplace[] {0x90, 0xE9};
+// Ventura (13.7.8, read from the D509BA's cache): the same SCGetInstructionSet, small-prim and walk-fence code at other
+// page offsets (isa without its trailing lea, whose displacement is build specific), and the DCC flag test compiled the
+// other way round: test r8b, 1; jne <DCC set-up out of line> (the same set-up as 15.8.1's: mov dword [rsi], 0x40; mov
+// dword [rdx], 0x20; shr eax, 9). Make the jne a 6-byte nop so no texture gets DCC. Each pattern occurs once in the cache.
+static const uint8_t dccVenturaFind[] {
+	0x41, 0x3B, 0x07, 0x76, 0x03, 0x41, 0x89, 0x07, 0x41, 0x89, 0xD8, 0x41, 0xF6, 0xC0, 0x01, 0x0F, 0x85, 0xB4, 0x00, 0x00, 0x00,
+};
+static const uint8_t isaReplace[] {0x1E}, smallPrimReplace[] {0x00}, walkFenceReplace[] {0xA8}, dccReplace[] {0x90, 0xE9},
+	dccVenturaReplace[] {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00};
 struct PagePatch {
 	const char *name;
 	const char *arg;  // boot-arg that turns it off (on, for an opt-in patch)
@@ -681,6 +689,13 @@ static PagePatch pagePatches[] {
 	{"walkfence", "-crnowalkfence", false, 0x4AA, walkFenceFind, sizeof(walkFenceFind), 6, walkFenceReplace,
 		sizeof(walkFenceReplace)},
 	{"dcc", "-crdcc", false, 0xA2C, dccFind, sizeof(dccFind), 0x17, dccReplace, sizeof(dccReplace)},
+	{"isa13", "-crnoscpatch", false, 0xD3A, scPatchFind, 60, 0x25, isaReplace, sizeof(isaReplace)},
+	{"smallprim13", "-crnosmallprim", false, 0xA68, smallPrimFind, sizeof(smallPrimFind), 14, smallPrimReplace,
+		sizeof(smallPrimReplace)},
+	{"walkfence13", "-crnowalkfence", false, 0xCF0, walkFenceFind, sizeof(walkFenceFind), 6, walkFenceReplace,
+		sizeof(walkFenceReplace)},
+	{"dcc13", "-crdcc", false, 0x500, dccVenturaFind, sizeof(dccVenturaFind), 15, dccVenturaReplace,
+		sizeof(dccVenturaReplace)},
 };
 static mach_vm_address_t orgCsValidatePage;
 static bool scPatchHooked;
