@@ -3629,9 +3629,20 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 							haveBase = true;
 						}
 						if (haveBase && !strncmp(seg->segname, "__TEXT_EXEC", sizeof(seg->segname)) && seg->vmsize &&
-							seg->vmaddr >= textBase && seg->vmaddr - textBase + seg->vmsize <= size) {
+							seg->vmaddr >= textBase && seg->vmaddr - textBase + seg->vmsize <= size && !text) {
 							text = slide + (seg->vmaddr - textBase);
 							textSize = seg->vmsize;
+						}
+						// The code itself: the __text section, in __TEXT_EXEC in Sequoia's kernel collection but in
+						// __TEXT on Ventura (Ventura nvram3: no __TEXT_EXEC, "text 0+0", so no signature was searched
+						// and the SMU load never ran). It is also what the signatures' occurrences count over.
+						auto *sect = reinterpret_cast<const section_64 *>(seg + 1);
+						for (uint32_t k = 0; haveBase && k < seg->nsects; k++, sect++) {
+							if (!strncmp(sect->sectname, "__text", sizeof(sect->sectname)) && sect->size &&
+								sect->addr >= textBase && sect->addr - textBase + sect->size <= size) {
+								text = slide + (sect->addr - textBase);
+								textSize = sect->size;
+							}
 						}
 					}
 					cmd = reinterpret_cast<const load_command *>(reinterpret_cast<const uint8_t *>(cmd) + cmd->cmdsize);
