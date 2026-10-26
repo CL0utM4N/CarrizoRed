@@ -208,14 +208,21 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 static char traceSummary[2560];
 static uint16_t softPPTableSize, softPPTableRev;  // see setSoftPowerPlayTable
 
+static void diskLogEvent(const char *fmt, ...);
+
+// Also into the disk log: an Apple panic carries no report, and NVRAM written by the kernel is lost without a clean
+// shutdown (Ventura nvram1/2: a stale CR-progress), so the log is where a crashed boot's notes survive.
 static void traceNote(const char *fmt, ...) {
+	char note[192];
+	va_list va;
+	va_start(va, fmt);
+	vsnprintf(note, sizeof(note), fmt, va);
+	va_end(va);
+	diskLogEvent("note: %s", note);
 	size_t len = strlen(traceSummary);
 	if (len + 2 >= sizeof(traceSummary))
 		return;
-	va_list va;
-	va_start(va, fmt);
-	vsnprintf(traceSummary + len, sizeof(traceSummary) - len, fmt, va);
-	va_end(va);
+	strlcpy(traceSummary + len, note, sizeof(traceSummary) - len);
 }
 
 // Bring-up trace events. The wrappers run in whatever context Apple's code calls them from (possibly with a spinlock
