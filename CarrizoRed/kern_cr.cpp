@@ -7560,8 +7560,7 @@ void CRDriver::vmmPanic(void *vmm) {
 		accelGuardMissLast ? accelGuardMissLast : "-", routesOk, routesFailed, routesUnverified,
 		routeLastFailed ? routeLastFailed : "-", getKernelVersion(), getKernelMinorVersion());
 	// No disk log here: this runs in WindowServer's submission path with the accelerator's locks held.
-	panic("%s
-%s", reason, callback->composeReport(static_cast<uint32_t>(uptimeMs() / 1000), ""));
+	panic("%s\n%s", reason, callback->composeReport(static_cast<uint32_t>(uptimeMs() / 1000), ""));
 }
 
 void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
