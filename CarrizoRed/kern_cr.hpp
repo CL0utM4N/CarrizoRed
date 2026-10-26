@@ -18,6 +18,8 @@ public:
 	static void ensureMmio();
 	// The wake watchdog's verdict (see wakeWatchdog): panics with the report unless the wake went through.
 	static void wakeWatchdogFired(const char *when, bool notPoweredOn, uint32_t beats);
+	// A GPU VM manager without its sDMA channel: panic with the report (see wrapEndVMPTUpdate).
+	[[noreturn]] static void vmmPanic(void *vmm);
 	void init();
 
 private:
