@@ -3505,17 +3505,64 @@ static struct {
 
 static bool videoClocksSet(const char *when);
 
+// UVD reads all zeros at the session check (clocks running, SRBM reset clear, SMU UVDPowerON answering 1). Whether it
+// was ever alive: snapshots at the MMIO probe (before Apple's driver), around the boot power-on and at the session
+// check. Besides status and the GPCOM_DATA0 write test, the UVD power registers CAIL's
+// stoney_power_down_uvd_block_for_dpg_mode uses: POWER_STATUS 0x38C4, PGFSM_CONFIG 0x38C0, tile status 0x38C2/3/5/6/8,
+// 0x38EE/F (it writes 0x5FF / 0x6FF to CONFIG and expects tiles 0x12 / 0x10; nothing in CAIL powers them back up).
+struct UvdSnapshot {
+	bool taken, responds;
+	uint64_t ms;
+	uint32_t status, data0, power, pgfsm, tiles[7], srbm;
+};
+static UvdSnapshot uvdAtProbe;
+
+static void uvdSnapshot(UvdSnapshot &s) {
+	static const uint32_t tileRegs[] {0x38C2, 0x38C3, 0x38C5, 0x38C6, 0x38C8, 0x38EE, 0x38EF};
+	auto *mmio = gpuMmio;
+	s.ms = uptimeMs();
+	s.status = mmio[0x3DAF];
+	s.data0 = mmio[0x3BC4];
+	mmio[0x3BC4] = 0x5AC3A55C;
+	s.responds = mmio[0x3BC4] == 0x5AC3A55C;
+	mmio[0x3BC4] = s.data0;
+	s.power = mmio[0x38C4];
+	s.pgfsm = mmio[0x38C0];
+	for (size_t i = 0; i < arrsize(tileRegs); i++)
+		s.tiles[i] = mmio[tileRegs[i]];
+	s.srbm = mmio[0x398];
+	s.taken = true;
+}
+
+static void uvdSnapshotLog(const char *when, const UvdSnapshot &s) {
+	if (!s.taken)
+		return;
+	diskLogEvent("uvd state %s (%llu ms): responds %d status %x power %x pgfsm %x tiles %x %x %x %x %x %x %x srbm %x", when,
+		s.ms, s.responds, s.status, s.power, s.pgfsm, s.tiles[0], s.tiles[1], s.tiles[2], s.tiles[3], s.tiles[4],
+		s.tiles[5], s.tiles[6], s.srbm);
+}
+
+static void uvdSnapshotNow(const char *when) {
+	UvdSnapshot s {};
+	uvdSnapshot(s);
+	uvdSnapshotLog(when, s);
+}
+
 static void smuVideoPowerOn() {
 	using namespace Smu8;
 	if (smuVideo.done || !gpuMmio)
 		return;
 	smuVideo.done = true;
 	smuVideo.ms = uptimeMs();
+	uvdSnapshotLog("at probe", uvdAtProbe);
+	uvdSnapshotNow("before power on");
 	smuVideo.resp[0] = smuSendMessage(UvdPowerOn, 0);
 	smuVideo.resp[1] = smuSendMessage(VcePowerOn, 0);
 	smuVideo.resp[2] = smuSendMessage(EnableAllSmuFeatures, UvdDpmMask | VceDpmMask);
 	diskLogEvent("video power on: UVDPowerON %x, VCEPowerON %x, UVD/VCE DPM %x", smuVideo.resp[0], smuVideo.resp[1],
 		smuVideo.resp[2]);
+	IODelay(1000);
+	uvdSnapshotNow("after power on");
 	if (smuVideo.resp[0] == 1 && smuVideo.resp[1] == 1)
 		videoClocksSet("boot");
 	traceNote("video=%x/%x/%x ", smuVideo.resp[0], smuVideo.resp[1], smuVideo.resp[2]);
@@ -3605,6 +3652,7 @@ static bool uvdReadyForSession() {
 	}
 	videoClocksSet("session");
 	uvdRegs("before");
+	uvdSnapshotNow("at session");
 	uint32_t srbm = gpuMmio[SrbmSoftReset];
 	if ((srbm & SrbmResetUvd) && !checkKernelArgument("-crnouvdunreset")) {
 		gpuMmio[SrbmSoftReset] = srbm & ~SrbmResetUvd;
@@ -5476,6 +5524,8 @@ void CRDriver::probeMMIO() {
 	probeValues[2] = fbOffset;
 	probeValues[3] = grbmStatus;
 	probeMs = uptimeMs();
+	if (!uvdAtProbe.taken && !gpuRegistersDead(mmio) && checkKernelArgument("-crvideo"))
+		uvdSnapshot(uvdAtProbe);
 	if (gpuRegistersDead(mmio)) {
 		gpuDeadAtStart = true;
 		checkGpuAlive(mmio);
