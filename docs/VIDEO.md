@@ -80,7 +80,17 @@ answers, firmware loaded, ring tests) before any playback test.
   property AppleGVA reads (`board-id`, next to `hw.model` in the dyld shared cache) to `hwgva-id` and sets that on the
   device tree root to iMacPro1,1's board-id, an AMD-only Mac. The rest of the system keeps its SMBIOS. `-crnogva` leaves
   AppleGVA alone.
-- **Next, from the stage 2 log:** whether Apple's UVD 6.3 / VCE 3.4 firmware starts on Stoney (UVD_STATUS, VCPU
+- **Stage 2 result (Sonoma):** the lock screen's wallpaper opened an AMD video context and closed it 2 ms later
+  without any further call. User space said why (`log show`): `VTDecoderXPCService: (AppleGVA) [HEVC] GVA ERROR:
+  IOGVACodec not set`.
+- **Stage 3, implemented (`-crvideo`, in testing):** AppleGVA's lookups only accept a GPU whose registry name is
+  `GFX0`, `GFXA`, `IGPU`, `IOPP` or `display`, and the iGPU had its ACPI name `VGA`: it is renamed `GFX0` (as
+  WhateverGreen does for AMD GPUs). And `AMDGraphicsAccelerator::configureDevice` publishes `IOGVAHEVCDecode` only when
+  the PCI device's `MM_EnableHEVCDecode` and `MM_EnableHEVCEncode` are both true, which AMD9500Controller's
+  `aty_properties` set false for every Polaris: they are forced true for that call, and HEVC encode is withdrawn again
+  afterwards (Stoney's UVD has no encode rings). The report's `hevc` bits: 1 flags forced, 2 decode published,
+  4 encode withdrawn, 8 renamed.
+- **Next, from the stage 3 log:** whether Apple's UVD 6.3 / VCE 3.4 firmware starts on Stoney (UVD_STATUS, VCPU
   running, ring test). If not, stage 2 replaces the firmware in the engine's buffer (`AMDUVDHWEngine::loadUVDFW` asks
   the shared multimedia layer for the image, `this+0x160`, then decrypts it when a flag says so) with Linux's
   `stoney_uvd.bin` / `stoney_vce.bin`, fetched by CI rather than committed.

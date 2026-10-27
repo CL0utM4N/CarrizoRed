@@ -728,6 +728,8 @@ static uint32_t scPatchCalls;
 // (15.8.1, 14.x, 13.7.8), never across a page. Only pages of dyld cache files are searched (vnode path checked once).
 static bool gvaPatchOn;
 static uint32_t gvaPatchHits;
+// What wrapConfigureDevice did (bits): 1 flags forced, 2 IOGVAHEVCDecode published, 4 HEVC encode withdrawn, 8 renamed.
+static uint32_t gvaHevcState;
 
 static bool isSharedCacheVnode(void *vnode) {
 	static struct {
@@ -2631,6 +2633,10 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			reinterpret_cast<mach_vm_address_t>(wrapGetHWChannel), orgGetHWChannel, channelChecks, 0x26,
 			"getHWChannel");
 	}
+	// Video decode for AppleGVA (see wrapConfigureDevice); -crnogva leaves it, as it does the board-id routing.
+	if (checkKernelArgument("-crvideo") && !checkKernelArgument("-crnogva"))
+		route("__ZN37AMDRadeonX4000_AMDGraphicsAccelerator15configureDeviceEP11IOPCIDevice",
+			reinterpret_cast<mach_vm_address_t>(wrapConfigureDevice), orgConfigureDevice, nullptr, 0, "configureDevice");
 	// AMDBaffinHardware::powerUp (and AMDEllesmereHardware's copy) ORs MC_ARB_MISC2.SEQ_RDY_POP_IDLE (0x40000000) and
 	// POP_IDLE_REPLAY (0x800) into the memory arbiter: Polaris GDDR5 sequencer tweaks, which Linux never sets on an APU,
 	// whose arbiter the CPU shares. Make both ORs write 0 (mov esi, 0x9D5; mov edx, imm; call [rax + 0x128]).
@@ -2740,6 +2746,41 @@ static bool wrapPowerUpHWEngines(void *that) {
 			*reinterpret_cast<void **>(static_cast<uint8_t *>(that) + multimedia[i]) = saved[i];
 	traceEvent("hw.powerUpHWEngines", true, ret);
 	traceNote("hw.powerUpHWEngines=%x(mm skipped %u) ", ret, skip ? accelMmDropped : 0);
+	return ret;
+}
+
+// -crvideo, AppleGVA side (docs/VIDEO.md stage 3). With the board-id routed, the Sonoma log still had
+// "[HEVC] GVA ERROR: IOGVACodec not set" and the AMD video context closed 2 ms after opening. Two causes:
+//  - AppleGVA only takes a GPU whose registry name is GFX0, GFXA, IGPU, IOPP or display (it compares the name before
+//    reading IOGVACodec / IOGVAHEVCDecode); ours is the ACPI name, VGA. Rename it to GFX0, as WhateverGreen does.
+//  - AMDGraphicsAccelerator::configureDevice publishes IOGVAHEVCDecode (+ capabilities) only when the PCI device's
+//    MM_EnableHEVCDecode and MM_EnableHEVCEncode are both true, and AMD9500Controller's aty_properties set both false
+//    for every Polaris. Force them true for that call (configureDevice is their only reader in 13.x-15.x), then take
+//    HEVC encode back out: Stoney's UVD 6.2 has no encode rings (Polaris encodes HEVC on UVD).
+static mach_vm_address_t orgConfigureDevice;
+
+static bool wrapConfigureDevice(IOService *that, IOPCIDevice *pci) {
+	if (pci) {
+		const char *name = pci->getName();
+		if (!name || (strcmp(name, "GFX0") && strcmp(name, "IGPU") && strcmp(name, "display"))) {
+			pci->setName("GFX0");
+			gvaHevcState |= 8;
+		}
+		pci->setProperty("MM_EnableHEVCDecode", kOSBooleanTrue);
+		pci->setProperty("MM_EnableHEVCEncode", kOSBooleanTrue);
+		gvaHevcState |= 1;
+	}
+	bool ret = FunctionCast(wrapConfigureDevice, orgConfigureDevice)(that, pci);
+	if (pci)
+		pci->setProperty("MM_EnableHEVCEncode", kOSBooleanFalse);
+	if (that->getProperty("IOGVAHEVCDecode"))
+		gvaHevcState |= 2;
+	if (that->getProperty("IOGVAHEVCEncode") || that->getProperty("IOGVAHEVCEncodeCapabilities")) {
+		that->removeProperty("IOGVAHEVCEncode");
+		that->removeProperty("IOGVAHEVCEncodeCapabilities");
+		gvaHevcState |= 4;
+	}
+	traceNote("configureDevice=%d hevc %x ", ret, gvaHevcState);
 	return ret;
 }
 
@@ -8184,8 +8225,8 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 			"cus %u; chiprev %x\n", w[0xA0 / 4], w[0xA8 / 4], w[0xB0 / 4], w[0xB8 / 4], gpuMmio ? gpuMmio[0x263E] : 0,
 			gpuMmio ? gpuMmio[0x9D8] : 0, w[0x98 / 4], w[0x88 / 4], w[0x8C / 4], w[0x90 / 4], w[0x94 / 4], w[0x8 / 4]);
 	}
-	add("page patches: hooked %d, %u pages validated; gva %s %u;", scPatchHooked, scPatchCalls, gvaPatchOn ? "on" : "off",
-		gvaPatchHits);
+	add("page patches: hooked %d, %u pages validated; gva %s %u hevc %x;", scPatchHooked, scPatchCalls,
+		gvaPatchOn ? "on" : "off", gvaPatchHits, gvaHevcState);
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
