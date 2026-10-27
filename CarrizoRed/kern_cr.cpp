@@ -6667,10 +6667,19 @@ struct SeenShader {
 	uint32_t fixedPte, fixedSdmaWptr;  // that page's PTE flags, and the sDMA0 ring's write pointer then
 	// The fix as dwords (index, original, fixed), replayed onto an sDMA copy's source (applySourcePatches);
 	// patchCount 0xFFFF: more than fit, not replayed (srcFixOverflow counts the copies that met one).
-	uint16_t patchCount;
+	uint16_t patchCount;         // 0xFFFE: the list is in bigPatches[bigSlot]
+	uint8_t bigSlot;
 	uint32_t patchAt[96], patchOld[96], patchNew[96];
 };
 static SeenShader seenShaders[512];
+// Fixes too large for a SeenShader's list (Sonoma's 144 KB lock screen shader: 329 dwords): a few slots, reused in turn.
+struct BigPatch {
+	uint64_t va;
+	uint32_t vmid, count;
+	uint32_t at[1024], oldValue[1024], newValue[1024];
+};
+static BigPatch bigPatches[8];
+static uint32_t bigPatchNext;
 static uint32_t seenNum, seenNext;
 static uint32_t ibHookCalls, ibHookIbs, ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookBusy, ibHookNoMap,
 	ibHookRaiseOnly, ibHookBinds, ibHookMemoHits;
@@ -6931,17 +6940,41 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 	SeenShader fresh {psVa, vmid, codeHash(print, 16), ok ? newVgprs : 0,
 		skip == SkipNoFreeVgpr && !allowBump, probeAt, probeVal, uptimeMs(), physAtFix, pteAtFix,
 		gpuMmio ? gpuMmio[0x3484] : 0};
-	for (uint32_t q = 0; q < have && fixedHere && ok && fresh.patchCount != 0xFFFF; q++) {
+	for (uint32_t q = 0; q < have && fixedHere && ok && fresh.patchCount < 0xFFFE; q++) {
 		if (code[q] == original[q])
 			continue;
 		if (fresh.patchCount == arrsize(fresh.patchAt)) {
 			uint32_t total = fresh.patchCount;
 			for (uint32_t r = q; r < have; r++)
 				total += code[r] != original[r];
+			if (total <= arrsize(bigPatches[0].at)) {
+				// Into the big pool: this shader's slot if it has one, else the next in turn.
+				uint32_t slot = arrsize(bigPatches);
+				for (uint32_t b = 0; b < arrsize(bigPatches) && slot == arrsize(bigPatches); b++)
+					if (bigPatches[b].count && bigPatches[b].va == psVa && bigPatches[b].vmid == vmid)
+						slot = b;
+				if (slot == arrsize(bigPatches))
+					slot = bigPatchNext++ % arrsize(bigPatches);
+				auto &big = bigPatches[slot];
+				big.va = psVa;
+				big.vmid = vmid;
+				big.count = 0;
+				for (uint32_t r = 0; r < have && big.count < arrsize(big.at); r++) {
+					if (code[r] == original[r])
+						continue;
+					big.at[big.count] = r;
+					big.oldValue[big.count] = original[r];
+					big.newValue[big.count] = code[r];
+					big.count++;
+				}
+				fresh.patchCount = 0xFFFE;
+				fresh.bigSlot = static_cast<uint8_t>(slot);
+				break;
+			}
 			static uint32_t longLogged;
 			if (longLogged++ < 10)
 				diskLogEvent("fix too long to replay: ps %llx, %u dwords patched (room for %u)", psVa, total,
-					static_cast<uint32_t>(arrsize(fresh.patchAt)));
+					static_cast<uint32_t>(arrsize(bigPatches[0].at)));
 			fresh.patchCount = 0xFFFF;
 			break;
 		}
@@ -7661,13 +7694,27 @@ static void applySourcePatches(uint32_t vmid, uint64_t src, uint64_t dst, uint32
 				srcFixOverflow++;
 			continue;
 		}
-		if (sh.va >= dst + bytes || sh.va + sh.patchAt[sh.patchCount - 1] * 4ULL + 4 <= dst)
+		const uint32_t *patchAt = sh.patchAt, *patchOld = sh.patchOld, *patchNew = sh.patchNew;
+		uint32_t patchCount = sh.patchCount;
+		if (patchCount == 0xFFFE) {  // in the big pool, unless its slot went to another shader since
+			auto &big = bigPatches[sh.bigSlot % arrsize(bigPatches)];
+			if (big.va != sh.va || big.vmid != sh.vmid || !big.count) {
+				if (sh.va >= dst && sh.va < dst + bytes)
+					srcFixOverflow++;
+				continue;
+			}
+			patchAt = big.at;
+			patchOld = big.oldValue;
+			patchNew = big.newValue;
+			patchCount = big.count;
+		}
+		if (sh.va >= dst + bytes || sh.va + patchAt[patchCount - 1] * 4ULL + 4 <= dst)
 			continue;  // no patched dword can be inside the copy (patchAt is ascending)
 		srcFixCopies++;
 		uint32_t wrote = 0, mismatch = 0;
-		for (uint32_t k = 0; k < sh.patchCount; k++) {
+		for (uint32_t k = 0; k < patchCount; k++) {
 			// Each patched dword on its own: a re-upload chunk may start in the middle of a shader.
-			uint64_t addr = sh.va + sh.patchAt[k] * 4ULL;
+			uint64_t addr = sh.va + patchAt[k] * 4ULL;
 			if (addr < dst || addr + 4 > dst + bytes)
 				continue;
 			uint64_t off = addr - dst;
@@ -7676,14 +7723,14 @@ static void applySourcePatches(uint32_t vmid, uint64_t src, uint64_t dst, uint32
 				srcFixReadFail++;
 				continue;
 			}
-			if (now == sh.patchNew[k])
+			if (now == patchNew[k])
 				continue;  // already fixed
-			if (now != sh.patchOld[k]) {
+			if (now != patchOld[k]) {
 				mismatch++;
 				continue;
 			}
 			uint64_t phys = ibVaToPhysLocked(vmid, src + off);
-			if (phys && ibWritePhys(phys, 4, &sh.patchNew[k]))
+			if (phys && ibWritePhys(phys, 4, &patchNew[k]))
 				wrote++;
 		}
 		srcFixDwords += wrote;
