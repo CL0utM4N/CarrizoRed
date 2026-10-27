@@ -1008,6 +1008,8 @@ static uint32_t wrapGetHWInfo(void *that, uint32_t *info);
 static uint32_t videoSpoofId, videoHWInfoCalls;
 static mach_vm_address_t orgUvdContextInit;
 static bool wrapUvdContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
+static mach_vm_address_t orgUvdStart;
+static bool wrapUvdStart(void *that);
 static bool uvdReadyForSession();
 static mach_vm_address_t orgVceContextInit;
 static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
@@ -2188,7 +2190,6 @@ namespace {
 		{"__ZN32AMDRadeonX4000_AMDBaffinHardware7powerUpEv", "hw.powerUp", InAccel, true, true, 0},
 		// Video engines (docs/VIDEO.md; powered only with -crvideo): firmware load and start, results in the summary.
 		{"__ZN29AMDRadeonX4000_AMDUVDHWEngine9loadUVDFWEv", "uvd.loadFW", InAccel, true, false, 0},
-		{"__ZN29AMDRadeonX4000_AMDUVDHWEngine5startEv", "uvd.start", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDUVDHWEngine13startRBEngineEv", "uvd.startRB", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine6loadFWEv", "vce.loadFW", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine5startEv", "vce.start", InAccel, true, false, 0},
@@ -2400,7 +2401,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 170, "one wrapper per stage");
+		static_assert(arrsize(stages) == 169, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -2424,7 +2425,6 @@ namespace {
 			CR_WRAP(145), CR_WRAP(146), CR_WRAP(147), CR_WRAP(148), CR_WRAP(149), CR_WRAP(150), CR_WRAP(151), CR_WRAP(152),
 			CR_WRAP(153), CR_WRAP(154), CR_WRAP(155), CR_WRAP(156), CR_WRAP(157), CR_WRAP(158), CR_WRAP(159), CR_WRAP(160),
 			CR_WRAP(161), CR_WRAP(162), CR_WRAP(163), CR_WRAP(164), CR_WRAP(165), CR_WRAP(166), CR_WRAP(167), CR_WRAP(168),
-			CR_WRAP(169),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -2682,6 +2682,8 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		route("__ZN33AMDRadeonX4000_AMDAccelVCEContext4initEP37AMDRadeonX4000_AMDGraphicsAcceleratorP35AMDRadeonX4000_"
 			  "AMDAccelVideoContextP23sVideoContextCreateInfo",
 			reinterpret_cast<mach_vm_address_t>(wrapVceContextInit), orgVceContextInit, nullptr, 0, "VCE context init");
+		route("__ZN29AMDRadeonX4000_AMDUVDHWEngine5startEv", reinterpret_cast<mach_vm_address_t>(wrapUvdStart),
+			orgUvdStart, nullptr, 0, "UVD start");
 		route("__ZN35AMDRadeonX4000_AMDAccelVideoContext12contextStartEv",
 			reinterpret_cast<mach_vm_address_t>(wrapVideoContextStart), orgVideoContextStart, nullptr, 0,
 			"video contextStart");
@@ -3626,7 +3628,7 @@ static bool eclkRunning() {
 // reads 0 and drops writes: the check clears that bit first (-crnouvdunreset leaves it).
 static constexpr uint32_t UvdGpcomData0 = 0x3BC4;
 static constexpr uint32_t SrbmSoftReset = 0x398, SrbmResetUvd = 0x40000;
-static uint32_t uvdState;  // 0 unchecked, 1 alive, 2 dead (sessions refused)
+static uint32_t uvdState;  // 0 unchecked, 1 alive, 2 dead, 3 firmware didn't boot (2 and 3: sessions refused)
 
 static bool uvdResponds() {
 	uint32_t old = gpuMmio[UvdGpcomData0];
@@ -3669,7 +3671,7 @@ static bool uvdReadyForSession() {
 	if (gpuMmio && videoPowered())
 		uvdPowerTilesUp();
 	if (uvdState || checkKernelArgument("-crnouvdcheck"))
-		return uvdState != 2;
+		return uvdState == 1;
 	if (!gpuMmio || !videoPowered()) {
 		uvdState = 2;
 		diskLogEvent("uvd check: video not powered, sessions refused");
@@ -3708,6 +3710,53 @@ static bool uvdReadyForSession() {
 	uvdState = alive ? 1 : 2;
 	traceNote("uvdcheck=%u ", uvdState);
 	return alive;
+}
+
+// With the tiles up (e004346) UVD answered, and nvram12 shows what came next: a session ran, decode timed out, the GPU
+// restart (uc.resetHW) called AMDUVDHWEngine::start again and that never returned (watchdog panic, 57 s open); UVD was
+// left with its VCPU in reset (SOFT_RESET 80008, VCPU_CNTL ff20000: no CLK_EN), i.e. the firmware never booted. Linux's
+// uvd_v6_0_start waits for UVD_STATUS bit 1 (VCPU report) after releasing the VCPU. So after Apple's start, wait up to
+// 100 ms for that bit; without it fail the start, refuse sessions from then on, and fail later starts (the restart's)
+// without calling Apple's, which is what hung. The registers go into the report: a frozen boot loses its disk log.
+static struct {
+	uint32_t calls, skipped, ret, status, vcpu, reset, lmi, tile;
+	uint64_t ms;
+} uvdStartInfo;
+
+static bool wrapUvdStart(void *that) {
+	auto &info = uvdStartInfo;
+	info.calls++;
+	if (uvdState == 3 && !checkKernelArgument("-crnouvdfwcheck")) {
+		info.skipped++;
+		traceNote("uvd.start=skipped ");
+		return false;
+	}
+	if (gpuMmio && videoPowered())
+		uvdPowerTilesUp();
+	bool ret = FunctionCast(wrapUvdStart, orgUvdStart)(that);
+	if (!gpuMmio)
+		return ret;
+	uint32_t status = gpuMmio[0x3DAF];
+	for (uint32_t i = 0; i < 100 && ret && !(status & 2); i++) {
+		IODelay(1000);
+		status = gpuMmio[0x3DAF];
+	}
+	info.ret = ret;
+	info.status = status;
+	info.vcpu = gpuMmio[0x3D98];
+	info.reset = gpuMmio[0x3DA0];
+	info.lmi = gpuMmio[0x3D67];
+	info.tile = gpuMmio[UvdPgfsmTile1];
+	info.ms = uptimeMs();
+	diskLogEvent("uvd start #%u = %d: status %x vcpu %x reset %x lmi %x tile1 %x", info.calls, ret, status, info.vcpu,
+		info.reset, info.lmi, info.tile);
+	traceNote("uvd.start=%d/%x ", ret, status);
+	if (ret && !(status & 2) && !checkKernelArgument("-crnouvdfwcheck")) {
+		uvdState = 3;
+		diskLogEvent("uvd start: firmware didn't report (UVD_STATUS bit 1 clear), sessions refused");
+		return false;
+	}
+	return ret;
 }
 
 // Encode: the screen recording's VCE session hung the same way ("VCELLQ event timeout"; VCE_SOFT_RESET still 1 after
@@ -8611,6 +8660,10 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 			smuVideo.ms, smuVideo.resp[0], smuVideo.resp[1], smuVideo.resp[2], videoPowered() ? gpuMmio[0x3DAF] : 0,
 			videoPowered() ? gpuMmio[0x3D98] : 0, videoPowered() ? gpuMmio[0x3DA0] : 0,
 			videoPowered() ? gpuMmio[0x8001] : 0, videoPowered() ? gpuMmio[0x8005] : 0, videoPowered() ? gpuMmio[0x8048] : 0);
+	if (uvdStartInfo.calls)
+		add("uvd start: calls %u skipped %u, last at %llu ms = %u: status %x vcpu %x reset %x lmi %x tile1 %x; state %u\n",
+			uvdStartInfo.calls, uvdStartInfo.skipped, uvdStartInfo.ms, uvdStartInfo.ret, uvdStartInfo.status,
+			uvdStartInfo.vcpu, uvdStartInfo.reset, uvdStartInfo.lmi, uvdStartInfo.tile, uvdState);
 	if (smuDpm.done)
 		add("sclk dpm: resp %x %x %x %x %x, L%u-L%u, features %x -> %x (SclkDpmOn %u), level changes %u, max seen L%u (before DPM), now %x; deep sleep %x watermark %x; mailbox msg %x resp %x arg %x, foreign %u:",
 			smuDpm.resp[0], smuDpm.resp[1], smuDpm.resp[2], smuDpm.resp[3], smuDpm.resp[4], smuDpm.hardMin,
