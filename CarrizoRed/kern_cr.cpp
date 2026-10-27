@@ -754,7 +754,8 @@ static uint32_t scPatchCalls;
 // (15.8.1, 14.x, 13.7.8), never across a page. Only pages of dyld cache files are searched (vnode path checked once).
 static bool gvaPatchOn;
 static uint32_t gvaPatchHits;
-// What wrapConfigureDevice did (bits): 1 flags forced, 2 IOGVAHEVCDecode published, 4 HEVC encode withdrawn, 8 renamed.
+// What wrapConfigureDevice did (bits): 1 flags forced, 2 IOGVAHEVCDecode published, 4 HEVC encode withdrawn, 8 renamed,
+// 0x10 HEVC decode withdrawn again (no -cruvdhevc).
 static uint32_t gvaHevcState;
 
 static bool isSharedCacheVnode(void *vnode) {
@@ -2848,6 +2849,22 @@ static bool wrapConfigureDevice(IOService *that, IOPCIDevice *pci) {
 		pci->setProperty("MM_EnableHEVCEncode", kOSBooleanFalse);
 	if (that->getProperty("IOGVAHEVCDecode"))
 		gvaHevcState |= 2;
+	// With UVD started (b298f8a) the first session, the lock screen's aerial (HEVC Main10, which UVD 6.2 can't decode),
+	// left UVD busy and the GPU restart never finished (nvram15). Until Main10 is filtered out of what is published,
+	// HEVC stays in software and only H.264 reaches UVD; the capabilities go to the log for that filter. -cruvdhevc keeps
+	// HEVC decode published.
+	if (auto *caps = that->getProperty("IOGVAHEVCDecodeCapabilities")) {
+		if (auto *s = OSSerialize::withCapacity(512)) {
+			if (caps->serialize(s))
+				diskLogEvent("hevc decode capabilities: %.900s", s->text());
+			s->release();
+		}
+	}
+	if ((gvaHevcState & 2) && !checkKernelArgument("-cruvdhevc")) {
+		that->removeProperty("IOGVAHEVCDecode");
+		that->removeProperty("IOGVAHEVCDecodeCapabilities");
+		gvaHevcState |= 0x10;
+	}
 	if (that->getProperty("IOGVAHEVCEncode") || that->getProperty("IOGVAHEVCEncodeCapabilities")) {
 		that->removeProperty("IOGVAHEVCEncode");
 		that->removeProperty("IOGVAHEVCEncodeCapabilities");
@@ -8703,8 +8720,10 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 			videoPowered() ? gpuMmio[0x8001] : 0, videoPowered() ? gpuMmio[0x8005] : 0, videoPowered() ? gpuMmio[0x8048] : 0);
 	if (uvdStartInfo.calls)
 		add("uvd start: calls %u skipped %u, last at %llu ms = %u: status %x vcpu %x reset %x lmi %x tile1 %x; state %u, "
-			"pg off %u\n", uvdStartInfo.calls, uvdStartInfo.skipped, uvdStartInfo.ms, uvdStartInfo.ret, uvdStartInfo.status,
-			uvdStartInfo.vcpu, uvdStartInfo.reset, uvdStartInfo.lmi, uvdStartInfo.tile, uvdState, uvdPgOff);
+			"pg off %u; now ring rptr %x wptr %x, srbm status %x\n", uvdStartInfo.calls, uvdStartInfo.skipped,
+			uvdStartInfo.ms, uvdStartInfo.ret, uvdStartInfo.status, uvdStartInfo.vcpu, uvdStartInfo.reset, uvdStartInfo.lmi,
+			uvdStartInfo.tile, uvdState, uvdPgOff, gpuMmio ? gpuMmio[0x3DA4] : 0, gpuMmio ? gpuMmio[0x3DA5] : 0,
+			gpuMmio ? gpuMmio[0x394] : 0);
 	if (smuDpm.done)
 		add("sclk dpm: resp %x %x %x %x %x, L%u-L%u, features %x -> %x (SclkDpmOn %u), level changes %u, max seen L%u (before DPM), now %x; deep sleep %x watermark %x; mailbox msg %x resp %x arg %x, foreign %u:",
 			smuDpm.resp[0], smuDpm.resp[1], smuDpm.resp[2], smuDpm.resp[3], smuDpm.resp[4], smuDpm.hardMin,
