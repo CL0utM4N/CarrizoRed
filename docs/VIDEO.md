@@ -90,6 +90,12 @@ answers, firmware loaded, ring tests) before any playback test.
   `aty_properties` set false for every Polaris: they are forced true for that call, and HEVC encode is withdrawn again
   afterwards (Stoney's UVD has no encode rings). The report's `hevc` bits: 1 flags forced, 2 decode published,
   4 encode withdrawn, 8 renamed.
+- **Stage 3 result (Sonoma):** `hevc f` (renamed, decode published, encode withdrawn). AppleGVA now picks the AMD
+  decoder and opens a context per attempt (four in a boot), but the lock screen's aerial wallpaper is **HEVC Main10,
+  3840x2160, 10-bit**, and every attempt ends in `AVD_api.Create failed err=5` / `Error creating the physical
+  accelerator`, then software decode. Stoney's UVD 6.2 decodes 8-bit HEVC only (Linux `cz_video_codecs_decode`), so
+  the aerial wallpapers stay on the CPU whatever the driver does; a still wallpaper is the fix for that lag. Whether
+  UVD itself works has to be shown with an 8-bit stream (H.264 or 8-bit HEVC).
 - **Next, from the stage 3 log:** whether Apple's UVD 6.3 / VCE 3.4 firmware starts on Stoney (UVD_STATUS, VCPU
   running, ring test). If not, stage 2 replaces the firmware in the engine's buffer (`AMDUVDHWEngine::loadUVDFW` asks
   the shared multimedia layer for the image, `this+0x160`, then decrypts it when a flag says so) with Linux's
