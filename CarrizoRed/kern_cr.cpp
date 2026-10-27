@@ -1006,6 +1006,8 @@ static mach_vm_address_t orgVideoContextStart, videoGetHWInfoOrg;
 static uint32_t wrapVideoContextStart(void *that);
 static uint32_t wrapGetHWInfo(void *that, uint32_t *info);
 static uint32_t videoSpoofId, videoHWInfoCalls;
+static mach_vm_address_t orgUvdContextInit;
+static bool wrapUvdContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
 
 void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	for (size_t i = 0; i < arrsize(kexts); i++) {
@@ -2188,8 +2190,6 @@ namespace {
 		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine6loadFWEv", "vce.loadFW", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine5startEv", "vce.start", InAccel, true, false, 0},
 		// Video sessions (stage 2): whether user space (AppleGVA / the AMD video driver) opens one at all, and how far in.
-		{"__ZN33AMDRadeonX4000_AMDAccelUVDContext4initEP37AMDRadeonX4000_AMDGraphicsAcceleratorP35AMDRadeonX4000_AMDAccelVideoContextP23sVideoContextCreateInfo",
-			"vid.uvdInit", InAccel, true, false, 0},
 		{"__ZN32AMDRadeonX4000_AMDSMLVIInterface9createUVDEv", "vid.createUVD", InAccel, true, false, 0},
 		{"__ZN32AMDRadeonX4000_AMDSMLVIInterface9createVCEEv", "vid.createVCE", InAccel, true, false, 0},
 		// What a session does after contextStart (the first stage-2 log stopped there): hardware info, the content-
@@ -2397,7 +2397,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 171, "one wrapper per stage");
+		static_assert(arrsize(stages) == 170, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -2421,7 +2421,7 @@ namespace {
 			CR_WRAP(145), CR_WRAP(146), CR_WRAP(147), CR_WRAP(148), CR_WRAP(149), CR_WRAP(150), CR_WRAP(151), CR_WRAP(152),
 			CR_WRAP(153), CR_WRAP(154), CR_WRAP(155), CR_WRAP(156), CR_WRAP(157), CR_WRAP(158), CR_WRAP(159), CR_WRAP(160),
 			CR_WRAP(161), CR_WRAP(162), CR_WRAP(163), CR_WRAP(164), CR_WRAP(165), CR_WRAP(166), CR_WRAP(167), CR_WRAP(168),
-			CR_WRAP(169), CR_WRAP(170),
+			CR_WRAP(169),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -2673,6 +2673,9 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		route("__ZN35AMDRadeonX4000_AMDAccelVideoContext9getHWInfoEP13sHardwareInfo",
 			reinterpret_cast<mach_vm_address_t>(wrapGetHWInfo), videoGetHWInfoOrg, nullptr, 0, "video getHWInfo");
 		routeAllowJcc = false;
+		route("__ZN33AMDRadeonX4000_AMDAccelUVDContext4initEP37AMDRadeonX4000_AMDGraphicsAcceleratorP35AMDRadeonX4000_"
+			  "AMDAccelVideoContextP23sVideoContextCreateInfo",
+			reinterpret_cast<mach_vm_address_t>(wrapUvdContextInit), orgUvdContextInit, nullptr, 0, "UVD context init");
 		route("__ZN35AMDRadeonX4000_AMDAccelVideoContext12contextStartEv",
 			reinterpret_cast<mach_vm_address_t>(wrapVideoContextStart), orgVideoContextStart, nullptr, 0,
 			"video contextStart");
@@ -2850,10 +2853,39 @@ static uint32_t wrapVideoContextStart(void *that) {
 static uint32_t wrapGetHWInfo(void *that, uint32_t *info) {
 	uint32_t ret = FunctionCast(wrapGetHWInfo, videoGetHWInfoOrg)(that, info);
 	uint32_t n = ++videoHWInfoCalls;
+	(void)that;
 	if (ret == 0 && info && videoSpoofId && (info[1] & 0xFFFF) != videoSpoofId) {
 		if (n <= 2)
 			diskLogEvent("video hwinfo: family %x device %x -> %x, rev %x", info[0], info[1], videoSpoofId, info[2]);
 		info[1] = videoSpoofId;
+	}
+	return ret;
+}
+
+// Next (same log): AMDSIVideoContext::newContext -> AMDAccelUVDContext::init returns false (kIOReturnUnsupported).
+// init fails when the create info's instance (+0x30) is neither 0 nor 1, or when the hardware's engine for it
+// (getHWEngine(5 + instance) = hardware[0x3D8 / 0x3E0]) isn't an AMDUVDHWEngine; Stoney has one UVD. Log both.
+static const char *className(void *object) {
+	if (!object)
+		return "-";
+	auto *meta = static_cast<OSMetaClassBase *>(object)->getMetaClass();
+	return meta ? meta->getClassName() : "?";
+}
+
+static bool wrapUvdContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo) {
+	static uint32_t calls;
+	bool ret = FunctionCast(wrapUvdContextInit, orgUvdContextInit)(that, accel, videoContext, createInfo);
+	traceNote("vid.uvdInit=%d ", ret);
+	if (++calls <= 3 && createInfo) {
+		diskLogEvent("uvd init = %d: create %08x %08x %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x %08x %08x %08x "
+			"%08x %08x", ret, createInfo[0], createInfo[1], createInfo[2], createInfo[3], createInfo[4], createInfo[5],
+			createInfo[6], createInfo[7], createInfo[8], createInfo[9], createInfo[10], createInfo[11], createInfo[12],
+			createInfo[13], createInfo[14], createInfo[15], createInfo[16]);
+		if (accelHardware) {
+			auto *hw = static_cast<uint8_t *>(accelHardware);
+			void *uvd0 = *reinterpret_cast<void **>(hw + 0x3D8), *uvd1 = *reinterpret_cast<void **>(hw + 0x3E0);
+			diskLogEvent("uvd init: engine 5 %p %s, engine 6 %p %s", uvd0, className(uvd0), uvd1, className(uvd1));
+		}
 	}
 	return ret;
 }
