@@ -6658,9 +6658,9 @@ struct SeenShader {
 	uint64_t fixedPhys;          // its first page's physical address then (a revert on another page: evicted, restored)
 	uint32_t fixedPte, fixedSdmaWptr;  // that page's PTE flags, and the sDMA0 ring's write pointer then
 	// The fix as dwords (index, original, fixed), replayed onto an sDMA copy's source (applySourcePatches);
-	// patchCount 0xFFFF: more than fit, not replayed.
-	uint16_t patchCount, patchAt[32];
-	uint32_t patchOld[32], patchNew[32];
+	// patchCount 0xFFFF: more than fit, not replayed (srcFixOverflow counts the copies that met one).
+	uint16_t patchCount, patchAt[48];
+	uint32_t patchOld[48], patchNew[48];
 };
 static SeenShader seenShaders[512];
 static uint32_t seenNum, seenNext;
@@ -7577,7 +7577,7 @@ static uint64_t wrapCommitIbFiji(void *channel, uint8_t *info) {
 // patched the destination at submission, and the draws in between run unfixed (the random flat-colour images). Fix the
 // source too, here, before the copy runs: for every fixed shader inside the copy's destination, write its patch list at
 // the same offset in the source, dword by dword, only where the source still holds the original dword it replaced.
-static uint32_t srcFixCopies, srcFixDwords, srcFixMismatch, srcFixLogged;
+static uint32_t srcFixCopies, srcFixDwords, srcFixMismatch, srcFixLogged, srcFixOverflow, srcFixReadFail;
 
 static void applySourcePatches(uint32_t vmid, uint64_t src, uint64_t dst, uint32_t bytes) {
 	static int off = -1;  // -crnosrcfix disables it
@@ -7587,8 +7587,14 @@ static void applySourcePatches(uint32_t vmid, uint64_t src, uint64_t dst, uint32
 		return;
 	for (uint32_t i = 0; i < seenNum && i < arrsize(seenShaders); i++) {
 		auto &sh = seenShaders[i];
-		if (sh.vmid != vmid || !sh.patchCount || sh.patchCount == 0xFFFF || sh.va >= dst + bytes ||
-			sh.va + sh.patchAt[sh.patchCount - 1] * 4ULL + 4 <= dst)
+		if (sh.vmid != vmid || !sh.patchCount)
+			continue;
+		if (sh.patchCount == 0xFFFF) {  // a fix too long to replay: count copies onto its start
+			if (sh.va >= dst && sh.va < dst + bytes)
+				srcFixOverflow++;
+			continue;
+		}
+		if (sh.va >= dst + bytes || sh.va + sh.patchAt[sh.patchCount - 1] * 4ULL + 4 <= dst)
 			continue;  // no patched dword can be inside the copy (patchAt is ascending)
 		srcFixCopies++;
 		uint32_t wrote = 0, mismatch = 0;
@@ -7599,8 +7605,10 @@ static void applySourcePatches(uint32_t vmid, uint64_t src, uint64_t dst, uint32
 				continue;
 			uint64_t off = addr - dst;
 			uint32_t now = 0;
-			if (readGpuVa(vmid, src + off, 1, &now, false) != 1)
+			if (readGpuVa(vmid, src + off, 1, &now, false) != 1) {
+				srcFixReadFail++;
 				continue;
+			}
 			if (now == sh.patchNew[k])
 				continue;  // already fixed
 			if (now != sh.patchOld[k]) {
@@ -7636,7 +7644,9 @@ static void sdmaWalk(uint32_t vmid, uint64_t va, uint32_t dwords) {
 					noteGpuCopy(vmid, 0x101, h, src, dst, bytes);
 					applySourcePatches(vmid, src, dst, bytes);
 				}
-				len = sub == 0 ? 7 : sub == 1 ? 12 : sub == 3 ? 13 : sub == 4 ? 14 : 0;
+				// Linux tonga_sdma_pkt_open.h: linear 7, tiled 12, struct (SOA) 8, linear sub-window 13, tiled sub-window 14
+				// (Apple's texture uploads, header 0x501: 91 per boot stopped the walk before), tile-to-tile 15.
+				len = sub == 0 ? 7 : sub == 1 ? 12 : sub == 3 ? 8 : sub == 4 ? 13 : sub == 5 ? 14 : sub == 6 ? 15 : 0;
 				break;
 			case 2:
 				if (sub == 0 && j + 3 < got) {
@@ -7989,11 +7999,11 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
-	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u (moved %u) block-moves %u; source fixes %u copies %u dwords %u mismatched; binds %u memo %u walks %u; ib-read ms %llu ps-check ms %llu ib-dw %llu pages snooped %u plain %u vram %u\n",
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u (moved %u) block-moves %u; source fixes %u copies %u dwords %u mismatched %u too long %u unreadable; binds %u memo %u walks %u; ib-read ms %llu ps-check ms %llu ib-dw %llu pages snooped %u plain %u vram %u\n",
 		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
 		interpFix.writes, interpFix.writeFails, interpFix.deadRegs, interpFix.bumps, interpHooked, ibHookCalls, ibHookIbs,
 		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap, ibHookRaiseOnly,
-		raisedNum, interpFix.probeReverts, interpFix.revertMoved, interpFix.blockMoves, srcFixCopies, srcFixDwords, srcFixMismatch, ibHookBinds, ibHookMemoHits, vmWalks,
+		raisedNum, interpFix.probeReverts, interpFix.revertMoved, interpFix.blockMoves, srcFixCopies, srcFixDwords, srcFixMismatch, srcFixOverflow, srcFixReadFail, ibHookBinds, ibHookMemoHits, vmWalks,
 		absToMs(ibReadTime), absToMs(psCheckTime), ibDwordsRead, ibPagesSnooped, ibPagesPlain, ibPagesVram);
 	// The clock samples (sampleGpuClock); "window": the SMU firmware version read through window 13 and window 0,
 	// which must match for the samples to mean anything.
