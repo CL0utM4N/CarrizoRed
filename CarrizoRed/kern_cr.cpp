@@ -3574,7 +3574,11 @@ static bool eclkRunning() {
 // Before a UVD context is made, check that a plain read/write register (UVD_GPCOM_VCPU_DATA0) keeps a value; if not,
 // try the SMU power-up again (as at boot, then off + on with dynamic gating) and log what each gives; a UVD that still
 // doesn't respond gets no session. -crnouvdcheck skips the check.
+// Clocks weren't it (nvram11 session: DCLK/VCLK/ECLK dividers 12/f/f, all ready, UVD still all zeros). Linux's
+// uvd_v6_0_start takes the block out of SRBM_SOFT_RESET (SOFT_RESET_UVD) before touching it, and a block held there
+// reads 0 and drops writes: the check clears that bit first (-crnouvdunreset leaves it).
 static constexpr uint32_t UvdGpcomData0 = 0x3BC4;
+static constexpr uint32_t SrbmSoftReset = 0x398, SrbmResetUvd = 0x40000;
 static uint32_t uvdState;  // 0 unchecked, 1 alive, 2 dead (sessions refused)
 
 static bool uvdResponds() {
@@ -3586,8 +3590,8 @@ static bool uvdResponds() {
 }
 
 static void uvdRegs(const char *when) {
-	diskLogEvent("uvd regs %s: status %x vcpu %x reset %x lmi %x data0 %x cgc %x", when, gpuMmio[0x3DAF], gpuMmio[0x3D98],
-		gpuMmio[0x3DA0], gpuMmio[0x3D67], gpuMmio[UvdGpcomData0], gpuMmio[0x3D2C]);
+	diskLogEvent("uvd regs %s: status %x vcpu %x reset %x lmi %x data0 %x cgc %x srbm %x", when, gpuMmio[0x3DAF],
+		gpuMmio[0x3D98], gpuMmio[0x3DA0], gpuMmio[0x3D67], gpuMmio[UvdGpcomData0], gpuMmio[0x3D2C], gpuMmio[SrbmSoftReset]);
 }
 
 static bool uvdReadyForSession() {
@@ -3601,6 +3605,13 @@ static bool uvdReadyForSession() {
 	}
 	videoClocksSet("session");
 	uvdRegs("before");
+	uint32_t srbm = gpuMmio[SrbmSoftReset];
+	if ((srbm & SrbmResetUvd) && !checkKernelArgument("-crnouvdunreset")) {
+		gpuMmio[SrbmSoftReset] = srbm & ~SrbmResetUvd;
+		IODelay(5000);
+		uvdRegs("unreset");
+	}
+	diskLogEvent("uvd check: SRBM_SOFT_RESET %x -> %x", srbm, gpuMmio[SrbmSoftReset]);
 	bool alive = uvdResponds();
 	diskLogEvent("uvd check: responds %d", alive);
 	if (!alive) {
@@ -3632,6 +3643,11 @@ static bool uvdReadyForSession() {
 static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo) {
 	static uint32_t refused;
 	if (!checkKernelArgument("-crvce") || !gpuMmio || !videoPowered() || !eclkRunning()) {
+		// newContext calls AMDAccelVCEContext::free when init fails, and free reads the accelerator from this+0x50
+		// without a check (13-15); init sets it only after its super init, so a refused context faulted (nvram11).
+		auto &ctxAccel = *reinterpret_cast<void **>(static_cast<uint8_t *>(that) + 0x50);
+		if (!ctxAccel)
+			ctxAccel = accel;
 		if (!refused++)
 			diskLogEvent("vce init refused (eclk cntl %x status %x)", gpuMmio ? smcRead(videoClocks[2].cntl) : 0,
 				gpuMmio ? smcRead(videoClocks[2].status) : 0);
