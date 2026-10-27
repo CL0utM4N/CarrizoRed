@@ -2525,6 +2525,11 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			interpHooked |= route("__ZN32AMDRadeonX4000_AMDFijiPM4Channel27commitIndirectCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
 				reinterpret_cast<mach_vm_address_t>(wrapCommitIbFiji), orgCommitIbFiji, nullptr, 0,
 				"Fiji commitIndirectCommandBuffer");
+		// sDMA submissions, read for the copy list only (-crnosdmawatch leaves them).
+		if (interpLock && interpSubmit && !checkKernelArgument("-crnosdmawatch"))
+			route("__ZN31AMDRadeonX4000_AMDVIsDMAChannel27commitIndirectCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
+				reinterpret_cast<mach_vm_address_t>(wrapCommitSdma), orgCommitSdma, nullptr, 0,
+				"sDMA commitIndirectCommandBuffer");
 	}
 
 	if (family == ChipFamily::Stoney && !checkKernelArgument("-crnosdmafix")) {
@@ -6618,21 +6623,22 @@ struct GpuCopy {
 	uint64_t dst, src, ms;
 	uint32_t bytes, op, vmid, ctrl;
 };
-static GpuCopy gpuCopies[64];
+static GpuCopy gpuCopies[256];
+static uint32_t sdmaHookCalls, sdmaIbs, sdmaUnknown;  // sDMA submissions read (wrapCommitSdma)
 static uint32_t gpuCopyNext, gpuCopyPackets, gpuCopyBindHits, gpuCopyRevertHits, gpuCopyLogged;
 
 static void noteGpuCopy(uint32_t vmid, uint32_t op, uint32_t ctrl, uint64_t src, uint64_t dst, uint32_t bytes) {
-	gpuCopyPackets++;
-	gpuCopies[gpuCopyNext++ % arrsize(gpuCopies)] = {dst & 0xFFFFFFFFFFFFULL, src & 0xFFFFFFFFFFFFULL, uptimeMs(), bytes,
+	__atomic_fetch_add(&gpuCopyPackets, 1, __ATOMIC_RELAXED);
+	gpuCopies[__atomic_fetch_add(&gpuCopyNext, 1, __ATOMIC_RELAXED) % arrsize(gpuCopies)] = {dst & 0xFFFFFFFFFFFFULL, src & 0xFFFFFFFFFFFFULL, uptimeMs(), bytes,
 		op, vmid, ctrl};
 }
 
-// The most recent copy (within 200 ms) whose destination overlaps the shader's first 4 KB.
-static const GpuCopy *recentCopyTo(uint32_t vmid, uint64_t va) {
+// The most recent copy (within maxAge ms) whose destination overlaps the shader's first 4 KB.
+static const GpuCopy *recentCopyTo(uint32_t vmid, uint64_t va, uint64_t maxAge = 200) {
 	uint64_t now = uptimeMs();
 	const GpuCopy *best = nullptr;
 	for (auto &c : gpuCopies)
-		if (c.bytes && c.vmid == vmid && now - c.ms <= 200 && c.dst < va + 0x1000 && va < c.dst + c.bytes &&
+		if (c.bytes && c.vmid == vmid && now - c.ms <= maxAge && c.dst < va + 0x1000 && va < c.dst + c.bytes &&
 			(!best || c.ms >= best->ms))
 			best = &c;
 	return best;
@@ -6772,7 +6778,7 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 			(readGpuVa(vmid, psVa + entry->probeAt * 4ULL, 1, &now, false) == 1 && now == entry->probeVal))
 			return withRaise(vmid, psVa, rsrc1);
 		interpFix.probeReverts++;
-		auto *c = recentCopyTo(vmid, psVa);
+		auto *c = recentCopyTo(vmid, psVa, ~0ULL);
 		if (c)
 			gpuCopyRevertHits++;
 		if (interpFix.probeReverts <= 60)
@@ -7182,8 +7188,9 @@ static void ctxDump() {
 	dump("ctx metal", 0x28000, censusCtx, censusCtxSet, 0x400);
 	dump("ctx clearstate", 0x28000, csbCtx, csbCtxSet, 0x400);
 	dump("uconfig metal", 0x30000, censusUcfg, censusUcfgSet, 0x400);
-	diskLogEvent("gpu copies: %u packets, %u binds and %u reverts right after a copy to the shader", gpuCopyPackets,
-		gpuCopyBindHits, gpuCopyRevertHits);
+	diskLogEvent("gpu copies: %u packets, %u binds and %u reverts right after a copy to the shader; sDMA submissions %u, "
+		"command buffers %u, unknown packets %u", gpuCopyPackets, gpuCopyBindHits, gpuCopyRevertHits, sdmaHookCalls, sdmaIbs,
+		sdmaUnknown);
 }
 
 // New draw-census entries to the disk log (watcher thread).
@@ -7531,6 +7538,82 @@ static uint64_t wrapCommitIb(void *channel, uint8_t *info) {
 static uint64_t wrapCommitIbFiji(void *channel, uint8_t *info) {
 	interpHookBody(info);
 	return FunctionCast(wrapCommitIbFiji, orgCommitIbFiji)(channel, info);
+}
+
+// sDMA submissions (AMDVIsDMAChannel::commitIndirectCommandBuffer, the same AMD_SUBMIT_COMMAND_BUFFER_INFO): their copies,
+// writes and fills go into the copy list (op 0x100 + sDMA opcode), to see whether the sDMA engine rewrites fixed shaders
+// (Sonoma: every revert had sDMA0 activity since the fix, and none had a copy in the graphics command buffers).
+// Packet lengths from Linux vid.h / sdma_v3_0 (VI sDMA): COPY linear 7, WRITE linear 4 + n, INDIRECT 6, FENCE 4, TRAP 2,
+// SEM 3, POLL_REGMEM 6, COND_EXE 5, ATOMIC 8, CONST_FILL 5, GEN_PTEPDE 10, TIMESTAMP 3, SRBM_WRITE 3; others end the walk.
+static mach_vm_address_t orgCommitSdma;
+
+static void sdmaWalk(uint32_t vmid, uint64_t va, uint32_t dwords) {
+	static uint32_t buf[0x1000];
+	uint32_t got = readGpuVa(vmid, va, dwords < arrsize(buf) ? dwords : arrsize(buf), buf, false);
+	for (uint32_t j = 0; j < got;) {
+		uint32_t h = buf[j], op = h & 0xFF, sub = (h >> 8) & 0xFF, len = 0;
+		switch (op) {
+			case 0: len = 1 + ((h >> 16) & 0x3FFF); break;  // NOP (count of extra dwords)
+			case 1:
+				if (sub == 0 && j + 6 < got)
+					noteGpuCopy(vmid, 0x101, h, static_cast<uint64_t>(buf[j + 4]) << 32 | buf[j + 3],
+						static_cast<uint64_t>(buf[j + 6]) << 32 | buf[j + 5], (buf[j + 1] & 0x3FFFFF) + 1);
+				len = sub == 0 ? 7 : sub == 1 ? 12 : sub == 3 ? 13 : sub == 4 ? 14 : 0;
+				break;
+			case 2:
+				if (sub == 0 && j + 3 < got) {
+					noteGpuCopy(vmid, 0x102, h, 0, static_cast<uint64_t>(buf[j + 2]) << 32 | buf[j + 1],
+						((buf[j + 3] & 0xFFFFF) + 1) * 4);
+					len = 4 + (buf[j + 3] & 0xFFFFF) + 1;
+				}
+				break;
+			case 4: len = 6; break;
+			case 5: len = 4; break;
+			case 6: len = 2; break;
+			case 7: len = 3; break;
+			case 8: len = 6; break;
+			case 9: len = 5; break;
+			case 10: len = 8; break;
+			case 11:
+				if (j + 4 < got)
+					noteGpuCopy(vmid, 0x10B, h, 0, static_cast<uint64_t>(buf[j + 2]) << 32 | buf[j + 1],
+						(buf[j + 4] & 0x3FFFFF) + 1);
+				len = 5;
+				break;
+			case 12: len = 10; break;
+			case 13: len = 3; break;
+			case 14: len = 3; break;
+			default: break;
+		}
+		if (!len) {
+			sdmaUnknown++;
+			return;
+		}
+		j += len;
+	}
+}
+
+static uint64_t wrapCommitSdma(void *channel, uint8_t *info) {
+	if (info && interpLock && gpuMmio && __atomic_load_n(&carveMap, __ATOMIC_ACQUIRE)) {
+		uint32_t flags = *reinterpret_cast<uint32_t *>(info), vmid = *reinterpret_cast<uint32_t *>(info + 4);
+		uint32_t count = *reinterpret_cast<uint32_t *>(info + 0xC);
+		sdmaHookCalls++;
+		if (!(flags & 0x12) && vmid <= 15 && IOLockTryLock(interpLock)) {
+			__atomic_fetch_add(&hookDepth, 1, __ATOMIC_ACQ_REL);
+			vmCacheBegin();
+			for (uint32_t i = 0; i < count && i < 8; i++) {
+				uint32_t dw = *reinterpret_cast<uint32_t *>(info + 0x44 + i * 0x28);
+				uint64_t va = *reinterpret_cast<uint64_t *>(info + 0x50 + i * 0x28);
+				if (dw && va && vmid) {
+					sdmaIbs++;
+					sdmaWalk(vmid, va, dw);
+				}
+			}
+			__atomic_fetch_sub(&hookDepth, 1, __ATOMIC_ACQ_REL);
+			IOLockUnlock(interpLock);
+		}
+	}
+	return FunctionCast(wrapCommitSdma, orgCommitSdma)(channel, info);
 }
 
 struct PutState {
