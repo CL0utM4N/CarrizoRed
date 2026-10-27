@@ -1011,6 +1011,9 @@ static mach_vm_address_t orgUvdContextInit;
 static bool wrapUvdContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
 static mach_vm_address_t orgUvdStart;
 static bool wrapUvdStart(void *that);
+static void uvdLiveTick();
+static uint64_t ibMcToPhys(uint64_t addr, bool system);
+static bool physRangeOk(uint64_t phys, uint32_t bytes);
 static mach_vm_address_t orgAddPlistPropertiesToPCIDevice;
 static uint64_t wrapAddPlistPropertiesToPCIDevice(IOService *that, const char *name);
 // -cruvdpanic: a report 20 s after the first UVD session check, unless UVD's firmware reported by then (nvram13:
@@ -1811,6 +1814,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			writeBreadcrumb(t);
 		if (panicAt && t >= panicAt)
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
+		uvdLiveTick();
 		if (uvdPanicMs && uptimeMs() >= uvdPanicMs && !(uvdStartInfo.status & 2))
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (-cruvdpanic), 20 s after the first UVD session.");
 		kickStalledFlip();
@@ -3786,6 +3790,61 @@ static bool wrapUvdStart(void *that) {
 		return false;
 	}
 	return ret;
+}
+
+// With the firmware running, H.264 decode still hung (nvram16: GPU restart 7 s into the first session, then resetHW
+// never finished), and the report only had UVD's state after the restart. Linux runs Stoney's UVD in physical mode (the
+// kernel rewrites every buffer address in a decode command to a memory-controller one) and only Polaris and later in VM
+// mode, which is what Apple's driver uses. So every 500 ms while the firmware runs (UVD_STATUS bit 1; a restart stops
+// it, keeping the last snapshot from before) record the ring and IB address registers and VMIDs, the VCPU command
+// registers, and the ring's first 32 dwords (its first IB packets), for the report.
+static struct {
+	uint64_t ms;
+	uint32_t samples, status, vcpu, rptr, wptr, rbCntl, rbLo, rbHi, rbVmid, ibLo, ibHi, ibVmid, ibSize, lmi, cmd, data0,
+		data1, ctxId, semaTimeout, ring[32];
+	bool ringRead;
+} uvdLive;
+
+static void uvdLiveTick() {
+	auto *m = gpuMmio;
+	if (uvdState != 1 || !m || !(m[0x3DAF] & 2))
+		return;
+	auto &s = uvdLive;
+	uint32_t wptr = m[0x3DA5];
+	bool wptrMoved = wptr != s.wptr || !s.samples;
+	s.ms = uptimeMs();
+	s.samples++;
+	s.status = m[0x3DAF];
+	s.vcpu = m[0x3D98];
+	s.rptr = m[0x3DA4];
+	s.wptr = wptr;
+	s.rbCntl = m[0x3DA9];
+	s.rbLo = m[0x3C69];
+	s.rbHi = m[0x3C68];
+	s.rbVmid = m[0x3DA3];
+	s.ibLo = m[0x3C67];
+	s.ibHi = m[0x3C66];
+	s.ibVmid = m[0x3DA1];
+	s.ibSize = m[0x3DA2];
+	s.lmi = m[0x3D67];
+	s.cmd = m[0x3BC3];
+	s.data0 = m[0x3BC4];
+	s.data1 = m[0x3BC5];
+	s.ctxId = m[0x3DBD];
+	s.semaTimeout = m[0x3DB0];
+	if (!wptrMoved || s.rbVmid)
+		return;
+	uint64_t phys = ibMcToPhys(static_cast<uint64_t>(s.rbHi) << 32 | s.rbLo, false);
+	if (!physRangeOk(phys, sizeof(s.ring)))
+		return;
+	auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, sizeof(s.ring), kIODirectionIn);
+	auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+	if (map) {
+		memcpy(s.ring, reinterpret_cast<const void *>(map->getVirtualAddress()), sizeof(s.ring));
+		s.ringRead = true;
+	}
+	OSSafeReleaseNULL(map);
+	OSSafeReleaseNULL(desc);
 }
 
 // Why the VCPU never started (nvram14: UVD_STATUS 0, VCPU_CNTL ff20000 without CLK_EN): CAIL's tonga_init_uvd_engine
@@ -8724,6 +8783,16 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 			uvdStartInfo.ms, uvdStartInfo.ret, uvdStartInfo.status, uvdStartInfo.vcpu, uvdStartInfo.reset, uvdStartInfo.lmi,
 			uvdStartInfo.tile, uvdState, uvdPgOff, gpuMmio ? gpuMmio[0x3DA4] : 0, gpuMmio ? gpuMmio[0x3DA5] : 0,
 			gpuMmio ? gpuMmio[0x394] : 0);
+	if (uvdLive.samples) {
+		auto &s = uvdLive;
+		add("uvd live (%u samples, last at %llu ms): status %x vcpu %x rptr %x wptr %x rb cntl %x bar %x:%08x vmid %x; ib "
+			"%x:%08x vmid %x size %x; lmi %x cmd %x data %x %x ctx %x sema %x; ring%s:", s.samples, s.ms, s.status, s.vcpu,
+			s.rptr, s.wptr, s.rbCntl, s.rbHi, s.rbLo, s.rbVmid, s.ibHi, s.ibLo, s.ibVmid, s.ibSize, s.lmi, s.cmd, s.data0,
+			s.data1, s.ctxId, s.semaTimeout, s.ringRead ? "" : " (not read)");
+		for (size_t i = 0; s.ringRead && i < arrsize(s.ring); i++)
+			add(" %x", s.ring[i]);
+		add("\n");
+	}
 	if (smuDpm.done)
 		add("sclk dpm: resp %x %x %x %x %x, L%u-L%u, features %x -> %x (SclkDpmOn %u), level changes %u, max seen L%u (before DPM), now %x; deep sleep %x watermark %x; mailbox msg %x resp %x arg %x, foreign %u:",
 			smuDpm.resp[0], smuDpm.resp[1], smuDpm.resp[2], smuDpm.resp[3], smuDpm.resp[4], smuDpm.hardMin,
