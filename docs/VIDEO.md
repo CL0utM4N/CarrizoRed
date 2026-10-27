@@ -73,7 +73,14 @@ answers, firmware loaded, ring tests) before any playback test.
   LMI status and ring pointers go into the disk log every second and into the report's `video:` line. Apple's
   power-gating calls are not hooked: the Dummy back end's `PhwDummy_PowerGateUVD`/`VCE` are 11-byte stubs packed back
   to back, too small for a jump; the engines simply stay powered.
-- **Next, from the stage 1 log:** whether Apple's UVD 6.3 / VCE 3.4 firmware starts on Stoney (UVD_STATUS, VCPU
+- **Stage 1 result:** the SMU powers both engines (`UVDPowerON 1`, `VCEPowerON 1`), but Apple's `loadUVDFW`, UVD
+  `start` and the VCE stages never ran: the engines start when a decode session opens, and none did.
+- **Stage 2, implemented (`-crvideo`, in testing):** AppleGVA chooses the hardware decoder from the platform's
+  board-id and expects the Intel iGPU's for iMac19,1. As WhateverGreen's `unfairgva=4` does, CarrizoRed renames the
+  property AppleGVA reads (`board-id`, next to `hw.model` in the dyld shared cache) to `hwgva-id` and sets that on the
+  device tree root to iMacPro1,1's board-id, an AMD-only Mac. The rest of the system keeps its SMBIOS. `-crnogva` leaves
+  AppleGVA alone.
+- **Next, from the stage 2 log:** whether Apple's UVD 6.3 / VCE 3.4 firmware starts on Stoney (UVD_STATUS, VCPU
   running, ring test). If not, stage 2 replaces the firmware in the engine's buffer (`AMDUVDHWEngine::loadUVDFW` asks
   the shared multimedia layer for the image, `this+0x160`, then decrypts it when a flag says so) with Linux's
   `stoney_uvd.bin` / `stoney_vce.bin`, fetched by CI rather than committed.
