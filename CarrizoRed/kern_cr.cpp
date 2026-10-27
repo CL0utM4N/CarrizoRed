@@ -2152,6 +2152,12 @@ namespace {
 		{"__ZN29AMDRadeonX4000_AMDUVDHWEngine13startRBEngineEv", "uvd.startRB", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine6loadFWEv", "vce.loadFW", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine5startEv", "vce.start", InAccel, true, false, 0},
+		// Video sessions (stage 2): whether user space (AppleGVA / the AMD video driver) opens one at all, and how far in.
+		{"__ZN35AMDRadeonX4000_AMDAccelVideoContext12contextStartEv", "vid.contextStart", InAccel, true, false, 0},
+		{"__ZN33AMDRadeonX4000_AMDAccelUVDContext4initEP37AMDRadeonX4000_AMDGraphicsAcceleratorP35AMDRadeonX4000_AMDAccelVideoContextP23sVideoContextCreateInfo",
+			"vid.uvdInit", InAccel, true, false, 0},
+		{"__ZN32AMDRadeonX4000_AMDSMLVIInterface9createUVDEv", "vid.createUVD", InAccel, true, false, 0},
+		{"__ZN32AMDRadeonX4000_AMDSMLVIInterface9createVCEEv", "vid.createVCE", InAccel, true, false, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware23allocateMemoryResourcesEv", "hw.allocateMemoryResources", InAccel, true, true, 0},
 		{"__ZN28AMDRadeonX4000_AMDVIHardware16initializeVMRegsEv", "hw.initializeVMRegs", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware27initializeHardwareRegistersEv", "hw.initializeHardwareRegisters", InAccel, true, true, 0},
@@ -2346,7 +2352,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 162, "one wrapper per stage");
+		static_assert(arrsize(stages) == 166, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -2369,7 +2375,7 @@ namespace {
 			CR_WRAP(138), CR_WRAP(139), CR_WRAP(140), CR_WRAP(141), CR_WRAP(142), CR_WRAP(143), CR_WRAP(144),
 			CR_WRAP(145), CR_WRAP(146), CR_WRAP(147), CR_WRAP(148), CR_WRAP(149), CR_WRAP(150), CR_WRAP(151), CR_WRAP(152),
 			CR_WRAP(153), CR_WRAP(154), CR_WRAP(155), CR_WRAP(156), CR_WRAP(157), CR_WRAP(158), CR_WRAP(159), CR_WRAP(160),
-			CR_WRAP(161),
+			CR_WRAP(161), CR_WRAP(162), CR_WRAP(163), CR_WRAP(164), CR_WRAP(165),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
