@@ -5978,19 +5978,22 @@ static void cfgStep(const uint32_t *code, uint32_t i, bool &fall, int32_t &targe
 
 // The instruction graph of one shader, for following a register's values backwards: which dwords start an
 // instruction, the instruction before each, and the branches into each (cfgFirstIn: 1 + index into cfgBranchFrom).
-static uint8_t cfgIsStart[0x8000];
-static uint16_t cfgPrev[0x8000], cfgFirstIn[0x8000];
-static uint16_t cfgBranchFrom[0x1000], cfgNextIn[0x1000];
+// The largest shader the fixer reads and analyses, in dwords (512 KB). Sonoma's lock screen shader is past 128 KB (no
+// s_endpgm in the first 32768 dwords, 1554 branches): it was skipped and always drew unfixed (a black wallpaper).
+static constexpr uint32_t MaxShaderDwords = 0x20000;
+static uint8_t cfgIsStart[MaxShaderDwords];
+static uint32_t cfgPrev[MaxShaderDwords], cfgFirstIn[MaxShaderDwords];
+static uint32_t cfgBranchFrom[0x4000], cfgNextIn[0x4000];
 
 static bool cfgBuild(const uint32_t *code, uint32_t end) {
 	if (end > arrsize(cfgIsStart))
 		return false;
 	memset(cfgIsStart, 0, end);
 	memset(cfgFirstIn, 0, end * sizeof(cfgFirstIn[0]));
-	uint32_t prev = 0xFFFF, branches = 0;
+	uint32_t prev = 0xFFFFFFFF, branches = 0;
 	for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i)) {
 		cfgIsStart[i] = 1;
-		cfgPrev[i] = static_cast<uint16_t>(prev);
+		cfgPrev[i] = prev;
 		prev = i;
 	}
 	for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i)) {
@@ -6001,9 +6004,9 @@ static bool cfgBuild(const uint32_t *code, uint32_t end) {
 			continue;
 		if (target >= static_cast<int32_t>(end) || !cfgIsStart[target] || branches == arrsize(cfgBranchFrom))
 			return false;  // a branch out of the program or into the middle of an instruction
-		cfgBranchFrom[branches] = static_cast<uint16_t>(i);
+		cfgBranchFrom[branches] = i;
 		cfgNextIn[branches] = cfgFirstIn[target];
-		cfgFirstIn[target] = static_cast<uint16_t>(++branches);
+		cfgFirstIn[target] = ++branches;
 	}
 	return true;
 }
@@ -6026,8 +6029,9 @@ struct RegChange {
 	uint32_t voted;  // members (bit = index in the block) moving this operand
 };
 
-static uint8_t webKind[0x8000], webDef[0x8000], webIn[0x8000], webSeen[0x8000], webEntry[0x8000];
-static uint16_t webStack[0xA000];
+static uint8_t webKind[MaxShaderDwords], webDef[MaxShaderDwords], webIn[MaxShaderDwords], webSeen[MaxShaderDwords],
+	webEntry[MaxShaderDwords];
+static uint32_t webStack[MaxShaderDwords + MaxShaderDwords / 4];
 
 static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint32_t p2, uint32_t vI, uint32_t blockAt,
 	uint32_t base, uint32_t k, uint32_t F, RegChange *out, uint32_t &outNum, uint32_t outMax, uint32_t &fail) {
@@ -6058,8 +6062,8 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 		out[outNum++] = {i, field, reg, 1U << (member - base)};
 		return true;
 	};
-	// Operands a member must move with the others: instruction position, bit 15 set for its write.
-	static uint16_t forced[16][32];
+	// Operands a member must move with the others: instruction position, bit 31 set for its write.
+	static uint32_t forced[16][32];
 	uint32_t forcedNum[16] {};
 	if (k > arrsize(forced))
 		return false;
@@ -6090,7 +6094,7 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 				if (sp == arrsize(webStack))
 					overflow = true;
 				else
-					webStack[sp++] = static_cast<uint16_t>(y);
+					webStack[sp++] = y;
 			};
 			auto preds = [&](uint32_t y) {
 				if (y == 0 && !entry) {
@@ -6098,7 +6102,7 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 					grew = true;
 				}
 				uint32_t p = cfgPrev[y];
-				if (p != 0xFFFF) {
+				if (p != 0xFFFFFFFF) {
 					bool fall;
 					int32_t target;
 					cfgStep(code, p, fall, target);
@@ -6156,8 +6160,8 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 		};
 		join(blockAt);
 		for (uint32_t s = 0; s < forcedNum[r - base]; s++) {
-			uint32_t site = forced[r - base][s] & 0x7FFF;
-			if (forced[r - base][s] & 0x8000)
+			uint32_t site = forced[r - base][s] & 0x7FFFFFFF;
+			if (forced[r - base][s] & 0x80000000)
 				webDef[site] = 1;
 			else
 				join(site);
@@ -6275,7 +6279,7 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 			if (out[c].field.read)
 				sites[siteNum++] = out[c].at;
 			if (out[c].field.write)
-				sites[siteNum++] = out[c].at | 0x8000;
+				sites[siteNum++] = out[c].at | 0x80000000;
 			for (uint32_t s = 0; s < siteNum; s++) {
 				bool known = false;
 				for (uint32_t q = 0; q < forcedNum[m] && !known; q++)
@@ -6286,7 +6290,7 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 					fail = (m << 8) | 9;
 					return false;
 				}
-				forced[m][forcedNum[m]++] = static_cast<uint16_t>(sites[s]);
+				forced[m][forcedNum[m]++] = sites[s];
 				more = true;
 			}
 		}
@@ -6386,7 +6390,7 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 		uint32_t renames = 0;
 		uint32_t blockBase = 0, blockCount = 0, blockAt = 0;
 		if (branchy) {
-			static uint8_t state[0x8000], start[0x8000];
+			static uint8_t state[MaxShaderDwords], start[MaxShaderDwords];
 			memset(state, 0, end);
 			memset(start, 0, end);
 			for (uint32_t i = 0; i < end; i += gcn3InstLength(code + i, end - i))
@@ -6659,8 +6663,8 @@ struct SeenShader {
 	uint32_t fixedPte, fixedSdmaWptr;  // that page's PTE flags, and the sDMA0 ring's write pointer then
 	// The fix as dwords (index, original, fixed), replayed onto an sDMA copy's source (applySourcePatches);
 	// patchCount 0xFFFF: more than fit, not replayed (srcFixOverflow counts the copies that met one).
-	uint16_t patchCount, patchAt[48];
-	uint32_t patchOld[48], patchNew[48];
+	uint16_t patchCount;
+	uint32_t patchAt[96], patchOld[96], patchNew[96];
 };
 static SeenShader seenShaders[512];
 static uint32_t seenNum, seenNext;
@@ -6768,8 +6772,9 @@ static uint32_t readGpuVa(uint32_t vmid, uint64_t va, uint32_t max, uint32_t *ou
 
 // A pixel shader bound with RSRC1_PS = rsrc1: fix it if we haven't, and return the RSRC1 value it needs.
 static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, bool allowBump) {
-	// Up to 128 KB of code (nvram173/174: some pixel shaders run past 8 KB, a few past 32 KB).
-	static uint32_t code[0x8000], original[0x8000];
+	// Up to MaxShaderDwords (512 KB) of code (nvram173/174: some pixel shaders run past 8 KB, a few past 32 KB; Sonoma's lock
+	// screen shader past 128 KB).
+	static uint32_t code[MaxShaderDwords], original[MaxShaderDwords];
 	// Every bind of a known shader only costs its first 16 dwords (a fingerprint taken after fixing it); the whole
 	// shader is read and fixed only when it is new here or its code changed.
 	if (readGpuVa(vmid, psVa, 16, code, false) != 16)
@@ -6860,9 +6865,21 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 				}
 				i += gcn3InstLength(code + i, have - i);
 			}
+			// Where it does end: scan on for the s_endpgm word, past what the fixer reads (up to 4 MB).
+			uint32_t trueEnd = 0;
+			static uint32_t more[1024];
+			for (uint64_t at = have; !trueEnd && at < 0x100000;) {
+				uint32_t n = readGpuVa(vmid, psVa + at * 4, arrsize(more), more, false);
+				for (uint32_t q = 0; q < n && !trueEnd; q++)
+					if (more[q] == 0xBF810000)
+						trueEnd = static_cast<uint32_t>(at + q + 1);
+				if (n < arrsize(more))
+					break;
+				at += n;
+			}
 			diskLogEvent("no end: ps %llx %u dw read; s_endpgm %u (first %d), s_setpc %u (first %d), s_swappc %u, branches %u, "
-				"hazard at %u", psVa, have, endpgm, static_cast<int>(firstEnd), setpc, static_cast<int>(firstSetpc), swappc,
-				branches, interpFix.lastHazardAt);
+				"hazard at %u; first s_endpgm word further on: %u dw", psVa, have, endpgm, static_cast<int>(firstEnd), setpc,
+				static_cast<int>(firstSetpc), swappc, branches, interpFix.lastHazardAt, trueEnd);
 			for (uint32_t i = 0; i < 160 && i < have; i += 16)
 				diskLogEvent("no end %llx +%u: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
 					psVa, i, code[i], code[i + 1], code[i + 2], code[i + 3], code[i + 4], code[i + 5], code[i + 6],
@@ -6911,7 +6928,7 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 		skip == SkipNoFreeVgpr && !allowBump, probeAt, probeVal, uptimeMs(), physAtFix, pteAtFix,
 		gpuMmio ? gpuMmio[0x3484] : 0};
 	for (uint32_t q = 0; q < have && fixedHere && ok && fresh.patchCount != 0xFFFF; q++) {
-		if (code[q] == original[q] || q > 0xFFFF)
+		if (code[q] == original[q])
 			continue;
 		if (fresh.patchCount == arrsize(fresh.patchAt)) {
 			uint32_t total = fresh.patchCount;
@@ -6924,7 +6941,7 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 			fresh.patchCount = 0xFFFF;
 			break;
 		}
-		fresh.patchAt[fresh.patchCount] = static_cast<uint16_t>(q);
+		fresh.patchAt[fresh.patchCount] = q;
 		fresh.patchOld[fresh.patchCount] = original[q];
 		fresh.patchNew[fresh.patchCount] = code[q];
 		fresh.patchCount++;
