@@ -1,7 +1,9 @@
 # Video decode and encode (UVD / VCE) on Stoney
 
-Research notes (2026-10-17): what Apple's Polaris stack has, how Stoney differs, and a plan. Stage 1 is
-implemented behind `-crvideo` (see Progress); without it CarrizoRed skips the video engines' power-up.
+Research notes (2026-10-17): what Apple's Polaris stack has, how Stoney differs, and a plan; then what testing found
+(Progress). **On hold since 2026-10-28**: UVD starts and Apple's firmware runs on it, but decoding hangs the GPU, because
+Apple's driver gives UVD GPU virtual addresses and Stoney's UVD has no VM support. See *Status and how to resume* at the
+end. Video plays and records in software meanwhile.
 
 ## The engines
 
@@ -96,7 +98,56 @@ answers, firmware loaded, ring tests) before any playback test.
   accelerator`, then software decode. Stoney's UVD 6.2 decodes 8-bit HEVC only (Linux `cz_video_codecs_decode`), so
   the aerial wallpapers stay on the CPU whatever the driver does; a still wallpaper is the fix for that lag. Whether
   UVD itself works has to be shown with an 8-bit stream (H.264 or 8-bit HEVC).
-- **Next, from the stage 3 log:** whether Apple's UVD 6.3 / VCE 3.4 firmware starts on Stoney (UVD_STATUS, VCPU
-  running, ring test). If not, stage 2 replaces the firmware in the engine's buffer (`AMDUVDHWEngine::loadUVDFW` asks
-  the shared multimedia layer for the image, `this+0x160`, then decrypts it when a flag says so) with Linux's
-  `stoney_uvd.bin` / `stoney_vce.bin`, fetched by CI rather than committed.
+- **Stage 4, user space reaches the kernel (Sonoma).** AMD's user-space driver failed `AVD_api.Create` (err 5) for every
+  codec: `AMDAccelVideoContext::getHWInfo` handed it the real device ID (0x98E4). The getHWInfo hook substitutes the
+  spoofed one (its prologue has a `jcc` in the first 14 bytes, so `routeChecked` relocates it, opted in per route with
+  `routeAllowJcc`). Then `AMDAccelUVDContext::init` failed on null UVD/VCE engine slots: CarrizoRed's own
+  `wrapPowerUpHWEngines` restored all three multimedia slots after saving only SAMU (fixed).
+- **Stage 5, UVD was dead.** The first real session hung (UVD event timeout, GPU restart, black screen). UVD's registers
+  read 0 and dropped writes. Ruled out one by one: the UVD/VCE clocks (GNB_CLK1-3 DFS dividers were already set and
+  ready), `SRBM_SOFT_RESET` (0), SMU `UVDPowerOFF`/`UVDPowerON` retries. Snapshots found it: UVD answered at the MMIO
+  probe, and by the SMU power-on CAIL's `stoney_power_down_uvd_block_for_dpg_mode` had powered its tiles down
+  (`UVD_PGFSM_CONFIG` 0x5FF, tiles 0x12, `UVD_POWER_STATUS` 1), which the SMU message doesn't undo.
+- **Stage 6, the power gating mode.** Powering the tiles back up (`PGFSM_CONFIG` 0x6FF) made UVD answer, but Apple's start
+  left the VCPU in reset. CAIL's `tonga_init_uvd_engine` has two paths: with the power gating flags UVD (0x20) and UVD
+  dynamic (0x4000) both set, it writes the register values into DPG staging memory for power management to apply on
+  demand (nothing does here); otherwise it is Linux's `uvd_v6_0_start` (direct writes, VCPU released, a 3 s wait for
+  `UVD_STATUS` bit 1). The flags follow the CAIL registry key `DisableUVDPowerGating`, which CAIL reads from the PCI
+  device after `AMDHardware::setupCAIL` copies the accelerator's `cail_properties` there
+  (`addPlistPropertiesToPCIDevice`); `AMDVIUVDRing::init` reads the same key to choose its plain ring registers over
+  the DPG ones. CarrizoRed adds `CAIL_DisableUVDPowerGating = 1` before the copy. **Result: UVD starts and Apple's
+  Polaris firmware boots on Stoney** (`UVD_STATUS` 2, `VCPU_CNTL` 0xFF20200). No Linux firmware is needed.
+- **Stage 7, decode hangs: VM mode.** With the firmware running, the first session (the 10-bit aerial, then an H.264
+  screen recording with HEVC withdrawn) left UVD busy, and Apple's GPU restart never finished. A snapshot of UVD before
+  the restart (nvram17): ring at a physical address with VMID 0, but **the IB at GPU virtual address 0x4_00000000 with
+  VMID 7**, ring read pointer stuck at it, no VM fault. Linux runs UVD in VM mode only from Polaris on
+  (`uvd_v6_0_set_ring_funcs`); older UVD 6, Stoney's included, runs in physical mode, where the kernel parses each
+  decode command and rewrites every buffer address to a memory-controller address (`amdgpu_uvd_ring_parse_cs`). Apple's
+  driver only knows VM mode, so Stoney's UVD reads the virtual address as a physical one.
+
+## Status and how to resume (2026-10-28)
+
+**Works with `-crvideo`:** AppleGVA picks the AMD decoder (board-id routing, GPU renamed GFX0, `MM_EnableHEVCDecode`), user
+space creates video contexts (device-ID fix), the SMU powers UVD and VCE, CAIL's UVD power gating is off, and UVD starts
+with Apple's firmware. VCE (encode) sessions are refused cleanly (`-crvce` lets them through; they hung in testing, with
+VCE's VCPU still in reset, likely the same power gating mode: `CAIL_DisableVCEPowerGating` is the first thing to try).
+
+**Held back:** UVD sessions are refused unless `-cruvd`, and HEVC decode is withdrawn unless `-cruvdhevc`, so nothing reaches
+UVD. With `-cruvd` decode hangs the GPU. `-cruvdpanic` gives a report 20 s into the first session if the firmware hasn't
+reported, and the report's `uvd start` / `uvd live` lines hold the registers, ring and IB addresses.
+
+**To make decode work (physical-mode translation, as Linux does for pre-Polaris UVD):**
+1. Catch each UVD submission before UVD reads it (Apple's UVD ring / channel submit).
+2. In the ring, rewrite each IB packet (`UVD_LMI_RBC_IB_VMID`, `UVD_LMI_RBC_IB_64BIT_BAR_LOW/HIGH`) to VMID 0 and the IB's
+   memory-controller address (the IB itself has to be contiguous or copied).
+3. In each IB, rewrite every `UVD_GPCOM_VCPU_DATA0`/`DATA1` address pair before a `UVD_GPCOM_VCPU_CMD` (message, feedback,
+   DPB, decode target, bitstream, context, ...) from the client's VMID to a memory-controller address, as
+   `amdgpu_uvd_cs_parse` does. CarrizoRed already walks client page tables for the shader fix (`ibVaToPhys`).
+4. The hard part: in physical mode every buffer has to be contiguous in the memory controller's view. Buffers in the
+   carve-out probably are; the bitstream comes from user space in scattered system memory and may need a bounce buffer,
+   or a mapping in VMID 0's page table (GART).
+5. HEVC: publish 8-bit only (drop Main10 from `VTSupportedProfileArray` / `VTPerProfileDetails` in
+   `IOGVAHEVCDecodeCapabilities`; the log has what `configureDevice` publishes).
+
+Test with an H.264 clip (a screen recording played in QuickTime); the lock screen's aerial is 10-bit and must stay in
+software.

@@ -24,7 +24,7 @@ scales with load (400 MHz idle, up to the chip's top level).
 | GPU clock scaling (SCLK DPM) | **Works, on by default.** Apple's PowerPlay runs its Dummy back end here, so nothing would start the SMU's clock scaling and the GPU would stay at its lowest clock. CarrizoRed starts it 90 s after boot, from the SMU's own clock table: 400 MHz minimum, up to the top level (900 MHz on an A9-9425, 800 MHz on an A9-9420). `-crnosclkdpm` turns it off |
 | Sleep | Enters sleep; **wake doesn't work yet** (a watchdog writes a report to NVRAM when it fails) |
 | Brightness, external displays (HDMI), HDMI audio | Not done or untested |
-| Video decode/encode (UVD/VCE) | **In development** (`-crvideo`, opt-in). Stoney's UVD 6.2 / VCE 3.4 are close to Polaris's UVD 6.3 / VCE 3.4, which Apple's driver supports. Stage 1: the SMU powers both engines. Stage 2: AppleGVA is routed to the AMD decoder (as WhateverGreen's `unfairgva=4` does). Firmware and codec work follow. Plan in [docs/VIDEO.md](docs/VIDEO.md) |
+| Video decode/encode (UVD/VCE) | **On hold**: video plays and records in software. UVD powers up and Apple's firmware boots on it, but decoding hangs the GPU: Apple's driver gives UVD GPU virtual addresses, and Stoney's UVD has no VM support (Linux runs it in physical mode and rewrites every buffer address). Making it work means doing that translation in CarrizoRed. Findings and next steps in [docs/VIDEO.md](docs/VIDEO.md) |
 | Carrizo / Bristol Ridge | Same display engine and code paths; the SMU microcode loader, clock scaling and shader-engine fix include Carrizo's differences (second SDMA engine, second MEC), following Linux. **Untested** (no hardware): reports from owners are very welcome |
 
 **Tested on:**
@@ -32,7 +32,7 @@ scales with load (400 MHz idle, up to the chip's top level).
 | Machine | APU | macOS | Result |
 |---|---|---|---|
 | ASUS VivoBook 15 D509BA | A9-9425 (Stoney Ridge, Radeon R5) | Sequoia 15.4 (Recovery, installer), 15.8.1 (installed) | Display and Metal acceleration work, desktop renders correctly |
-| ASUS VivoBook 15 D509BA | A9-9425 | Sonoma 14.x (installed) | Display and Metal acceleration work, desktop renders correctly; the animated lock-screen wallpaper is slow (HEVC video decoded on the CPU until video acceleration works) |
+| ASUS VivoBook 15 D509BA | A9-9425 | Sonoma 14.x (installed) | Display and Metal acceleration work, desktop renders correctly; the animated lock-screen wallpaper is slow (10-bit 4K HEVC: decoded on the CPU, and Stoney's UVD can't decode 10-bit anyway) |
 | ASUS VivoBook 15 D509BA | A9-9425 | Ventura 13.7.8 (installed) | Display and Metal acceleration work |
 | Acer Aspire E5-523 (tester) | E2-9010 (Stoney Ridge, Radeon R2) | Ventura 13.7.8 | Reached the desktop, then crashed before the Ventura fixes; retest pending |
 
@@ -96,11 +96,11 @@ And Metal needed:
 | Metal acceleration | Works on Ventura, Sonoma and Sequoia; the desktop renders correctly |
 | Stoney's 16-bank LDS shader fix | Works: every hazardous shader fixed in recent sessions (none skipped), fixes no longer undone by Metal's re-uploads |
 | Random glitches (flat-colour images, login avatar, blue folder icons) | Fixed: Metal's SDMA shader re-uploads were undoing the shader fix. Folder icons drawn wrong by older builds stay in macOS's icon cache until it is cleared |
-| Lock screen (Sonoma) | Renders; the animated wallpaper is slow (HEVC decoded on the CPU) |
+| Lock screen (Sonoma) | Renders; the animated wallpaper is slow (10-bit 4K HEVC on the CPU; Stoney's UVD can't decode 10-bit). A still wallpaper avoids it |
 | GPU clock scaling | Works, on by default, up to the chip's top level. It stays at the top level more than it should; being looked at |
 | Freezes with clock scaling | Fixed: CarrizoRed's own interrupt-storm breaker was tripping on real interrupt bursts at higher clocks |
 | OpenGL | Expected to work, untested: Apple's AMD GL driver compiles through the same `libSC` CarrizoRed patches for Stoney (its `ATIRadeonX4000SCLib` wraps it), and the shader fix works on every submission whatever the API |
-| Video decode/encode | Stage 2 (AppleGVA routed to the AMD decoder) in testing behind `-crvideo`; then Stoney firmware and codec limits ([docs/VIDEO.md](docs/VIDEO.md)) |
+| Video decode/encode | On hold: software decode and encode. UVD starts with Apple's firmware, but needs CarrizoRed to translate GPU virtual addresses to physical ones before it can decode ([docs/VIDEO.md](docs/VIDEO.md)) |
 | Sleep/wake | Sleep works; wake doesn't yet (FCHXHCIFix's crash on wake fixed; a pre-sleep watchdog reports where wake stops) |
 | Carrizo / Bristol Ridge | Code paths written (SMU loader, clock scaling, caps), untested: no hardware |
 | External displays, brightness, HDMI audio | Not started / untested |
@@ -209,7 +209,11 @@ and the list of affected machines.
 | `-crnoppdummy` | Stoney/Carrizo: don't set `PP_PhmUseDummyBackEnd` (PowerPlay has no back end for these APUs; without the Dummy one, `initializePowerPlay` fails and the accelerator never powers up); also turns PowerPlay off |
 | `-crnosoftpptable` | Stoney/Carrizo: don't hand PowerPlay the VBIOS's PowerPlayInfo table as `PP_PhmSoftPowerPlayTable` (HWLibs' own VBIOS lookup appears to fail on the APU, and PowerPlay then fails to initialise) |
 | `-crnodirectucode` | Stoney/Carrizo: leave CAIL's `DisableCailLoadUcode` on (the default). CarrizoRed clears it so CAIL reserves its micro-engine VRAM block, which the SMU microcode loader extends and uses; with the flag on, nothing loads the microcode and the accelerator's power-up waits forever |
-| `-crvideo` | Video (in development, opt-in): have the SMU power UVD and VCE up, let Apple's driver start them (SAMU stays off), and route AppleGVA to the AMD decoder |
+| `-crvideo` | Video (on hold, for development): have the SMU power UVD and VCE up with CAIL's UVD power gating off, route AppleGVA to the AMD decoder, and refuse UVD and VCE sessions, so video stays in software |
+| `-cruvd` | With `-crvideo`: let UVD decode sessions through. **Hangs the GPU** until address translation exists (see docs/VIDEO.md) |
+| `-cruvdhevc` | With `-crvideo`: keep HEVC decode published to AppleGVA (withdrawn by default; Stoney can't decode the 10-bit aerial wallpapers) |
+| `-crvce` | With `-crvideo`: let VCE encode sessions through (hung in testing; off by default) |
+| `-cruvdpanic` | With `-crvideo -cruvd`: panic with the black-box report 20 s after the first UVD session if its firmware hasn't reported |
 | `-crnogva` | With `-crvideo`: leave AppleGVA's decoder choice alone (no `hwgva-id` board-id redirect) |
 | `-crnosrcfix` | Don't apply the shader fix to the source of Metal's SDMA re-uploads (fixed shaders can then revert for some frames) |
 | `-crnosdmawatch` | Don't read SDMA submissions at all (also turns the source fix off) |

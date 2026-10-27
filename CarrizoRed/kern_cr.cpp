@@ -3702,8 +3702,20 @@ static void uvdPowerTilesUp() {
 	traceNote("uvdtiles=%x ", tile);
 }
 
+// On hold (docs/VIDEO.md): with the firmware running, decode still hangs UVD, because Apple's driver gives it GPU
+// virtual addresses (IB VMID 7, nvram17) and Stoney's UVD 6.2 has no VM support (Linux runs it in physical mode,
+// rewriting every buffer address). Until that translation exists, UVD sessions are refused unless -cruvd: user space
+// decodes in software, as before.
 static bool uvdReadyForSession() {
 	using namespace Smu8;
+	if (!checkKernelArgument("-cruvd")) {
+		static bool logged;
+		if (!logged) {
+			logged = true;
+			diskLogEvent("uvd: sessions refused (decode on hold, -cruvd to try)");
+		}
+		return false;
+	}
 	if (!uvdPanicMs && checkKernelArgument("-cruvdpanic"))
 		uvdPanicMs = uptimeMs() + 20000;
 	if (gpuMmio && videoPowered())
