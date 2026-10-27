@@ -1009,6 +1009,8 @@ static uint32_t videoSpoofId, videoHWInfoCalls;
 static mach_vm_address_t orgUvdContextInit;
 static bool wrapUvdContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
 static bool uvdReadyForSession();
+static mach_vm_address_t orgVceContextInit;
+static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
 
 void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	for (size_t i = 0; i < arrsize(kexts); i++) {
@@ -2677,6 +2679,9 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		route("__ZN33AMDRadeonX4000_AMDAccelUVDContext4initEP37AMDRadeonX4000_AMDGraphicsAcceleratorP35AMDRadeonX4000_"
 			  "AMDAccelVideoContextP23sVideoContextCreateInfo",
 			reinterpret_cast<mach_vm_address_t>(wrapUvdContextInit), orgUvdContextInit, nullptr, 0, "UVD context init");
+		route("__ZN33AMDRadeonX4000_AMDAccelVCEContext4initEP37AMDRadeonX4000_AMDGraphicsAcceleratorP35AMDRadeonX4000_"
+			  "AMDAccelVideoContextP23sVideoContextCreateInfo",
+			reinterpret_cast<mach_vm_address_t>(wrapVceContextInit), orgVceContextInit, nullptr, 0, "VCE context init");
 		route("__ZN35AMDRadeonX4000_AMDAccelVideoContext12contextStartEv",
 			reinterpret_cast<mach_vm_address_t>(wrapVideoContextStart), orgVideoContextStart, nullptr, 0,
 			"video contextStart");
@@ -3498,6 +3503,8 @@ static struct {
 	uint64_t ms;
 } smuVideo;
 
+static bool videoClocksSet(const char *when);
+
 static void smuVideoPowerOn() {
 	using namespace Smu8;
 	if (smuVideo.done || !gpuMmio)
@@ -3509,11 +3516,56 @@ static void smuVideoPowerOn() {
 	smuVideo.resp[2] = smuSendMessage(EnableAllSmuFeatures, UvdDpmMask | VceDpmMask);
 	diskLogEvent("video power on: UVDPowerON %x, VCEPowerON %x, UVD/VCE DPM %x", smuVideo.resp[0], smuVideo.resp[1],
 		smuVideo.resp[2]);
+	if (smuVideo.resp[0] == 1 && smuVideo.resp[1] == 1)
+		videoClocksSet("boot");
 	traceNote("video=%x/%x/%x ", smuVideo.resp[0], smuVideo.resp[1], smuVideo.resp[2]);
 }
 
 static bool videoPowered() {
 	return smuVideo.done && smuVideo.resp[0] == 1 && smuVideo.resp[1] == 1;
+}
+
+// UVD/VCE clocks. On an APU Linux sets them itself before the engines start (vi_set_uvd_clocks / vi_set_vce_clocks:
+// DCLK in GNB_CLK1, VCLK in GNB_CLK2, ECLK in GNB_CLK3; DFS divider in DFS_CNTL[6:0], then wait for STATUS bit 16);
+// Apple leaves them to PowerPlay, whose Dummy back end does nothing. With no clock UVD's registers don't take writes
+// and VCE's processor never leaves reset (both seen 2026-10-27). The DFS VCO is 3600 MHz (the SMU's SCLK table: DID 0x10
+// = /4 = 900 MHz, 0x24 = /9 = 400 MHz), so DID 0x24 gives 400 MHz. A clock whose divider is 0 (none) gets it; the log
+// has what each held. -crnovclk leaves them.
+static constexpr uint32_t VideoClockDid = 0x24;
+static const struct {
+	const char *name;
+	uint32_t cntl, status;
+} videoClocks[] {{"dclk", 0xD82200F0, 0xD822010C}, {"vclk", 0xD8220110, 0xD822012C}, {"eclk", 0xD8220130, 0xD822014C}};
+
+static uint32_t smcRead(uint32_t reg) {
+	gpuMmio[Smu8::MP0PUB_IND_INDEX] = reg;
+	return gpuMmio[Smu8::MP0PUB_IND_DATA];
+}
+
+static void smcWrite(uint32_t reg, uint32_t value) {
+	gpuMmio[Smu8::MP0PUB_IND_INDEX] = reg;
+	gpuMmio[Smu8::MP0PUB_IND_DATA] = value;
+}
+
+static bool videoClocksSet(const char *when) {
+	bool allReady = true;
+	for (auto &clock : videoClocks) {
+		uint32_t cntl = smcRead(clock.cntl), status = smcRead(clock.status), now = cntl;
+		if (!(cntl & 0x7F) && !checkKernelArgument("-crnovclk")) {
+			now = (cntl & ~0x7FU) | VideoClockDid;
+			smcWrite(clock.cntl, now);
+			for (uint32_t i = 0; i < 1000 && !((status = smcRead(clock.status)) & 0x10000); i++)
+				IODelay(1000);
+			now = smcRead(clock.cntl);
+		}
+		allReady &= (now & 0x7F) && (status & 0x10000);
+		diskLogEvent("video clock %s (%s): cntl %x -> %x, status %x", clock.name, when, cntl, now, status);
+	}
+	return allReady;
+}
+
+static bool eclkRunning() {
+	return (smcRead(videoClocks[2].cntl) & 0x7F) && (smcRead(videoClocks[2].status) & 0x10000);
 }
 
 // First UVD session (2026-10-27): Apple's UVD start "succeeded" (loadFW, startRB, start = 1) yet UVD_STATUS, VCPU_CNTL,
@@ -3547,6 +3599,7 @@ static bool uvdReadyForSession() {
 		diskLogEvent("uvd check: video not powered, sessions refused");
 		return false;
 	}
+	videoClocksSet("session");
 	uvdRegs("before");
 	bool alive = uvdResponds();
 	diskLogEvent("uvd check: responds %d", alive);
@@ -3571,6 +3624,23 @@ static bool uvdReadyForSession() {
 	uvdState = alive ? 1 : 2;
 	traceNote("uvdcheck=%u ", uvdState);
 	return alive;
+}
+
+// Encode: the screen recording's VCE session hung the same way ("VCELLQ event timeout"; VCE_SOFT_RESET still 1 after
+// Apple's start). Decode comes first, so VCE contexts are refused (software encode) unless -crvce, and even then only
+// with ECLK running.
+static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo) {
+	static uint32_t refused;
+	if (!checkKernelArgument("-crvce") || !gpuMmio || !videoPowered() || !eclkRunning()) {
+		if (!refused++)
+			diskLogEvent("vce init refused (eclk cntl %x status %x)", gpuMmio ? smcRead(videoClocks[2].cntl) : 0,
+				gpuMmio ? smcRead(videoClocks[2].status) : 0);
+		traceNote("vid.vceInit=refused ");
+		return false;
+	}
+	bool ret = FunctionCast(wrapVceContextInit, orgVceContextInit)(that, accel, videoContext, createInfo);
+	traceNote("vid.vceInit=%d ", ret);
+	return ret;
 }
 
 // The SMU's graphics clock table, read once (nvram180: the current/target DPM level never left 0 and Apple's
