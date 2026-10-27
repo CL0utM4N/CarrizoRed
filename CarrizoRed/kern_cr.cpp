@@ -6654,6 +6654,10 @@ struct SeenShader {
 	uint64_t fixedMs;            // when it was (last) fixed
 	uint64_t fixedPhys;          // its first page's physical address then (a revert on another page: evicted, restored)
 	uint32_t fixedPte, fixedSdmaWptr;  // that page's PTE flags, and the sDMA0 ring's write pointer then
+	// The fix as dwords (index, original, fixed), replayed onto an sDMA copy's source (applySourcePatches);
+	// patchCount 0xFFFF: more than fit, not replayed.
+	uint16_t patchCount, patchAt[32];
+	uint32_t patchOld[32], patchNew[32];
 };
 static SeenShader seenShaders[512];
 static uint32_t seenNum, seenNext;
@@ -6864,6 +6868,18 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 	SeenShader fresh {psVa, vmid, codeHash(print, 16), ok ? newVgprs : 0,
 		skip == SkipNoFreeVgpr && !allowBump, probeAt, probeVal, uptimeMs(), physAtFix, pteAtFix,
 		gpuMmio ? gpuMmio[0x3484] : 0};
+	for (uint32_t q = 0; q < have && fixedHere && ok && fresh.patchCount != 0xFFFF; q++) {
+		if (code[q] == original[q] || q > 0xFFFF)
+			continue;
+		if (fresh.patchCount == arrsize(fresh.patchAt)) {
+			fresh.patchCount = 0xFFFF;
+			break;
+		}
+		fresh.patchAt[fresh.patchCount] = static_cast<uint16_t>(q);
+		fresh.patchOld[fresh.patchCount] = original[q];
+		fresh.patchNew[fresh.patchCount] = code[q];
+		fresh.patchCount++;
+	}
 	if (entry) {
 		*entry = fresh;
 	} else if (seenNum < arrsize(seenShaders)) {
@@ -7548,6 +7564,52 @@ static uint64_t wrapCommitIbFiji(void *channel, uint8_t *info) {
 // Packet lengths from Linux vid.h / sdma_v3_0 (VI sDMA): COPY linear 7, WRITE linear 4 + n, INDIRECT 6, FENCE 4, TRAP 2,
 // SEM 3, POLL_REGMEM 6, COND_EXE 5, ATOMIC 8, CONST_FILL 5, GEN_PTEPDE 10, TIMESTAMP 3, SRBM_WRITE 3; others end the walk.
 
+// Sonoma (5157f14 log): the reverts are Metal's driver re-uploading its shader heap with sDMA linear copies (36 KB
+// chunks, 1-7 ms before each revert) from a staging copy holding the original code: the copy lands after the fixer
+// patched the destination at submission, and the draws in between run unfixed (the random flat-colour images). Fix the
+// source too, here, before the copy runs: for every fixed shader inside the copy's destination, write its patch list at
+// the same offset in the source, dword by dword, only where the source still holds the original dword it replaced.
+static uint32_t srcFixCopies, srcFixDwords, srcFixMismatch, srcFixLogged;
+
+static void applySourcePatches(uint32_t vmid, uint64_t src, uint64_t dst, uint32_t bytes) {
+	static int off = -1;  // -crnosrcfix disables it
+	if (off < 0)
+		off = checkKernelArgument("-crnosrcfix") ? 1 : 0;
+	if (!src || !bytes || off)
+		return;
+	for (uint32_t i = 0; i < seenNum && i < arrsize(seenShaders); i++) {
+		auto &sh = seenShaders[i];
+		if (sh.vmid != vmid || !sh.patchCount || sh.patchCount == 0xFFFF || sh.va < dst || sh.va >= dst + bytes)
+			continue;
+		srcFixCopies++;
+		uint32_t wrote = 0, mismatch = 0;
+		for (uint32_t k = 0; k < sh.patchCount; k++) {
+			uint64_t off = sh.va - dst + sh.patchAt[k] * 4ULL;
+			if (off + 4 > bytes)
+				continue;
+			uint32_t now = 0;
+			if (readGpuVa(vmid, src + off, 1, &now, false) != 1)
+				continue;
+			if (now == sh.patchNew[k])
+				continue;  // already fixed
+			if (now != sh.patchOld[k]) {
+				mismatch++;
+				continue;
+			}
+			uint64_t phys = ibVaToPhysLocked(vmid, src + off);
+			if (phys && ibWritePhys(phys, 4, &sh.patchNew[k]))
+				wrote++;
+		}
+		srcFixDwords += wrote;
+		srcFixMismatch += mismatch;
+		if (srcFixLogged < 30 && (wrote || mismatch)) {
+			srcFixLogged++;
+			diskLogEvent("source fix: ps %llx in sDMA copy %llx -> %llx (%u bytes): %u dwords patched, %u mismatched", sh.va,
+				src, dst, bytes, wrote, mismatch);
+		}
+	}
+}
+
 static void sdmaWalk(uint32_t vmid, uint64_t va, uint32_t dwords) {
 	static uint32_t buf[0x1000];
 	uint32_t got = readGpuVa(vmid, va, dwords < arrsize(buf) ? dwords : arrsize(buf), buf, false);
@@ -7556,9 +7618,13 @@ static void sdmaWalk(uint32_t vmid, uint64_t va, uint32_t dwords) {
 		switch (op) {
 			case 0: len = 1 + ((h >> 16) & 0x3FFF); break;  // NOP (count of extra dwords)
 			case 1:
-				if (sub == 0 && j + 6 < got)
-					noteGpuCopy(vmid, 0x101, h, static_cast<uint64_t>(buf[j + 4]) << 32 | buf[j + 3],
-						static_cast<uint64_t>(buf[j + 6]) << 32 | buf[j + 5], (buf[j + 1] & 0x3FFFFF) + 1);
+				if (sub == 0 && j + 6 < got) {
+					uint64_t src = (static_cast<uint64_t>(buf[j + 4]) << 32 | buf[j + 3]) & 0xFFFFFFFFFFFFULL;
+					uint64_t dst = (static_cast<uint64_t>(buf[j + 6]) << 32 | buf[j + 5]) & 0xFFFFFFFFFFFFULL;
+					uint32_t bytes = (buf[j + 1] & 0x3FFFFF) + 1;
+					noteGpuCopy(vmid, 0x101, h, src, dst, bytes);
+					applySourcePatches(vmid, src, dst, bytes);
+				}
 				len = sub == 0 ? 7 : sub == 1 ? 12 : sub == 3 ? 13 : sub == 4 ? 14 : 0;
 				break;
 			case 2:
@@ -7907,11 +7973,11 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
-	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u (moved %u) block-moves %u; binds %u memo %u walks %u; ib-read ms %llu ps-check ms %llu ib-dw %llu pages snooped %u plain %u vram %u\n",
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u (moved %u) block-moves %u; source fixes %u copies %u dwords %u mismatched; binds %u memo %u walks %u; ib-read ms %llu ps-check ms %llu ib-dw %llu pages snooped %u plain %u vram %u\n",
 		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
 		interpFix.writes, interpFix.writeFails, interpFix.deadRegs, interpFix.bumps, interpHooked, ibHookCalls, ibHookIbs,
 		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap, ibHookRaiseOnly,
-		raisedNum, interpFix.probeReverts, interpFix.revertMoved, interpFix.blockMoves, ibHookBinds, ibHookMemoHits, vmWalks,
+		raisedNum, interpFix.probeReverts, interpFix.revertMoved, interpFix.blockMoves, srcFixCopies, srcFixDwords, srcFixMismatch, ibHookBinds, ibHookMemoHits, vmWalks,
 		absToMs(ibReadTime), absToMs(psCheckTime), ibDwordsRead, ibPagesSnooped, ibPagesPlain, ibPagesVram);
 	// The clock samples (sampleGpuClock); "window": the SMU firmware version read through window 13 and window 0,
 	// which must match for the samples to mean anything.
