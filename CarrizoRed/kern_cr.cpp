@@ -1339,6 +1339,8 @@ static bool interpFixOff, interpHooked, interpBump, interpSubmit;
 static mach_vm_address_t orgCommitIb, orgCommitIbFiji;
 static uint64_t wrapCommitIb(void *channel, uint8_t *info);
 static uint64_t wrapCommitIbFiji(void *channel, uint8_t *info);
+static mach_vm_address_t orgCommitSdma;
+static uint64_t wrapCommitSdma(void *channel, uint8_t *info);
 
 // GPU clock: the SMU's current and target SCLK DPM level (ixTARGET_AND_CURRENT_PROFILE_INDEX, SMC 0xD0200014: current
 // [20:16], target [25:21]; Linux smu8_read_sensor) and the GFX rail's voltage ID (ixSMUSVI_GFX_CURRENTVID 0xD8230048
@@ -7545,7 +7547,6 @@ static uint64_t wrapCommitIbFiji(void *channel, uint8_t *info) {
 // (Sonoma: every revert had sDMA0 activity since the fix, and none had a copy in the graphics command buffers).
 // Packet lengths from Linux vid.h / sdma_v3_0 (VI sDMA): COPY linear 7, WRITE linear 4 + n, INDIRECT 6, FENCE 4, TRAP 2,
 // SEM 3, POLL_REGMEM 6, COND_EXE 5, ATOMIC 8, CONST_FILL 5, GEN_PTEPDE 10, TIMESTAMP 3, SRBM_WRITE 3; others end the walk.
-static mach_vm_address_t orgCommitSdma;
 
 static void sdmaWalk(uint32_t vmid, uint64_t va, uint32_t dwords) {
 	static uint32_t buf[0x1000];
