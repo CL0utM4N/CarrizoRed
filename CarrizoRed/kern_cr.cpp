@@ -1010,6 +1010,9 @@ static mach_vm_address_t orgUvdContextInit;
 static bool wrapUvdContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
 static mach_vm_address_t orgUvdStart;
 static bool wrapUvdStart(void *that);
+// -cruvdpanic: a report 20 s after the first UVD session check (nvram13: WindowServer hung after it, the disk log was
+// lost and the panic was macOS's userspace watchdog, without the report). 0 until then.
+static uint64_t uvdPanicMs;
 static bool uvdReadyForSession();
 static mach_vm_address_t orgVceContextInit;
 static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
@@ -1800,6 +1803,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			writeBreadcrumb(t);
 		if (panicAt && t >= panicAt)
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
+		if (uvdPanicMs && uptimeMs() >= uvdPanicMs)
+			self->panicReport(t, now, "CarrizoRed: deliberate panic (-cruvdpanic), 20 s after the first UVD session.");
 		kickStalledFlip();
 		// GPU stopped: the GFX ring's read pointer (CP_RB0_RPTR) stuck behind its write pointer (CP_RB0_WPTR) for 10 s.
 		// The screen freezes with the kernel still running and nothing in NVRAM, so panic with the report instead.
@@ -3668,6 +3673,8 @@ static void uvdPowerTilesUp() {
 
 static bool uvdReadyForSession() {
 	using namespace Smu8;
+	if (!uvdPanicMs && checkKernelArgument("-cruvdpanic"))
+		uvdPanicMs = uptimeMs() + 20000;
 	if (gpuMmio && videoPowered())
 		uvdPowerTilesUp();
 	if (uvdState || checkKernelArgument("-crnouvdcheck"))
