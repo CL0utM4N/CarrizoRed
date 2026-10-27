@@ -1010,9 +1010,16 @@ static mach_vm_address_t orgUvdContextInit;
 static bool wrapUvdContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
 static mach_vm_address_t orgUvdStart;
 static bool wrapUvdStart(void *that);
-// -cruvdpanic: a report 20 s after the first UVD session check (nvram13: WindowServer hung after it, the disk log was
-// lost and the panic was macOS's userspace watchdog, without the report). 0 until then.
+static mach_vm_address_t orgAddPlistPropertiesToPCIDevice;
+static uint64_t wrapAddPlistPropertiesToPCIDevice(IOService *that, const char *name);
+// -cruvdpanic: a report 20 s after the first UVD session check, unless UVD's firmware reported by then (nvram13:
+// WindowServer hung after it, the disk log was lost and the panic was macOS's userspace watchdog, without the report).
+// 0 until then.
 static uint64_t uvdPanicMs;
+static struct {
+	uint32_t calls, skipped, ret, status, vcpu, reset, lmi, tile;
+	uint64_t ms;
+} uvdStartInfo;
 static bool uvdReadyForSession();
 static mach_vm_address_t orgVceContextInit;
 static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
@@ -1803,7 +1810,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			writeBreadcrumb(t);
 		if (panicAt && t >= panicAt)
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
-		if (uvdPanicMs && uptimeMs() >= uvdPanicMs)
+		if (uvdPanicMs && uptimeMs() >= uvdPanicMs && !(uvdStartInfo.status & 2))
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (-cruvdpanic), 20 s after the first UVD session.");
 		kickStalledFlip();
 		// GPU stopped: the GFX ring's read pointer (CP_RB0_RPTR) stuck behind its write pointer (CP_RB0_WPTR) for 10 s.
@@ -2689,6 +2696,9 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			reinterpret_cast<mach_vm_address_t>(wrapVceContextInit), orgVceContextInit, nullptr, 0, "VCE context init");
 		route("__ZN29AMDRadeonX4000_AMDUVDHWEngine5startEv", reinterpret_cast<mach_vm_address_t>(wrapUvdStart),
 			orgUvdStart, nullptr, 0, "UVD start");
+		route("__ZN37AMDRadeonX4000_AMDGraphicsAccelerator29addPlistPropertiesToPCIDeviceEPKc",
+			reinterpret_cast<mach_vm_address_t>(wrapAddPlistPropertiesToPCIDevice), orgAddPlistPropertiesToPCIDevice,
+			nullptr, 0, "addPlistPropertiesToPCIDevice");
 		route("__ZN35AMDRadeonX4000_AMDAccelVideoContext12contextStartEv",
 			reinterpret_cast<mach_vm_address_t>(wrapVideoContextStart), orgVideoContextStart, nullptr, 0,
 			"video contextStart");
@@ -3725,11 +3735,6 @@ static bool uvdReadyForSession() {
 // uvd_v6_0_start waits for UVD_STATUS bit 1 (VCPU report) after releasing the VCPU. So after Apple's start, wait up to
 // 100 ms for that bit; without it fail the start, refuse sessions from then on, and fail later starts (the restart's)
 // without calling Apple's, which is what hung. The registers go into the report: a frozen boot loses its disk log.
-static struct {
-	uint32_t calls, skipped, ret, status, vcpu, reset, lmi, tile;
-	uint64_t ms;
-} uvdStartInfo;
-
 static bool wrapUvdStart(void *that) {
 	auto &info = uvdStartInfo;
 	info.calls++;
@@ -3764,6 +3769,35 @@ static bool wrapUvdStart(void *that) {
 		return false;
 	}
 	return ret;
+}
+
+// Why the VCPU never started (nvram14: UVD_STATUS 0, VCPU_CNTL ff20000 without CLK_EN): CAIL's tonga_init_uvd_engine
+// has two paths. With the power gating flags UVD (0x20) and UVD dynamic (0x4000) both set it takes the DPG one: the
+// register values go to the DPG staging memory (Tonga_set_reg_in_uvd_dpg_mode, VCPU_CNTL ff20200) for the power
+// management to apply when it powers UVD on demand, which nothing does here. The same two flags make
+// stoney_power_down_uvd_block_for_dpg_mode power the tiles down at boot. Otherwise it is Linux's uvd_v6_0_start:
+// registers written directly, VCPU released, then a 3 s wait for UVD_STATUS bit 1. The flags come from the registry key
+// DisableUVDPowerGating (sets both disable bits, cail+0x6F8), which CAIL reads from the PCI device, where
+// AMDHardware::setupCAIL has addPlistPropertiesToPCIDevice copy the accelerator's cail_properties; the UVD ring reads
+// the same key there to pick the plain ring registers over the DPG ones. So add CAIL_DisableUVDPowerGating = 1 to
+// cail_properties before the copy (13-15). Linux doesn't power-gate Stoney's UVD this way either. -crnouvdpgoff leaves it.
+static bool uvdPgOff;
+
+static uint64_t wrapAddPlistPropertiesToPCIDevice(IOService *that, const char *name) {
+	if (that && name && !strcmp(name, "cail_properties") && !checkKernelArgument("-crnouvdpgoff")) {
+		auto *dict = OSDynamicCast(OSDictionary, that->getProperty(name));
+		auto *copy = dict ? OSDictionary::withDictionary(dict) : OSDictionary::withCapacity(1);
+		auto *one = OSNumber::withNumber(1ULL, 32);
+		if (copy && one) {
+			copy->setObject("CAIL_DisableUVDPowerGating", one);
+			that->setProperty(name, copy);
+			uvdPgOff = true;
+		}
+		OSSafeReleaseNULL(one);
+		OSSafeReleaseNULL(copy);
+		traceNote("uvdpg=%s ", uvdPgOff ? "off" : "failed");
+	}
+	return FunctionCast(wrapAddPlistPropertiesToPCIDevice, orgAddPlistPropertiesToPCIDevice)(that, name);
 }
 
 // Encode: the screen recording's VCE session hung the same way ("VCELLQ event timeout"; VCE_SOFT_RESET still 1 after
@@ -8668,9 +8702,9 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 			videoPowered() ? gpuMmio[0x3D98] : 0, videoPowered() ? gpuMmio[0x3DA0] : 0,
 			videoPowered() ? gpuMmio[0x8001] : 0, videoPowered() ? gpuMmio[0x8005] : 0, videoPowered() ? gpuMmio[0x8048] : 0);
 	if (uvdStartInfo.calls)
-		add("uvd start: calls %u skipped %u, last at %llu ms = %u: status %x vcpu %x reset %x lmi %x tile1 %x; state %u\n",
-			uvdStartInfo.calls, uvdStartInfo.skipped, uvdStartInfo.ms, uvdStartInfo.ret, uvdStartInfo.status,
-			uvdStartInfo.vcpu, uvdStartInfo.reset, uvdStartInfo.lmi, uvdStartInfo.tile, uvdState);
+		add("uvd start: calls %u skipped %u, last at %llu ms = %u: status %x vcpu %x reset %x lmi %x tile1 %x; state %u, "
+			"pg off %u\n", uvdStartInfo.calls, uvdStartInfo.skipped, uvdStartInfo.ms, uvdStartInfo.ret, uvdStartInfo.status,
+			uvdStartInfo.vcpu, uvdStartInfo.reset, uvdStartInfo.lmi, uvdStartInfo.tile, uvdState, uvdPgOff);
 	if (smuDpm.done)
 		add("sclk dpm: resp %x %x %x %x %x, L%u-L%u, features %x -> %x (SclkDpmOn %u), level changes %u, max seen L%u (before DPM), now %x; deep sleep %x watermark %x; mailbox msg %x resp %x arg %x, foreign %u:",
 			smuDpm.resp[0], smuDpm.resp[1], smuDpm.resp[2], smuDpm.resp[3], smuDpm.resp[4], smuDpm.hardMin,
