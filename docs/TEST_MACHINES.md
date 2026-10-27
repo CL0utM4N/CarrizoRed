@@ -71,6 +71,8 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   Linux allows the xHCI reset up to 10 s. `AppleUSBXHCI::reset()` waits `clock_interval_to_deadline(100, 1000000)`.
 - **Attempt 6 (OpenCore patch: that deadline 100 → 1000 ms, `Base = __ZN12AppleUSBXHCI5resetEv`):** **USB works**. A
   SanDisk USB 3 stick enumerates on XHC0 at 5 Gbps and the installer boots. XHCIProbe dropped from the EFI.
+  The patch needs `Limit` 2048, not 1024: the `Find` bytes sit 571 bytes into `reset()` on Sequoia but 1078 on Monterey
+  12.5.1, where a 1024 limit left it unpatched and the installer waited for its root device again (2026-10-28).
 - **First CarrizoRed run (installer, 2026-10-10):** loads after dropping a bad `OSBundleCompatibleVersion` (1.0 >
   version 0.0.1 made XNU reject it silently). Reports Stoney Ridge, rev `0xDA`, 512 MB, carve-out at `0x1FF000000`,
   `GB_ADDR_CONFIG` `0x22010001` (Linux's Stoney golden value). VBIOS injection said No: the platform expert was looked
