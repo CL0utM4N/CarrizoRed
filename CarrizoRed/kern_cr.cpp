@@ -1008,6 +1008,7 @@ static uint32_t wrapGetHWInfo(void *that, uint32_t *info);
 static uint32_t videoSpoofId, videoHWInfoCalls;
 static mach_vm_address_t orgUvdContextInit;
 static bool wrapUvdContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
+static bool uvdReadyForSession();
 
 void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	for (size_t i = 0; i < arrsize(kexts); i++) {
@@ -2877,6 +2878,12 @@ static const char *className(void *object) {
 
 static bool wrapUvdContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo) {
 	static uint32_t calls;
+	// A context whose UVD doesn't respond would hang the decode channel, and the GPU restart that follows never comes
+	// back (2026-10-27: "UVDDec event timeout", black screen). Refuse it: user space then decodes in software.
+	if (!uvdReadyForSession()) {
+		traceNote("vid.uvdInit=refused ");
+		return false;
+	}
 	bool ret = FunctionCast(wrapUvdContextInit, orgUvdContextInit)(that, accel, videoContext, createInfo);
 	traceNote("vid.uvdInit=%d ", ret);
 	if (++calls <= 3 && createInfo) {
@@ -3122,7 +3129,7 @@ namespace Smu8 {
 	                          SetMinDeepSleepSclk = 0x11, SetWatermarkFrequency = 0x26E;  // cz_ppsmc.h
 	static constexpr uint32_t SclkDpmMask = 0x80000, SclkDpmOn = 0x200000;  // SCLK_DPM_MASK, scoreboard SclkDpmOn
 	static constexpr uint32_t CgFreqTranVoting0 = 0xD02001A8, VotingRightsDefault = 0x3FFFC102;
-	static constexpr uint16_t UvdPowerOn = 0x8, VcePowerOn = 0xA;
+	static constexpr uint16_t UvdPowerOn = 0x8, VcePowerOn = 0xA, UvdPowerOff = 0x7;
 	static constexpr uint32_t UvdDpmMask = 0x10000, VceDpmMask = 0x400000;
 	// UCODE_ID_* (smu_ucode_xfer_cz.h); Stoney has no SDMA1 or MEC2, Linux maps them to SDMA0 and MEC_JT1.
 	static constexpr uint8_t SDMA0 = 0, CE = 2, PFP = 3, ME = 4, MEC_JT1 = 5, RLC_G = 8, RLC_SCRATCH = 9,
@@ -3507,6 +3514,63 @@ static void smuVideoPowerOn() {
 
 static bool videoPowered() {
 	return smuVideo.done && smuVideo.resp[0] == 1 && smuVideo.resp[1] == 1;
+}
+
+// First UVD session (2026-10-27): Apple's UVD start "succeeded" (loadFW, startRB, start = 1) yet UVD_STATUS, VCPU_CNTL,
+// SOFT_RESET and LMI_STATUS read 0 before and after it, while VCE's read real values: UVD's registers don't take
+// writes, so it isn't really powered or clocked, the decode fence never retired, and the restart left a black screen.
+// Before a UVD context is made, check that a plain read/write register (UVD_GPCOM_VCPU_DATA0) keeps a value; if not,
+// try the SMU power-up again (as at boot, then off + on with dynamic gating) and log what each gives; a UVD that still
+// doesn't respond gets no session. -crnouvdcheck skips the check.
+static constexpr uint32_t UvdGpcomData0 = 0x3BC4;
+static uint32_t uvdState;  // 0 unchecked, 1 alive, 2 dead (sessions refused)
+
+static bool uvdResponds() {
+	uint32_t old = gpuMmio[UvdGpcomData0];
+	gpuMmio[UvdGpcomData0] = 0x5AC3A55C;
+	bool ok = gpuMmio[UvdGpcomData0] == 0x5AC3A55C;
+	gpuMmio[UvdGpcomData0] = old;
+	return ok;
+}
+
+static void uvdRegs(const char *when) {
+	diskLogEvent("uvd regs %s: status %x vcpu %x reset %x lmi %x data0 %x cgc %x", when, gpuMmio[0x3DAF], gpuMmio[0x3D98],
+		gpuMmio[0x3DA0], gpuMmio[0x3D67], gpuMmio[UvdGpcomData0], gpuMmio[0x3D2C]);
+}
+
+static bool uvdReadyForSession() {
+	using namespace Smu8;
+	if (uvdState || checkKernelArgument("-crnouvdcheck"))
+		return uvdState != 2;
+	if (!gpuMmio || !videoPowered()) {
+		uvdState = 2;
+		diskLogEvent("uvd check: video not powered, sessions refused");
+		return false;
+	}
+	uvdRegs("before");
+	bool alive = uvdResponds();
+	diskLogEvent("uvd check: responds %d", alive);
+	if (!alive) {
+		auto on = smuSendMessage(UvdPowerOn, 0);
+		auto dpm = smuSendMessage(EnableAllSmuFeatures, UvdDpmMask);
+		IODelay(1000);
+		alive = uvdResponds();
+		diskLogEvent("uvd check: UVDPowerON(0) again %x, DPM %x -> responds %d", on, dpm, alive);
+		uvdRegs("retry 1");
+	}
+	if (!alive) {
+		auto off = smuSendMessage(UvdPowerOff, 0);
+		IODelay(1000);
+		auto on = smuSendMessage(UvdPowerOn, 1);
+		auto dpm = smuSendMessage(EnableAllSmuFeatures, UvdDpmMask);
+		IODelay(1000);
+		alive = uvdResponds();
+		diskLogEvent("uvd check: UVDPowerOFF %x, UVDPowerON(1) %x, DPM %x -> responds %d", off, on, dpm, alive);
+		uvdRegs("retry 2");
+	}
+	uvdState = alive ? 1 : 2;
+	traceNote("uvdcheck=%u ", uvdState);
+	return alive;
 }
 
 // The SMU's graphics clock table, read once (nvram180: the current/target DPM level never left 0 and Apple's
