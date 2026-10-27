@@ -674,6 +674,12 @@ static const uint8_t dccFind[] {
 static const uint8_t dccVenturaFind[] {
 	0x41, 0x3B, 0x07, 0x76, 0x03, 0x41, 0x89, 0x07, 0x41, 0x89, 0xD8, 0x41, 0xF6, 0xC0, 0x01, 0x0F, 0x85, 0xB4, 0x00, 0x00, 0x00,
 };
+// Sonoma (14.x, read from the D509BA's cache): the same three at other page offsets again, and the DCC flag test compiled
+// as in 15.8.1 (test byte [rsp + 8], 1; je <no DCC>): make the je a jmp. Each pattern occurs once in that cache only.
+static const uint8_t dccSonomaFind[] {
+	0x8B, 0x84, 0x24, 0xB8, 0x00, 0x00, 0x00, 0x3B, 0x03, 0x76, 0x02, 0x89, 0x03, 0x4C, 0x8B, 0x54, 0x24, 0x20, 0xF6, 0x44,
+	0x24, 0x08, 0x01, 0x0F, 0x84, 0x80, 0x01, 0x00, 0x00,
+};
 static const uint8_t isaReplace[] {0x1E}, smallPrimReplace[] {0x00}, walkFenceReplace[] {0xA8}, dccReplace[] {0x90, 0xE9},
 	dccVenturaReplace[] {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00};
 struct PagePatch {
@@ -703,6 +709,12 @@ static PagePatch pagePatches[] {
 		sizeof(walkFenceReplace)},
 	{"dcc13", "-crdcc", false, 0x500, dccVenturaFind, sizeof(dccVenturaFind), 15, dccVenturaReplace,
 		sizeof(dccVenturaReplace)},
+	{"isa14", "-crnoscpatch", false, 0x4B6, scPatchFind, 60, 0x25, isaReplace, sizeof(isaReplace)},
+	{"smallprim14", "-crnosmallprim", false, 0x65D, smallPrimFind, sizeof(smallPrimFind), 14, smallPrimReplace,
+		sizeof(smallPrimReplace)},
+	{"walkfence14", "-crnowalkfence", false, 0x8F3, walkFenceFind, sizeof(walkFenceFind), 6, walkFenceReplace,
+		sizeof(walkFenceReplace)},
+	{"dcc14", "-crdcc", false, 0x60A, dccSonomaFind, sizeof(dccSonomaFind), 0x17, dccReplace, sizeof(dccReplace)},
 };
 static mach_vm_address_t orgCsValidatePage;
 static bool scPatchHooked;
