@@ -108,6 +108,9 @@ static mach_vm_address_t solveOrSignature(KernelPatcher &patcher, size_t index, 
 	return addr;
 }
 
+// Set around a route that may move a conditional jump (see below); off by default, so the hooks refused before stay out.
+static bool routeAllowJcc;
+
 static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::RouteRequest &request,
 	mach_vm_address_t slide, size_t size) {
 	if (request.org) {
@@ -123,7 +126,11 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 			SYSLOG("cr", "route: %s not found (error %d)", request.symbol, patcher.getError());
 			return false;
 		}
-		size_t copied = 0;
+		// The trampoline: the instructions the jump overwrites, moved as they are, except a conditional jump, which becomes
+		// the inverse short jump over a jmp [rip+0] to its original target (AMDAccelVideoContext::getHWInfo has
+		// "test rsi, rsi; je" inside its first 14 bytes).
+		uint8_t code[96];
+		size_t copied = 0, codeLen = 0;
 		while (copied < 14) {
 			hde64s hs {};
 			size_t len = Disassembler::hdeDisasm(func + copied, &hs);
@@ -140,15 +147,34 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 				return false;
 			}
 			bool ripRelative = (hs.flags & F_MODRM) && hs.modrm_mod == 0 && hs.modrm_rm == 5;
-			if (ripRelative || (hs.flags & F_RELATIVE)) {
+			bool jcc = (hs.flags & F_RELATIVE) && ((hs.opcode & 0xF0) == 0x70 || (hs.opcode == 0x0F &&
+				(hs.opcode2 & 0xF0) == 0x80));
+			if (jcc && routeAllowJcc && codeLen + 16 <= sizeof(code)) {
+				int64_t disp = (hs.flags & F_IMM8) ? static_cast<int8_t>(hs.imm.imm8) : static_cast<int32_t>(hs.imm.imm32);
+				mach_vm_address_t target = func + copied + len + disp;
+				if (target >= func && target < func + 14) {
+					SYSLOG("cr", "route: REFUSED %s: branch at +0x%lx lands inside the patch", request.symbol, copied);
+					return false;
+				}
+				uint8_t cc = (hs.opcode == 0x0F ? hs.opcode2 : hs.opcode) & 0x0F;
+				const uint8_t skip[8] {static_cast<uint8_t>(0x70 | (cc ^ 1)), 14, 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+				memcpy(code + codeLen, skip, sizeof(skip));
+				memcpy(code + codeLen + sizeof(skip), &target, sizeof(target));
+				codeLen += sizeof(skip) + sizeof(target);
+				copied += len;
+				continue;
+			}
+			if (ripRelative || (hs.flags & F_RELATIVE) || codeLen + len > sizeof(code)) {
 				SYSLOG("cr", "route: REFUSED %s: %s instruction at +0x%lx would be copied unrelocated", request.symbol,
 					ripRelative ? "RIP-relative" : "relative-branch", copied);
 				return false;
 			}
+			memcpy(code + codeLen, reinterpret_cast<const void *>(func + copied), len);
+			codeLen += len;
 			copied += len;
 		}
-		// Trampoline: the copied instructions (safe to move, checked above), then jmp [rip+0] back to func + copied.
-		if (routePoolUsed + copied + 14 > RoutePoolSize) {
+		// Trampoline: the moved instructions (checked above), then jmp [rip+0] back to func + copied.
+		if (routePoolUsed + codeLen + 14 > RoutePoolSize) {
 			SYSLOG("cr", "route: %s: trampoline pool full (%lu bytes used)", request.symbol, routePoolUsed);
 			routesFailed++;
 			routeLastFailed = request.symbol;
@@ -161,13 +187,13 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 			routeLastFailed = request.symbol;
 			return false;
 		}
-		memcpy(tramp, reinterpret_cast<const void *>(func), copied);
+		memcpy(tramp, code, codeLen);
 		static const uint8_t jumpBack[6] {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
-		memcpy(tramp + copied, jumpBack, sizeof(jumpBack));
+		memcpy(tramp + codeLen, jumpBack, sizeof(jumpBack));
 		mach_vm_address_t back = func + copied;
-		memcpy(tramp + copied + sizeof(jumpBack), &back, sizeof(back));
+		memcpy(tramp + codeLen + sizeof(jumpBack), &back, sizeof(back));
 		MachInfo::setKernelWriting(false, nullptr);
-		routePoolUsed += (copied + 14 + 15) & ~static_cast<size_t>(15);
+		routePoolUsed += (codeLen + 14 + 15) & ~static_cast<size_t>(15);
 		*request.org = reinterpret_cast<mach_vm_address_t>(tramp);
 		KernelPatcher::RouteRequest jump {request.symbol, request.to};
 		bool written;
@@ -976,8 +1002,10 @@ void CRDriver::findByConfigSpace() {
 
 static mach_vm_address_t orgConfigureDevice;
 static bool wrapConfigureDevice(IOService *that, IOPCIDevice *pci);
-static mach_vm_address_t orgVideoContextStart, videoGetHWInfo;
+static mach_vm_address_t orgVideoContextStart, videoGetHWInfoOrg;
 static uint32_t wrapVideoContextStart(void *that);
+static uint32_t wrapGetHWInfo(void *that, uint32_t *info);
+static uint32_t videoSpoofId, videoHWInfoCalls;
 
 void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	for (size_t i = 0; i < arrsize(kexts); i++) {
@@ -2166,7 +2194,6 @@ namespace {
 		{"__ZN32AMDRadeonX4000_AMDSMLVIInterface9createVCEEv", "vid.createVCE", InAccel, true, false, 0},
 		// What a session does after contextStart (the first stage-2 log stopped there): hardware info, the content-
 		// protection connection, power-management commands, the SI layer's context, the UVD capability, and its end.
-		{"__ZN35AMDRadeonX4000_AMDAccelVideoContext9getHWInfoEP13sHardwareInfo", "vid.getHWInfo", InAccel, true, false, 0},
 		{"__ZN35AMDRadeonX4000_AMDAccelVideoContext18createCPConnectionEv", "vid.createCP", InAccel, true, false, 0},
 		{"__ZN35AMDRadeonX4000_AMDAccelVideoContext13sendPMCommandEPvS0_yPy", "vid.sendPM", InAccel, true, false, 0},
 		{"__ZN35AMDRadeonX4000_AMDAccelVideoContext11submitCPMsgEP18sAMDCPContextMsgInP19sAMDCPContextMsgOutyPy", "vid.submitCP",
@@ -2370,7 +2397,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 172, "one wrapper per stage");
+		static_assert(arrsize(stages) == 171, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -2394,7 +2421,7 @@ namespace {
 			CR_WRAP(145), CR_WRAP(146), CR_WRAP(147), CR_WRAP(148), CR_WRAP(149), CR_WRAP(150), CR_WRAP(151), CR_WRAP(152),
 			CR_WRAP(153), CR_WRAP(154), CR_WRAP(155), CR_WRAP(156), CR_WRAP(157), CR_WRAP(158), CR_WRAP(159), CR_WRAP(160),
 			CR_WRAP(161), CR_WRAP(162), CR_WRAP(163), CR_WRAP(164), CR_WRAP(165), CR_WRAP(166), CR_WRAP(167), CR_WRAP(168),
-			CR_WRAP(169), CR_WRAP(170), CR_WRAP(171),
+			CR_WRAP(169), CR_WRAP(170),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -2642,9 +2669,10 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		route("__ZN37AMDRadeonX4000_AMDGraphicsAccelerator15configureDeviceEP11IOPCIDevice",
 			reinterpret_cast<mach_vm_address_t>(wrapConfigureDevice), orgConfigureDevice, nullptr, 0, "configureDevice");
 	if (checkKernelArgument("-crvideo")) {
-		videoGetHWInfo = patcher.solveSymbol(index, "__ZN35AMDRadeonX4000_AMDAccelVideoContext9getHWInfoEP13sHardwareInfo",
-			slide, size);
-		patcher.clearError();
+		routeAllowJcc = true;
+		route("__ZN35AMDRadeonX4000_AMDAccelVideoContext9getHWInfoEP13sHardwareInfo",
+			reinterpret_cast<mach_vm_address_t>(wrapGetHWInfo), videoGetHWInfoOrg, nullptr, 0, "video getHWInfo");
+		routeAllowJcc = false;
 		route("__ZN35AMDRadeonX4000_AMDAccelVideoContext12contextStartEv",
 			reinterpret_cast<mach_vm_address_t>(wrapVideoContextStart), orgVideoContextStart, nullptr, 0,
 			"video contextStart");
@@ -2781,6 +2809,11 @@ static bool wrapConfigureDevice(IOService *that, IOPCIDevice *pci) {
 		pci->setProperty("MM_EnableHEVCEncode", kOSBooleanTrue);
 		gvaHevcState |= 1;
 	}
+	if (pci) {
+		uint32_t id = 0;
+		if (WIOKit::getOSDataValue(pci, "device-id", id))
+			videoSpoofId = id & 0xFFFF;
+	}
 	bool ret = FunctionCast(wrapConfigureDevice, orgConfigureDevice)(that, pci);
 	if (pci)
 		pci->setProperty("MM_EnableHEVCEncode", kOSBooleanFalse);
@@ -2807,14 +2840,20 @@ static uint32_t wrapVideoContextStart(void *that) {
 	uint32_t ret = FunctionCast(wrapVideoContextStart, orgVideoContextStart)(that);
 	traceEvent("vid.contextStart", true, ret);
 	traceNote("vid.contextStart=%x ", ret);
-	if (videoGetHWInfo && n <= 2) {
-		uint32_t info[0x120 / 4] {};
-		auto err = reinterpret_cast<uint32_t (*)(void *, void *)>(videoGetHWInfo)(that, info);
-		diskLogEvent("video hwinfo (start %u) = %x:", n, err);
-		for (uint32_t i = 0; i < arrsize(info); i += 12)
-			diskLogEvent("  +%03x: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", i * 4, info[i],
-				info[i + 1], info[i + 2], info[i + 3], info[i + 4], info[i + 5], info[i + 6], info[i + 7], info[i + 8],
-				info[i + 9], info[i + 10], info[i + 11]);
+	(void)n;
+	return ret;
+}
+
+// The answer (2026-10-27 log): getHWInfo's +4 is the hardware's device ID, the real 0x98E4, which AMD's user-space
+// driver doesn't know (the rest is Polaris 11's: family 0x82, external revision 0x5A = Polaris 11 rev 0 + 0x5A). Hand
+// user space the device-id the system sees (the spoof) instead; the accelerator itself keeps the real one.
+static uint32_t wrapGetHWInfo(void *that, uint32_t *info) {
+	uint32_t ret = FunctionCast(wrapGetHWInfo, videoGetHWInfoOrg)(that, info);
+	uint32_t n = ++videoHWInfoCalls;
+	if (ret == 0 && info && videoSpoofId && (info[1] & 0xFFFF) != videoSpoofId) {
+		if (n <= 2)
+			diskLogEvent("video hwinfo: family %x device %x -> %x, rev %x", info[0], info[1], videoSpoofId, info[2]);
+		info[1] = videoSpoofId;
 	}
 	return ret;
 }
