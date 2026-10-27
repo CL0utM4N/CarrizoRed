@@ -5739,7 +5739,7 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 struct InterpFixStats {
 	uint32_t scans, shaders, hazards, fixed, skipped, lastSkip, writes, writeFails, deadRegs, bumps;
 	uint32_t lastSkipWhy, lastLoopTarget, lastShaderLen, lastHazardAt, lastUnknownWord, lastUnknownAt;
-	uint32_t probeReverts, blockMoves, lastBlockFail;
+	uint32_t probeReverts, blockMoves, lastBlockFail, revertMoved;
 };
 static InterpFixStats interpFix;
 
@@ -6644,6 +6644,8 @@ struct SeenShader {
 	bool pending;
 	uint32_t probeAt, probeVal;  // a fixed instruction and its fixed value (probeAt 0xFFFFFFFF: none)
 	uint64_t fixedMs;            // when it was (last) fixed
+	uint64_t fixedPhys;          // its first page's physical address then (a revert on another page: evicted, restored)
+	uint32_t fixedPte, fixedSdmaWptr;  // that page's PTE flags, and the sDMA0 ring's write pointer then
 };
 static SeenShader seenShaders[512];
 static uint32_t seenNum, seenNext;
@@ -6774,9 +6776,21 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 		if (c)
 			gpuCopyRevertHits++;
 		if (interpFix.probeReverts <= 60)
-			diskLogEvent("interp revert: ps %llx vmid %u, fixed %llu ms before; copy to it: %s op %x src %llx %u bytes "
-				"%llu ms ago", psVa, vmid, uptimeMs() - entry->fixedMs, c ? "yes" : "no", c ? c->op : 0, c ? c->src : 0,
-				c ? c->bytes : 0, c ? uptimeMs() - c->ms : 0);
+		{
+			// Paging test: the same virtual page now at another physical page (or another memory type) means the shader
+			// was evicted and copied back, by the sDMA engine (not in the command buffers the copy check reads).
+			uint32_t pteNow = 0;
+			uint64_t physNow = ibVaToPhysLocked(vmid, psVa & ~0xFFFULL, &pteNow);
+			uint32_t sdmaNow = gpuMmio ? gpuMmio[0x3484] : 0;
+			if (physNow != entry->fixedPhys)
+				interpFix.revertMoved++;
+			if (interpFix.probeReverts <= 60)
+				diskLogEvent("interp revert: ps %llx vmid %u, fixed %llu ms before; page %llx (pte %x) then, %llx (pte %x) "
+					"now%s; sdma0 wptr %x -> %x; copy to it: %s op %x src %llx %u bytes %llu ms ago", psVa, vmid,
+					uptimeMs() - entry->fixedMs, entry->fixedPhys, entry->fixedPte, physNow, pteNow,
+					physNow != entry->fixedPhys ? " MOVED" : "", entry->fixedSdmaWptr, sdmaNow, c ? "yes" : "no",
+					c ? c->op : 0, c ? c->src : 0, c ? c->bytes : 0, c ? uptimeMs() - c->ms : 0);
+		}
 	}
 	uint32_t have = readGpuVa(vmid, psVa, arrsize(code), code, true);
 	while (have && have < arrsize(code) && !gcn3ProgramEnd(code, have)) {
@@ -6837,8 +6851,11 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 			break;
 		}
 	}
+	uint32_t pteAtFix = 0;
+	uint64_t physAtFix = ibVaToPhysLocked(vmid, psVa & ~0xFFFULL, &pteAtFix);
 	SeenShader fresh {psVa, vmid, codeHash(print, 16), ok ? newVgprs : 0,
-		skip == SkipNoFreeVgpr && !allowBump, probeAt, probeVal, uptimeMs()};
+		skip == SkipNoFreeVgpr && !allowBump, probeAt, probeVal, uptimeMs(), physAtFix, pteAtFix,
+		gpuMmio ? gpuMmio[0x3484] : 0};
 	if (entry) {
 		*entry = fresh;
 	} else if (seenNum < arrsize(seenShaders)) {
@@ -7806,11 +7823,11 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
-	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u block-moves %u; binds %u memo %u walks %u; ib-read ms %llu ps-check ms %llu ib-dw %llu pages snooped %u plain %u vram %u\n",
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u (moved %u) block-moves %u; binds %u memo %u walks %u; ib-read ms %llu ps-check ms %llu ib-dw %llu pages snooped %u plain %u vram %u\n",
 		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
 		interpFix.writes, interpFix.writeFails, interpFix.deadRegs, interpFix.bumps, interpHooked, ibHookCalls, ibHookIbs,
 		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap, ibHookRaiseOnly,
-		raisedNum, interpFix.probeReverts, interpFix.blockMoves, ibHookBinds, ibHookMemoHits, vmWalks,
+		raisedNum, interpFix.probeReverts, interpFix.revertMoved, interpFix.blockMoves, ibHookBinds, ibHookMemoHits, vmWalks,
 		absToMs(ibReadTime), absToMs(psCheckTime), ibDwordsRead, ibPagesSnooped, ibPagesPlain, ibPagesVram);
 	// The clock samples (sampleGpuClock); "window": the SMU firmware version read through window 13 and window 0,
 	// which must match for the samples to mean anything.
