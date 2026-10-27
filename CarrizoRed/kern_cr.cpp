@@ -974,6 +974,9 @@ void CRDriver::findByConfigSpace() {
 	iterator->release();
 }
 
+static mach_vm_address_t orgConfigureDevice;
+static bool wrapConfigureDevice(IOService *that, IOPCIDevice *pci);
+
 void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	for (size_t i = 0; i < arrsize(kexts); i++) {
 		if (kexts[i].loadIndex != index)
@@ -2757,7 +2760,6 @@ static bool wrapPowerUpHWEngines(void *that) {
 //    MM_EnableHEVCDecode and MM_EnableHEVCEncode are both true, and AMD9500Controller's aty_properties set both false
 //    for every Polaris. Force them true for that call (configureDevice is their only reader in 13.x-15.x), then take
 //    HEVC encode back out: Stoney's UVD 6.2 has no encode rings (Polaris encodes HEVC on UVD).
-static mach_vm_address_t orgConfigureDevice;
 
 static bool wrapConfigureDevice(IOService *that, IOPCIDevice *pci) {
 	if (pci) {
