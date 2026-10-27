@@ -720,6 +720,48 @@ static mach_vm_address_t orgCsValidatePage;
 static bool scPatchHooked;
 static uint32_t scPatchCalls;
 
+// Video decode (-crvideo, docs/VIDEO.md stage 2): AppleGVA picks the hardware decoder from the platform's board-id, and
+// for iMac19,1 it expects the Intel iGPU's, so the AMD decoder never got a session (no UVD firmware load or start ran).
+// As WhateverGreen's unfairgva=4 does (acidanthera, kern_unfair.cpp): rename the property AppleGVA reads, "board-id"
+// next to "hw.model" in the dyld shared cache, to "hwgva-id", and set hwgva-id on the device tree root to iMacPro1,1's
+// board-id (an AMD-only Mac). The rest of the system keeps the real SMBIOS. The string is in two places in each cache
+// (15.8.1, 14.x, 13.7.8), never across a page. Only pages of dyld cache files are searched (vnode path checked once).
+static bool gvaPatchOn;
+static uint32_t gvaPatchHits;
+
+static bool isSharedCacheVnode(void *vnode) {
+	static struct {
+		void *vnode;
+		bool cache;
+	} seen[64];
+	static uint32_t next;
+	for (auto &e : seen)
+		if (e.vnode == vnode)
+			return e.cache;
+	char path[160];
+	int len = sizeof(path);
+	bool cache = vn_getpath(static_cast<vnode_t>(vnode), path, &len) == 0 && strstr(path, "dyld_shared_cache_x86_64");
+	auto &slot = seen[next++ % arrsize(seen)];
+	slot.vnode = vnode;
+	slot.cache = cache;
+	return cache;
+}
+
+static void gvaPatchPage(uint8_t *page) {
+	static const char find[] = "board-id\0hw.model";  // 17 bytes with the NUL in the middle
+	for (uint32_t i = 0; i + sizeof(find) - 1 <= 0x1000;) {
+		auto *hit = static_cast<uint8_t *>(memchr(page + i, 'b', 0x1000 - i));
+		if (!hit)
+			return;
+		uint32_t at = static_cast<uint32_t>(hit - page);
+		if (at + sizeof(find) - 1 <= 0x1000 && !memcmp(hit, find, sizeof(find) - 1)) {
+			memcpy(hit, "hwgva", 5);
+			__atomic_fetch_add(&gvaPatchHits, 1, __ATOMIC_RELAXED);
+		}
+		i = at + 1;
+	}
+}
+
 static void wrapCsValidatePage(void *vnode, void *pager, uint64_t offset, const void *data, int *validated,
 	int *tainted, int *nx) {
 	FunctionCast(wrapCsValidatePage, orgCsValidatePage)(vnode, pager, offset, data, validated, tainted, nx);
@@ -727,6 +769,8 @@ static void wrapCsValidatePage(void *vnode, void *pager, uint64_t offset, const 
 	if (!data || !validated || !*validated || (offset & 0xFFF))
 		return;
 	auto *page = const_cast<uint8_t *>(static_cast<const uint8_t *>(data));
+	if (gvaPatchOn && isSharedCacheVnode(vnode))
+		gvaPatchPage(page);
 	for (auto &patch : pagePatches) {
 		if (!patch.enabled)
 			continue;
@@ -770,6 +814,18 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 		patch.enabled = checkKernelArgument(patch.arg) == patch.optIn && patch.pageOffset + patch.size <= 0x1000 &&
 			patch.at + patch.replaceSize <= patch.size;
 		anyPagePatch |= patch.enabled;
+	}
+	// Video decode routing: with -crvideo only (the engines are powered only then), -crnogva leaves AppleGVA alone.
+	gvaPatchOn = checkKernelArgument("-crvideo") && !checkKernelArgument("-crnogva");
+	if (gvaPatchOn) {
+		if (auto *root = IORegistryEntry::fromPath("/", gIODTPlane)) {
+			root->setProperty("hwgva-id", const_cast<char *>("Mac-7BA5B2D9E42DDD94"),
+				static_cast<uint32_t>(sizeof("Mac-7BA5B2D9E42DDD94")));
+			root->release();
+		} else {
+			gvaPatchOn = false;
+		}
+		anyPagePatch |= gvaPatchOn;
 	}
 	if (anyPagePatch) {
 		// Long route, chained with any other wrapper of the same function (RestrictEvents has one).
@@ -8109,7 +8165,8 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 			"cus %u; chiprev %x\n", w[0xA0 / 4], w[0xA8 / 4], w[0xB0 / 4], w[0xB8 / 4], gpuMmio ? gpuMmio[0x263E] : 0,
 			gpuMmio ? gpuMmio[0x9D8] : 0, w[0x98 / 4], w[0x88 / 4], w[0x8C / 4], w[0x90 / 4], w[0x94 / 4], w[0x8 / 4]);
 	}
-	add("page patches: hooked %d, %u pages validated;", scPatchHooked, scPatchCalls);
+	add("page patches: hooked %d, %u pages validated; gva %s %u;", scPatchHooked, scPatchCalls, gvaPatchOn ? "on" : "off",
+		gvaPatchHits);
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
