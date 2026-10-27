@@ -6627,7 +6627,10 @@ struct GpuCopy {
 };
 static GpuCopy gpuCopies[256];
 static uint32_t sdmaHookCalls, sdmaIbs, sdmaUnknown;  // sDMA submissions read (wrapCommitSdma)
+static uint32_t sdmaUnknownHdr[8], sdmaUnknownHdrs;    // the first distinct headers it stopped at
 static uint32_t gpuCopyNext, gpuCopyPackets, gpuCopyBindHits, gpuCopyRevertHits, gpuCopyLogged;
+
+static void applySourcePatches(uint32_t vmid, uint64_t src, uint64_t dst, uint32_t bytes);
 
 static void noteGpuCopy(uint32_t vmid, uint32_t op, uint32_t ctrl, uint64_t src, uint64_t dst, uint32_t bytes) {
 	__atomic_fetch_add(&gpuCopyPackets, 1, __ATOMIC_RELAXED);
@@ -7207,8 +7210,9 @@ static void ctxDump() {
 	dump("ctx clearstate", 0x28000, csbCtx, csbCtxSet, 0x400);
 	dump("uconfig metal", 0x30000, censusUcfg, censusUcfgSet, 0x400);
 	diskLogEvent("gpu copies: %u packets, %u binds and %u reverts right after a copy to the shader; sDMA submissions %u, "
-		"command buffers %u, unknown packets %u", gpuCopyPackets, gpuCopyBindHits, gpuCopyRevertHits, sdmaHookCalls, sdmaIbs,
-		sdmaUnknown);
+		"command buffers %u, unknown packets %u (headers %x %x %x %x %x %x %x %x)", gpuCopyPackets, gpuCopyBindHits,
+		gpuCopyRevertHits, sdmaHookCalls, sdmaIbs, sdmaUnknown, sdmaUnknownHdr[0], sdmaUnknownHdr[1], sdmaUnknownHdr[2],
+		sdmaUnknownHdr[3], sdmaUnknownHdr[4], sdmaUnknownHdr[5], sdmaUnknownHdr[6], sdmaUnknownHdr[7]);
 }
 
 // New draw-census entries to the disk log (watcher thread).
@@ -7309,10 +7313,14 @@ static void processUserIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords, bool al
 		// GPU copies to memory (see GpuCopy): DMA_DATA (DST_SEL [21:20] 0/3 = address, SRC_SEL [30:29] 0/3 = address, 2 =
 		// data), WRITE_DATA (DST_SEL [11:8] 1/2/5 = memory), COPY_DATA (DST_SEL [11:8] 1/2/5, COUNT_SEL [16]: 64-bit).
 		if (type == 3 && op == 0x50 && j + 6 < got) {
-			uint32_t ctrl = buf[j + 1], dstSel = (ctrl >> 20) & 3;
-			if (dstSel == 0 || dstSel == 3)
-				noteGpuCopy(vmid, op, ctrl, static_cast<uint64_t>(buf[j + 3]) << 32 | buf[j + 2],
-					static_cast<uint64_t>(buf[j + 5]) << 32 | buf[j + 4], buf[j + 6] & 0x1FFFFF);
+			uint32_t ctrl = buf[j + 1], dstSel = (ctrl >> 20) & 3, srcSel = (ctrl >> 29) & 3;
+			if (dstSel == 0 || dstSel == 3) {
+				uint64_t src = (static_cast<uint64_t>(buf[j + 3]) << 32 | buf[j + 2]) & 0xFFFFFFFFFFFFULL;
+				uint64_t dst = (static_cast<uint64_t>(buf[j + 5]) << 32 | buf[j + 4]) & 0xFFFFFFFFFFFFULL;
+				noteGpuCopy(vmid, op, ctrl, src, dst, buf[j + 6] & 0x1FFFFF);
+				if (srcSel == 0 || srcSel == 3)  // from an address (not immediate data or GDS)
+					applySourcePatches(vmid, src, dst, buf[j + 6] & 0x1FFFFF);
+			}
 		} else if (type == 3 && op == 0x37 && j + 3 < got && count > 3) {
 			uint32_t ctrl = buf[j + 1], dstSel = (ctrl >> 8) & 0xF;
 			if (dstSel == 1 || dstSel == 2 || dstSel == 5)
@@ -7579,14 +7587,17 @@ static void applySourcePatches(uint32_t vmid, uint64_t src, uint64_t dst, uint32
 		return;
 	for (uint32_t i = 0; i < seenNum && i < arrsize(seenShaders); i++) {
 		auto &sh = seenShaders[i];
-		if (sh.vmid != vmid || !sh.patchCount || sh.patchCount == 0xFFFF || sh.va < dst || sh.va >= dst + bytes)
-			continue;
+		if (sh.vmid != vmid || !sh.patchCount || sh.patchCount == 0xFFFF || sh.va >= dst + bytes ||
+			sh.va + sh.patchAt[sh.patchCount - 1] * 4ULL + 4 <= dst)
+			continue;  // no patched dword can be inside the copy (patchAt is ascending)
 		srcFixCopies++;
 		uint32_t wrote = 0, mismatch = 0;
 		for (uint32_t k = 0; k < sh.patchCount; k++) {
-			uint64_t off = sh.va - dst + sh.patchAt[k] * 4ULL;
-			if (off + 4 > bytes)
+			// Each patched dword on its own: a re-upload chunk may start in the middle of a shader.
+			uint64_t addr = sh.va + sh.patchAt[k] * 4ULL;
+			if (addr < dst || addr + 4 > dst + bytes)
 				continue;
+			uint64_t off = addr - dst;
 			uint32_t now = 0;
 			if (readGpuVa(vmid, src + off, 1, &now, false) != 1)
 				continue;
@@ -7654,6 +7665,11 @@ static void sdmaWalk(uint32_t vmid, uint64_t va, uint32_t dwords) {
 		}
 		if (!len) {
 			sdmaUnknown++;
+			bool known = false;
+			for (uint32_t u = 0; u < sdmaUnknownHdrs && !known; u++)
+				known = sdmaUnknownHdr[u] == h;
+			if (!known && sdmaUnknownHdrs < arrsize(sdmaUnknownHdr))
+				sdmaUnknownHdr[sdmaUnknownHdrs++] = h;
 			return;
 		}
 		j += len;
