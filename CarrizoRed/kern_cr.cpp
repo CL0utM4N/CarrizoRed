@@ -6048,6 +6048,7 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 	auto isInterpSource = [&](uint32_t i, const VgprField &field) {
 		return (code[i] >> 26) == 0x35 && field.shift == 0;
 	};
+	bool full = false;  // addChange ran out of room (fail code 11) rather than meeting a conflict (7)
 	auto addChange = [&](uint32_t i, const VgprField &field, uint32_t reg, uint32_t member) {
 		for (uint32_t c = 0; c < outNum; c++) {
 			if (out[c].at != i || out[c].field.dword != field.dword || out[c].field.shift != field.shift)
@@ -6057,8 +6058,10 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 			out[c].voted |= 1U << (member - base);
 			return true;
 		}
-		if (outNum == outMax)
+		if (outNum == outMax) {
+			full = true;
 			return false;
+		}
 		out[outNum++] = {i, field, reg, 1U << (member - base)};
 		return true;
 	};
@@ -6259,7 +6262,7 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 					return false;
 				}
 				if (!addChange(i, f[q], F + (f[q].count > 1 ? v : r) - base, r)) {
-					fail = member | 7;
+					fail = member | (full ? 11 : 7);
 					return false;
 				}
 			}
@@ -6541,7 +6544,8 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 				}
 				newAllocated = (need + 3) & ~3U;
 			}
-			static RegChange changes[256];
+			// Room for every operand a block move touches: Sonoma's 144 KB lock screen shader failed at 256 (code 7).
+			static RegChange changes[4096];
 			uint32_t changeNum = 0, blockFail = 0;
 			if (!planBlockMove(code, end, at, p2, vI, blockAt, blockBase, blockCount, F, changes, changeNum,
 					arrsize(changes), blockFail)) {
