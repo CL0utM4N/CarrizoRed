@@ -2773,8 +2773,11 @@ static bool wrapPowerUpHWEngines(void *that) {
 	if (video)
 		smuVideoPowerOn();
 	bool skip = !checkKernelArgument("-crmm");
+	// Restore only the slots emptied here: restoring all three wrote the unsaved nullptr over UVD and VCE with -crvideo,
+	// and every video session then failed in AMDAccelUVDContext::init (getHWEngine(5) = 0).
+	size_t first = video ? 2 : 0;
 	if (skip) {
-		for (size_t i = video ? 2 : 0; i < arrsize(multimedia); i++) {
+		for (size_t i = first; i < arrsize(multimedia); i++) {
 			auto &engine = *reinterpret_cast<void **>(static_cast<uint8_t *>(that) + multimedia[i]);
 			saved[i] = engine;
 			if (engine)
@@ -2785,7 +2788,7 @@ static bool wrapPowerUpHWEngines(void *that) {
 	traceEvent("hw.powerUpHWEngines", false, 0);
 	bool ret = FunctionCast(wrapPowerUpHWEngines, orgPowerUpHWEngines)(that);
 	if (skip)
-		for (size_t i = 0; i < arrsize(multimedia); i++)
+		for (size_t i = first; i < arrsize(multimedia); i++)
 			*reinterpret_cast<void **>(static_cast<uint8_t *>(that) + multimedia[i]) = saved[i];
 	traceEvent("hw.powerUpHWEngines", true, ret);
 	traceNote("hw.powerUpHWEngines=%x(mm skipped %u) ", ret, skip ? accelMmDropped : 0);
