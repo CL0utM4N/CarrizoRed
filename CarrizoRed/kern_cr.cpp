@@ -3641,8 +3641,33 @@ static void uvdRegs(const char *when) {
 		gpuMmio[0x3D98], gpuMmio[0x3DA0], gpuMmio[0x3D67], gpuMmio[UvdGpcomData0], gpuMmio[0x3D2C], gpuMmio[SrbmSoftReset]);
 }
 
+// The cause (7013a3b snapshots): UVD answered at the MMIO probe, but by the boot power-on PGFSM_CONFIG held 0x5FF (all
+// tiles, POWER_DOWN, P1_SELECT), every tile read 0x12 and POWER_STATUS 1: CAIL's stoney_power_down_uvd_block_for_dpg_mode
+// had run, and SMU UVDPowerON doesn't undo it. Its own retry path powers the tiles up with 0x6FF (POWER_UP) and expects
+// 0x10. Before every session (CAIL may power them down again), do that, then POWER_STATUS back to 0 as at the probe, with
+// dynamic power gating mode off as Linux's uvd_v6_0_start has it. -crnouvdtiles leaves them.
+static constexpr uint32_t UvdPgfsmConfig = 0x38C0, UvdPgfsmTile1 = 0x38C2, UvdPowerStatus = 0x38C4;
+static constexpr uint32_t UvdTileOff = 0x12, UvdTileOn = 0x10;
+
+static void uvdPowerTilesUp() {
+	auto *mmio = gpuMmio;
+	uint32_t config = mmio[UvdPgfsmConfig], tile = mmio[UvdPgfsmTile1], power = mmio[UvdPowerStatus];
+	if (checkKernelArgument("-crnouvdtiles") || (tile != UvdTileOff && (power & 3) == 0))
+		return;
+	mmio[UvdPgfsmConfig] = 0x6FF;
+	for (uint32_t i = 0; i < 100 && (tile = mmio[UvdPgfsmTile1]) != UvdTileOn; i++)
+		IODelay(10);
+	mmio[UvdPowerStatus] = power & ~0x7U;
+	IODelay(100);
+	diskLogEvent("uvd tiles up: pgfsm %x -> %x, tile1 %x, power %x -> %x", config, mmio[UvdPgfsmConfig], tile, power,
+		mmio[UvdPowerStatus]);
+	traceNote("uvdtiles=%x ", tile);
+}
+
 static bool uvdReadyForSession() {
 	using namespace Smu8;
+	if (gpuMmio && videoPowered())
+		uvdPowerTilesUp();
 	if (uvdState || checkKernelArgument("-crnouvdcheck"))
 		return uvdState != 2;
 	if (!gpuMmio || !videoPowered()) {
