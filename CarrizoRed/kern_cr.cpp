@@ -6830,6 +6830,45 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 		bool listed = false;
 		for (uint32_t q = 0; q < skippedNum && !listed; q++)
 			listed = skippedShaders[q].va == psVa;
+		// No end found in 128 KB (Sonoma: 4 shaders, all at 64 KB boundaries, hazard in their first 64 dwords): dump
+		// the start and count the control flow in what was read, to see how they end (an s_setpc / s_swappc into an
+		// epilogue elsewhere would leave no s_endpgm at all).
+		static uint32_t noEndDumped;
+		if (!listed && skip == SkipNoEnd && noEndDumped < 4) {
+			noEndDumped++;
+			uint32_t endpgm = 0, setpc = 0, swappc = 0, branches = 0, firstSetpc = 0xFFFFFFFF, firstEnd = 0xFFFFFFFF;
+			for (uint32_t i = 0; i < have;) {
+				uint32_t w = code[i];
+				if ((w >> 23) == 0x17F) {  // SOPP
+					uint32_t op = (w >> 16) & 0x7F;
+					if (op == 1) {
+						endpgm++;
+						if (firstEnd == 0xFFFFFFFF)
+							firstEnd = i;
+					} else if (op == 2 || (op >= 4 && op <= 9)) {
+						branches++;
+					}
+				} else if ((w >> 23) == 0x17D) {  // SOP1: s_setpc_b64 0x1D, s_swappc_b64 0x1E
+					uint32_t op = (w >> 8) & 0xFF;
+					if (op == 0x1D) {
+						setpc++;
+						if (firstSetpc == 0xFFFFFFFF)
+							firstSetpc = i;
+					} else if (op == 0x1E) {
+						swappc++;
+					}
+				}
+				i += gcn3InstLength(code + i, have - i);
+			}
+			diskLogEvent("no end: ps %llx %u dw read; s_endpgm %u (first %d), s_setpc %u (first %d), s_swappc %u, branches %u, "
+				"hazard at %u", psVa, have, endpgm, static_cast<int>(firstEnd), setpc, static_cast<int>(firstSetpc), swappc,
+				branches, interpFix.lastHazardAt);
+			for (uint32_t i = 0; i < 160 && i < have; i += 16)
+				diskLogEvent("no end %llx +%u: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x",
+					psVa, i, code[i], code[i + 1], code[i + 2], code[i + 3], code[i + 4], code[i + 5], code[i + 6],
+					code[i + 7], code[i + 8], code[i + 9], code[i + 10], code[i + 11], code[i + 12], code[i + 13],
+					code[i + 14], code[i + 15]);
+		}
 		if (!listed && skippedNum < arrsize(skippedShaders))
 			skippedShaders[skippedNum++] = {psVa, have,
 				skip == SkipUnknownEncoding ? interpFix.lastUnknownAt : interpFix.lastHazardAt, static_cast<uint32_t>(skip),
@@ -6875,6 +6914,13 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 		if (code[q] == original[q] || q > 0xFFFF)
 			continue;
 		if (fresh.patchCount == arrsize(fresh.patchAt)) {
+			uint32_t total = fresh.patchCount;
+			for (uint32_t r = q; r < have; r++)
+				total += code[r] != original[r];
+			static uint32_t longLogged;
+			if (longLogged++ < 10)
+				diskLogEvent("fix too long to replay: ps %llx, %u dwords patched (room for %u)", psVa, total,
+					static_cast<uint32_t>(arrsize(fresh.patchAt)));
 			fresh.patchCount = 0xFFFF;
 			break;
 		}
