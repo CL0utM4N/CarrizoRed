@@ -976,6 +976,8 @@ void CRDriver::findByConfigSpace() {
 
 static mach_vm_address_t orgConfigureDevice;
 static bool wrapConfigureDevice(IOService *that, IOPCIDevice *pci);
+static mach_vm_address_t orgVideoContextStart, videoGetHWInfo;
+static uint32_t wrapVideoContextStart(void *that);
 
 void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	for (size_t i = 0; i < arrsize(kexts); i++) {
@@ -2158,7 +2160,6 @@ namespace {
 		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine6loadFWEv", "vce.loadFW", InAccel, true, false, 0},
 		{"__ZN29AMDRadeonX4000_AMDVCEHWEngine5startEv", "vce.start", InAccel, true, false, 0},
 		// Video sessions (stage 2): whether user space (AppleGVA / the AMD video driver) opens one at all, and how far in.
-		{"__ZN35AMDRadeonX4000_AMDAccelVideoContext12contextStartEv", "vid.contextStart", InAccel, true, false, 0},
 		{"__ZN33AMDRadeonX4000_AMDAccelUVDContext4initEP37AMDRadeonX4000_AMDGraphicsAcceleratorP35AMDRadeonX4000_AMDAccelVideoContextP23sVideoContextCreateInfo",
 			"vid.uvdInit", InAccel, true, false, 0},
 		{"__ZN32AMDRadeonX4000_AMDSMLVIInterface9createUVDEv", "vid.createUVD", InAccel, true, false, 0},
@@ -2369,7 +2370,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 173, "one wrapper per stage");
+		static_assert(arrsize(stages) == 172, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -2393,7 +2394,7 @@ namespace {
 			CR_WRAP(145), CR_WRAP(146), CR_WRAP(147), CR_WRAP(148), CR_WRAP(149), CR_WRAP(150), CR_WRAP(151), CR_WRAP(152),
 			CR_WRAP(153), CR_WRAP(154), CR_WRAP(155), CR_WRAP(156), CR_WRAP(157), CR_WRAP(158), CR_WRAP(159), CR_WRAP(160),
 			CR_WRAP(161), CR_WRAP(162), CR_WRAP(163), CR_WRAP(164), CR_WRAP(165), CR_WRAP(166), CR_WRAP(167), CR_WRAP(168),
-			CR_WRAP(169), CR_WRAP(170), CR_WRAP(171), CR_WRAP(172),
+			CR_WRAP(169), CR_WRAP(170), CR_WRAP(171),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
@@ -2640,6 +2641,14 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 	if (checkKernelArgument("-crvideo") && !checkKernelArgument("-crnogva"))
 		route("__ZN37AMDRadeonX4000_AMDGraphicsAccelerator15configureDeviceEP11IOPCIDevice",
 			reinterpret_cast<mach_vm_address_t>(wrapConfigureDevice), orgConfigureDevice, nullptr, 0, "configureDevice");
+	if (checkKernelArgument("-crvideo")) {
+		videoGetHWInfo = patcher.solveSymbol(index, "__ZN35AMDRadeonX4000_AMDAccelVideoContext9getHWInfoEP13sHardwareInfo",
+			slide, size);
+		patcher.clearError();
+		route("__ZN35AMDRadeonX4000_AMDAccelVideoContext12contextStartEv",
+			reinterpret_cast<mach_vm_address_t>(wrapVideoContextStart), orgVideoContextStart, nullptr, 0,
+			"video contextStart");
+	}
 	// AMDBaffinHardware::powerUp (and AMDEllesmereHardware's copy) ORs MC_ARB_MISC2.SEQ_RDY_POP_IDLE (0x40000000) and
 	// POP_IDLE_REPLAY (0x800) into the memory arbiter: Polaris GDDR5 sequencer tweaks, which Linux never sets on an APU,
 	// whose arbiter the CPU shares. Make both ORs write 0 (mov esi, 0x9D5; mov edx, imm; call [rax + 0x128]).
@@ -2783,6 +2792,30 @@ static bool wrapConfigureDevice(IOService *that, IOPCIDevice *pci) {
 		gvaHevcState |= 4;
 	}
 	traceNote("configureDevice=%d hevc %x ", ret, gvaHevcState);
+	return ret;
+}
+
+// With the decoder published, AppleGVA opens an AMD video context per attempt (H.264 and HEVC, decode and encode) and
+// AMD's user-space driver gives up at once: "AVD_api.Create failed err=5", no call reaches the context between
+// contextStart and contextStop. The first thing it can read is AMDAccelVideoContext::getHWInfo, which can't be routed
+// (a jump in its first 14 bytes); it only copies fields, so call it after contextStart and log what user space gets.
+static uint32_t videoContextStarts;
+
+static uint32_t wrapVideoContextStart(void *that) {
+	uint32_t n = ++videoContextStarts;
+	traceEvent("vid.contextStart", false, 0);
+	uint32_t ret = FunctionCast(wrapVideoContextStart, orgVideoContextStart)(that);
+	traceEvent("vid.contextStart", true, ret);
+	traceNote("vid.contextStart=%x ", ret);
+	if (videoGetHWInfo && n <= 2) {
+		uint32_t info[0x120 / 4] {};
+		auto err = reinterpret_cast<uint32_t (*)(void *, void *)>(videoGetHWInfo)(that, info);
+		diskLogEvent("video hwinfo (start %u) = %x:", n, err);
+		for (uint32_t i = 0; i < arrsize(info); i += 12)
+			diskLogEvent("  +%03x: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", i * 4, info[i],
+				info[i + 1], info[i + 2], info[i + 3], info[i + 4], info[i + 5], info[i + 6], info[i + 7], info[i + 8],
+				info[i + 9], info[i + 10], info[i + 11]);
+	}
 	return ret;
 }
 
