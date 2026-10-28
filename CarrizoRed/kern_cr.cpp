@@ -763,8 +763,28 @@ static const uint8_t smallPrimBigSurFind[] {
 static const uint8_t dccBigSurFind[] {
 	0xF6, 0x45, 0xD4, 0x01, 0x0F, 0x84, 0x8F, 0x00, 0x00, 0x00, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0xB5, 0x50, 0xFE, 0xFF, 0xFF,
 };
+// Catalina (10.15.7 19H2): not in the dyld cache. The compiler is AMDShared.bundle's libSC.dylib, whose
+// SCGetInstructionSet numbers the targets differently: the VI branch (family 130) returns 4, and the CZ branch returns
+// 0x0E (GFX81) for revision 0x61 and up, i.e. Stoney. Make the VI branch's `mov eax, 4` a `mov eax, 0x0E`. The other
+// three are in AMDMTLBronzeDriver: the small-prim mask from the chip record's +0xAC, the walk-fence immediate stored at
+// +0x2D8 (through rax, with the next register's value in its high half), and the DCC flag test on [rbp - 0x30]. Each
+// pattern occurs once in its file.
+static const uint8_t isaCatalinaFind[] {
+	0x83, 0xC6, 0xEC, 0xB8, 0x04, 0x00, 0x00, 0x00, 0x83, 0xFE, 0x13, 0x0F, 0x87, 0xE9, 0x00, 0x00, 0x00, 0x81, 0xC2, 0xD7,
+	0x96, 0xFF, 0xFF, 0x83, 0xFA, 0x07, 0x0F, 0x83, 0xDA, 0x00, 0x00, 0x00,
+};
+static const uint8_t smallPrimCatalinaFind[] {
+	0x8B, 0x96, 0xAC, 0x00, 0x00, 0x00, 0xC1, 0xE2, 0x0A, 0xC1, 0xFA, 0x1F, 0x83, 0xE2, 0x05, 0x89, 0x57, 0x40,
+};
+static const uint8_t walkFenceCatalinaFind[] {
+	0x48, 0xB8, 0xB8, 0x01, 0x02, 0x06, 0xE9, 0x01, 0x00, 0x00, 0x48, 0x89, 0x87, 0xD8, 0x02, 0x00, 0x00,
+};
+static const uint8_t dccCatalinaFind[] {
+	0x41, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x4D, 0x89, 0xE9, 0xF6, 0x45, 0xD0, 0x01, 0x0F, 0x84, 0xA0, 0x00, 0x00, 0x00, 0x4D,
+	0x89, 0xCD,
+};
 static const uint8_t isaReplace[] {0x1E}, smallPrimReplace[] {0x00}, walkFenceReplace[] {0xA8}, dccReplace[] {0x90, 0xE9},
-	dccVenturaReplace[] {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00};
+	dccVenturaReplace[] {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00}, isaCatalinaReplace[] {0x0E};
 struct PagePatch {
 	const char *name;
 	const char *arg;  // boot-arg that turns it off (on, for an opt-in patch)
@@ -810,8 +830,15 @@ static PagePatch pagePatches[] {
 	{"walkfence11", "-crnowalkfence", false, 0xB8F, walkFenceMontereyFind, sizeof(walkFenceMontereyFind), 6,
 		walkFenceReplace, sizeof(walkFenceReplace)},
 	{"dcc11", "-crdcc", false, 0xF4F, dccBigSurFind, sizeof(dccBigSurFind), 4, dccReplace, sizeof(dccReplace)},
+	{"isa10", "-crnoscpatch", false, 0x758, isaCatalinaFind, sizeof(isaCatalinaFind), 4, isaCatalinaReplace,
+		sizeof(isaCatalinaReplace)},
+	{"smallprim10", "-crnosmallprim", false, 0x21A, smallPrimCatalinaFind, sizeof(smallPrimCatalinaFind), 14,
+		smallPrimReplace, sizeof(smallPrimReplace)},
+	{"walkfence10", "-crnowalkfence", false, 0x472, walkFenceCatalinaFind, sizeof(walkFenceCatalinaFind), 2,
+		walkFenceReplace, sizeof(walkFenceReplace)},
+	{"dcc10", "-crdcc", false, 0xAD9, dccCatalinaFind, sizeof(dccCatalinaFind), 13, dccReplace, sizeof(dccReplace)},
 };
-static mach_vm_address_t orgCsValidatePage;
+static mach_vm_address_t orgCsValidatePage, orgCsValidateRange;
 static bool scPatchHooked;
 static uint32_t scPatchCalls;
 
@@ -860,13 +887,7 @@ static void gvaPatchPage(uint8_t *page) {
 	}
 }
 
-static void wrapCsValidatePage(void *vnode, void *pager, uint64_t offset, const void *data, int *validated,
-	int *tainted, int *nx) {
-	FunctionCast(wrapCsValidatePage, orgCsValidatePage)(vnode, pager, offset, data, validated, tainted, nx);
-	__atomic_fetch_add(&scPatchCalls, 1, __ATOMIC_RELAXED);
-	if (!data || !validated || !*validated || (offset & 0xFFF))
-		return;
-	auto *page = const_cast<uint8_t *>(static_cast<const uint8_t *>(data));
+static void patchValidatedPage(void *vnode, uint8_t *page) {
 	if (gvaPatchOn && isSharedCacheVnode(vnode))
 		gvaPatchPage(page);
 	for (auto &patch : pagePatches) {
@@ -878,6 +899,26 @@ static void wrapCsValidatePage(void *vnode, void *pager, uint64_t offset, const 
 			__atomic_fetch_add(&patch.hits, 1, __ATOMIC_RELAXED);
 		}
 	}
+}
+
+static void wrapCsValidatePage(void *vnode, void *pager, uint64_t offset, const void *data, int *validated,
+	int *tainted, int *nx) {
+	FunctionCast(wrapCsValidatePage, orgCsValidatePage)(vnode, pager, offset, data, validated, tainted, nx);
+	__atomic_fetch_add(&scPatchCalls, 1, __ATOMIC_RELAXED);
+	if (!data || !validated || !*validated || (offset & 0xFFF))
+		return;
+	patchValidatedPage(vnode, const_cast<uint8_t *>(static_cast<const uint8_t *>(data)));
+}
+
+// Catalina has no cs_validate_page: pages are validated one at a time through cs_validate_range (xnu-6153), which
+// returns whether the range validated. libSC and the Metal driver are separate files there, mapped from disk.
+static int wrapCsValidateRange(void *vnode, void *pager, uint64_t offset, const void *data, size_t size,
+	unsigned *tainted) {
+	int validated = FunctionCast(wrapCsValidateRange, orgCsValidateRange)(vnode, pager, offset, data, size, tainted);
+	__atomic_fetch_add(&scPatchCalls, 1, __ATOMIC_RELAXED);
+	if (validated && data && size == 0x1000 && !(offset & 0xFFF))
+		patchValidatedPage(vnode, const_cast<uint8_t *>(static_cast<const uint8_t *>(data)));
+	return validated;
 }
 
 void CRDriver::init() {
@@ -926,13 +967,17 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 		anyPagePatch |= gvaPatchOn;
 	}
 	if (anyPagePatch) {
-		// Long route, chained with any other wrapper of the same function (RestrictEvents has one).
-		KernelPatcher::RouteRequest request {"_cs_validate_page", wrapCsValidatePage, orgCsValidatePage};
-		scPatchHooked = patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1) && orgCsValidatePage &&
-			orgCsValidatePage != EINVAL;
+		// Long route, chained with any other wrapper of the same function (RestrictEvents has one; on Catalina, Lilu's user
+		// patcher wraps cs_validate_range).
+		bool catalina = getKernelVersion() < KernelVersion::BigSur;
+		auto &org = catalina ? orgCsValidateRange : orgCsValidatePage;
+		KernelPatcher::RouteRequest request = catalina ?
+			KernelPatcher::RouteRequest {"_cs_validate_range", wrapCsValidateRange, orgCsValidateRange} :
+			KernelPatcher::RouteRequest {"_cs_validate_page", wrapCsValidatePage, orgCsValidatePage};
+		scPatchHooked = patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1) && org && org != EINVAL;
 		if (!scPatchHooked) {
-			SYSLOG("cr", "failed to hook cs_validate_page for the Metal patches (error %d)", patcher.getError());
-			orgCsValidatePage = 0;
+			SYSLOG("cr", "failed to hook %s for the Metal patches (error %d)", request.symbol, patcher.getError());
+			org = 0;
 			patcher.clearError();
 		}
 	}
@@ -2646,14 +2691,55 @@ void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_add
 // Field offsets come from the 15.8.1 KDK; each patch first checks the instructions that carry them (the D509BA boots
 // the 15.4 recovery) and stays off if they differ.
 static bool accelSdma1Dropped, accelCapsFixed, vmFixOn, vmFixReady;
-static bool capsMonterey;  // AMDHardware's capability fields 8 bytes earlier (see the caps fix route)
+// AMDHardware's capability fields: shader engines, SH per SE, CUs per SH, minimum active CUs per SH (see the caps fix
+// route). Monterey and Big Sur have them 8 bytes earlier; Catalina at 0x58, 0x5C, 0x80, 0x84.
+static struct {
+	uint32_t se, sh, cu, activeCu;
+} capsOff {0x64, 0x6C, 0xA0, 0xA4};
 // AMD_SUBMIT_COMMAND_BUFFER_INFO (the PM4 and sDMA commit hooks): +0 flags, +4 VMID, then the command buffer count and
 // the entries, 0x28 bytes each (dwords at +0, GPU address at +0xC). Monterey and later: count at +0xC, entries from
 // +0x44; Big Sur: count at +0x8, entries from +0x3C (both commitIndirectCommandBuffer versions read them there).
-static uint32_t submitCountOff = 0xC, submitEntriesOff = 0x44;
+// Catalina: count at +0x8, entries from +0x2C, 0x20 bytes each with the GPU address at +4.
+static uint32_t submitCountOff = 0xC, submitEntriesOff = 0x44, submitStride = 0x28, submitVaOff = 0xC;
 // The vtable slot of the info object's state getter AMDHardware::startHWEngines calls (and wrapStartHWEngines): 0x178,
 // Big Sur 0x170.
 static uint32_t hwStateSlot = 0x178;
+// AMDHardware's engine slots, 8 bytes per engine type (0 PM4, 1 sDMA0, 2 sDMA1): from +0x3B0, Catalina +0x340. The
+// multimedia engines the power-up skips (UVD, VCE, SAMU) are at other types there too.
+static uint32_t hwEngines = 0x3B0;
+static uint32_t hwMmSlots[3] {0x3D8, 0x3E8, 0x400};
+// Whether the GFX ring's layout (PM4 engine +0x50, ring +0x30 size, +0x40 CPU mapping, +0x48 GPU address) is known:
+// Catalina's ring objects differ, so its ring reads (diagnostics, the fallback shader scan) are skipped.
+static bool ringLayoutKnown = true;
+// CAIL's flags word and the SMU data buffer's size (see the direct microcode load): Catalina has both 8 bytes earlier.
+static uint32_t cailFlagsOff = 0x6F0, cailSmuSizeOff = 0xCD8;
+
+// The layouts above for the running macOS (Catalina 10.15.7 19H2, Big Sur 11.7.11 20G1443, Monterey 12.7.6).
+static void selectAccelLayouts() {
+	auto version = getKernelVersion();
+	if (version <= KernelVersion::Monterey)
+		capsOff = {0x5C, 0x64, 0x98, 0x9C};
+	if (version == KernelVersion::BigSur) {
+		submitCountOff = 0x8;
+		submitEntriesOff = 0x3C;
+		hwStateSlot = 0x170;
+	}
+	if (version == KernelVersion::Catalina) {
+		capsOff = {0x58, 0x5C, 0x80, 0x84};
+		submitCountOff = 0x8;
+		submitEntriesOff = 0x2C;
+		submitStride = 0x20;
+		submitVaOff = 0x4;
+		hwStateSlot = 0x180;
+		hwEngines = 0x340;
+		hwMmSlots[0] = 0x358;
+		hwMmSlots[1] = 0x368;
+		hwMmSlots[2] = 0x380;
+		ringLayoutKnown = false;
+		cailFlagsOff = 0x6E8;
+		cailSmuSizeOff = 0xCD0;
+	}
+}
 static void *accelHardware;  // AMDBaffinHardware, from allocateHWEngines (for the black box's ring dump)
 
 // The GPU at the first AMDHardware::resetHardware, before Apple's reset changes it: GRBM/SRBM status, CP status and
@@ -2676,8 +2762,8 @@ static void snapshotHang(uint32_t arg) {
 	for (size_t i = 0; i < arrsize(hangRegs); i++)
 		hangSnap.regs[i] = mmio[hangRegs[i]];
 	hangSnap.rptr = mmio[0x21C0];
-	if (auto *hw = static_cast<uint8_t *>(accelHardware))
-		if (auto *pm4 = *reinterpret_cast<uint8_t **>(hw + 0x3B0))
+	if (auto *hw = ringLayoutKnown ? static_cast<uint8_t *>(accelHardware) : nullptr)
+		if (auto *pm4 = *reinterpret_cast<uint8_t **>(hw + hwEngines))
 			if (auto *ring = *reinterpret_cast<uint8_t **>(pm4 + 0x50)) {
 				auto *cpu = *reinterpret_cast<uint32_t **>(ring + 0x40);
 				uint32_t dwords = *reinterpret_cast<uint32_t *>(ring + 0x30);
@@ -2782,6 +2868,7 @@ static uint64_t wrapEndVMPTUpdate(void *that) {
 static bool wrapPowerUpHWEngines(void *that);
 
 void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
+	selectAccelLayouts();
 	auto route = [&](const char *symbol, mach_vm_address_t wrapper, mach_vm_address_t &org, const char *const *checks,
 					 size_t checkLen, const char *what) {
 		mach_vm_address_t fn = patcher.solveSymbol(index, symbol, slide, size);
@@ -2821,10 +2908,6 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		// twice. It reads through the carve-out mapping and the kernel physmap only. -crnointerpsubmit disables it
 		// (the once-a-second scan then does the fixing, without raises).
 		interpSubmit = !checkKernelArgument("-crnointerpsubmit");
-		if (getKernelVersion() == KernelVersion::BigSur) {
-			submitCountOff = 0x8;
-			submitEntriesOff = 0x3C;
-		}
 		interpHooked = interpLock && interpSubmit && route("__ZN30AMDRadeonX4000_AMDVIPM4Channel27commitIndirectCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
 			reinterpret_cast<mach_vm_address_t>(wrapCommitIb), orgCommitIb, nullptr, 0, "commitIndirectCommandBuffer");
 		if (interpLock && interpSubmit)
@@ -2841,29 +2924,35 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 	if (family == ChipFamily::Stoney && !checkKernelArgument("-crnosdmafix")) {
 		// Each "a|b": Sequoia/Sonoma's encoding, then Ventura's, then Monterey's (other registers, same offsets).
 		// Big Sur: r14 in allocateHWEngines, the state getter at vtable 0x170 and a 32-bit store of its word.
+		// Catalina: the engine slots from +0x340 (sDMA at +0x348, +0x350), and startHWEngines only logs a missing sDMA1
+		// (it starts sDMA0 and ignores sDMA1's result), so it is left as it is.
+		bool bigSur = getKernelVersion() == KernelVersion::BigSur;
+		bool catalina = getKernelVersion() == KernelVersion::Catalina;
 		static const char *const allocChecks[] {"4c89b3b8030000|49899fb8030000|49899eb8030000",
 			"4c89b3c0030000|49899fc0030000|49899ec0030000", nullptr};
+		static const char *const allocChecksCatalina[] {"49899e48030000", "49899e50030000", nullptr};
 		static const char *const startChecks[] {"4a8bbcf3b8030000|498bbcdfb8030000|498bbcdeb8030000", "ff9048010000",
 			"488b7b18|498b7f18|498b7e18", "ff9078010000", "66895008|66897008", nullptr};
 		static const char *const startChecksBigSur[] {"498bbcdeb8030000", "ff9048010000", "498b7e18", "ff9070010000",
 			"897008", nullptr};
-		bool bigSur = getKernelVersion() == KernelVersion::BigSur;
-		hwStateSlot = bigSur ? 0x170 : 0x178;
 		if (route("__ZN32AMDRadeonX4000_AMDBaffinHardware17allocateHWEnginesEv",
-				reinterpret_cast<mach_vm_address_t>(wrapAllocateHWEngines), orgAllocateHWEngines, allocChecks, 0x100,
-				"allocateHWEngines")) {
+				reinterpret_cast<mach_vm_address_t>(wrapAllocateHWEngines), orgAllocateHWEngines,
+				catalina ? allocChecksCatalina : allocChecks, 0x100, "allocateHWEngines") && !catalina) {
 			route("__ZN26AMDRadeonX4000_AMDHardware14startHWEnginesEv",
 				reinterpret_cast<mach_vm_address_t>(wrapStartHWEngines), orgStartHWEngines,
 				bigSur ? startChecksBigSur : startChecks, 0xA0,
 				"startHWEngines");
 		}
 		static const char *const powerUpChecks[] {"4b8bbcfeb0030000|498bbcdeb0030000", nullptr};
+		static const char *const powerUpChecksCatalina[] {"498bbcde40030000", nullptr};
 		route("__ZN26AMDRadeonX4000_AMDHardware16powerUpHWEnginesEv",
-			reinterpret_cast<mach_vm_address_t>(wrapPowerUpHWEngines), orgPowerUpHWEngines, powerUpChecks, 0x30,
-			"powerUpHWEngines");
+			reinterpret_cast<mach_vm_address_t>(wrapPowerUpHWEngines), orgPowerUpHWEngines,
+			catalina ? powerUpChecksCatalina : powerUpChecks, 0x30, "powerUpHWEngines");
 		static const char *const channelChecks[] {"488bbcc7b0030000", "488b80a0010000", nullptr};
+		static const char *const channelChecksCatalina[] {"488bbcc740030000", "488b80a0010000", nullptr};
 		route("__ZN26AMDRadeonX4000_AMDHardware12getHWChannelE20_eAMD_HW_ENGINE_TYPE18_eAMD_HW_RING_TYPE",
-			reinterpret_cast<mach_vm_address_t>(wrapGetHWChannel), orgGetHWChannel, channelChecks, 0x26,
+			reinterpret_cast<mach_vm_address_t>(wrapGetHWChannel), orgGetHWChannel,
+			catalina ? channelChecksCatalina : channelChecks, 0x26,
 			"getHWChannel");
 	}
 	// Video decode for AppleGVA (see wrapConfigureDevice); -crnogva leaves it, as it does the board-id routing.
@@ -2904,7 +2993,8 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		static const uint8_t repl2[] {0xBE, 0xD5, 0x09, 0x00, 0x00, 0xBA, 0x00, 0x00,
 			0x00, 0x00, 0xFF, 0x90, 0x28, 0x01, 0x00, 0x00};
 		KernelPatcher::LookupPatch patches[] {
-			{&kexts[KextRadeonX4000], find1, repl1, sizeof(find1), 2},
+			// Catalina has the first one in AMDFijiHardware::powerUp too.
+			{&kexts[KextRadeonX4000], find1, repl1, sizeof(find1), getKernelVersion() == KernelVersion::Catalina ? 3u : 2u},
 			{&kexts[KextRadeonX4000], find2, repl2, sizeof(find2), 2},
 		};
 		for (auto &patch : patches) {
@@ -2924,10 +3014,14 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		// active CUs AMDVIHardware's setupAndInitializeHWCapabilities stores 0x9C).
 		static const char *const capsChecksMonterey[] {"c7475c02000000", "c7476401000000", "c7879800000008000000",
 			nullptr};
-		capsMonterey = getKernelVersion() <= KernelVersion::Monterey;  // and Big Sur
+		// Catalina: SEs and SH per SE in one 64-bit store to 0x58 (2, 1), CUs per SH at 0x80, active CUs at 0x84.
+		static const char *const capsChecksCatalina[] {"48b80200000001000000", "48894758", "c7878000000008000000",
+			nullptr};
+		auto version = getKernelVersion();
 		route("__ZN32AMDRadeonX4000_AMDBaffinHardware32setupAndInitializeHWCapabilitiesEv",
 			reinterpret_cast<mach_vm_address_t>(wrapSetupHWCapabilities), orgSetupHWCapabilities,
-			capsMonterey ? capsChecksMonterey : capsChecks, 0x30, "setupAndInitializeHWCapabilities");
+			version == KernelVersion::Catalina ? capsChecksCatalina :
+			version <= KernelVersion::Monterey ? capsChecksMonterey : capsChecks, 0x30, "setupAndInitializeHWCapabilities");
 	}
 	if (!checkKernelArgument("-crnovmmcheck")) {
 		static const char *const vmmChecks[] {"ff4f3c", "488b7f28", "ff9040010000", "ff9058010000", "488b8060010000", nullptr};
@@ -2962,7 +3056,7 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 bool CRDriver::wrapAllocateHWEngines(void *that) {
 	bool ret = FunctionCast(wrapAllocateHWEngines, callback->orgAllocateHWEngines)(that);
 	accelHardware = that;
-	auto &sdma1 = *reinterpret_cast<OSObject **>(static_cast<uint8_t *>(that) + 0x3C0);
+	auto &sdma1 = *reinterpret_cast<OSObject **>(static_cast<uint8_t *>(that) + hwEngines + 0x10);
 	if (sdma1) {
 		sdma1->release();
 		sdma1 = nullptr;
@@ -2972,7 +3066,7 @@ bool CRDriver::wrapAllocateHWEngines(void *that) {
 	return ret;
 }
 
-// UVD 6.3 (+0x3D8), VCE 3.4 (+0x3E8) and SAMU (+0x400): on the APU the SMU keeps them power-gated until a PowerPlay
+// UVD 6.3 (+0x3D8), VCE 3.4 (+0x3E8) and SAMU (+0x400; Catalina +0x358, +0x368, +0x380, see hwMmSlots): on the APU the SMU keeps them power-gated until a PowerPlay
 // back end asks it to power them up (Linux smu8: PPSMC_MSG_UVDPowerON etc.); the Dummy back end never does, and
 // programming a gated block can hang the bus. Releasing the engines made AMDGraphicsAccelerator::start fail (nvram68,
 // then a NULL dereference in its clean-up path), so they stay; only their power-up is skipped: the slots are emptied
@@ -2982,7 +3076,7 @@ bool CRDriver::wrapAllocateHWEngines(void *that) {
 static void smuVideoPowerOn();
 
 static bool wrapPowerUpHWEngines(void *that) {
-	static const uint32_t multimedia[] {0x3D8, 0x3E8, 0x400};
+	auto &multimedia = hwMmSlots;
 	void *saved[arrsize(multimedia)] {};
 	bool video = checkKernelArgument("-crvideo");
 	if (video)
@@ -3134,9 +3228,9 @@ static bool wrapUvdContextInit(void *that, void *accel, void *videoContext, uint
 // the same "sDMA started" bit (bit 9 of the 16-bit word at +8 of the info block from this+0x18, vtable +0x178).
 bool CRDriver::wrapStartHWEngines(void *that) {
 	auto *self = static_cast<uint8_t *>(that);
-	if (*reinterpret_cast<void **>(self + 0x3C0))
+	if (*reinterpret_cast<void **>(self + hwEngines + 0x10))
 		return FunctionCast(wrapStartHWEngines, callback->orgStartHWEngines)(that);
-	void *sdma0 = *reinterpret_cast<void **>(self + 0x3B8);
+	void *sdma0 = *reinterpret_cast<void **>(self + hwEngines + 8);
 	bool ok = sdma0 && vfunc<bool (*)(void *)>(sdma0, 0x148)(sdma0);
 	void *info = *reinterpret_cast<void **>(self + 0x18);
 	auto *state = vfunc<uint8_t *(*)(void *)>(info, hwStateSlot)(info);
@@ -3162,12 +3256,12 @@ void *CRDriver::wrapGetHWChannel(void *that, uint32_t engine, uint32_t ring) {
 
 uint64_t CRDriver::wrapSetupHWCapabilities(void *that) {
 	uint64_t ret = FunctionCast(wrapSetupHWCapabilities, callback->orgSetupHWCapabilities)(that);
-	auto *self = static_cast<uint8_t *>(that) - (capsMonterey ? 8 : 0);
-	uint32_t activeCu = *reinterpret_cast<uint32_t *>(self + 0xA4);  // minimum active CUs per SH, from CAIL
-	*reinterpret_cast<uint32_t *>(self + 0x64) = 1;                   // shader engines
-	*reinterpret_cast<uint32_t *>(self + 0x6C) = 1;                   // SH per SE
+	auto *self = static_cast<uint8_t *>(that);
+	uint32_t activeCu = *reinterpret_cast<uint32_t *>(self + capsOff.activeCu);  // minimum active CUs per SH, from CAIL
+	*reinterpret_cast<uint32_t *>(self + capsOff.se) = 1;                         // shader engines
+	*reinterpret_cast<uint32_t *>(self + capsOff.sh) = 1;                         // SH per SE
 	if (activeCu)
-		*reinterpret_cast<uint32_t *>(self + 0xA0) = activeCu;        // CUs per SH
+		*reinterpret_cast<uint32_t *>(self + capsOff.cu) = activeCu;              // CUs per SH
 	accelCapsFixed = true;
 	accelCapsCu = activeCu;
 	traceEvent("hw.capabilities (1 SE, active CUs)", true, activeCu);
@@ -3269,7 +3363,7 @@ static uint32_t cailFlagsBefore, cailFlagsAfter;
 
 static uint64_t wrapCailReadinOverrideRegistrySetting(void *cail) {
 	auto ret = FunctionCast(wrapCailReadinOverrideRegistrySetting, orgCailReadinOverrideRegistrySetting)(cail);
-	auto &flags = *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(cail) + 0x6F0);
+	auto &flags = *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(cail) + cailFlagsOff);
 	cailFlagsBefore = flags;
 	flags &= ~0x200000U;
 	cailFlagsAfter = flags;
@@ -3486,7 +3580,7 @@ static void smuLoadFirmware(void *cail) {
 		smuLoad.result = "no UcodeInfo";
 		return;
 	}
-	if (!smuRegionStart || !smuLoad.blockOffset || *reinterpret_cast<uint32_t *>(base + 0xCD8) != smuCailSize) {
+	if (!smuRegionStart || !smuLoad.blockOffset || *reinterpret_cast<uint32_t *>(base + cailSmuSizeOff) != smuCailSize) {
 		smuLoad.result = "CAIL's micro-engine block isn't reserved";
 		return;
 	}
@@ -4573,7 +4667,11 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			routeHwlibs(patcher, index, ats, slide, size, HookAts);
 		}
 		if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crnodirectucode")) {
-			// The flags word store, and the RLC loader's test of the flag (test byte [rbx+0x6F2], 0x20).
+			// The flags word store, and the RLC loader's test of the flag (test byte [rbx+0x6F2], 0x20). Catalina's CAIL
+			// has both fields 8 bytes earlier (mov [r12+0x6E8], eax; test byte [r12+0x6EA], 0x20; the SMU buffer size
+			// stored at +0xCD0); its Carrizo code isn't checked, so it stays off there.
+			selectAccelLayouts();
+			bool catalina = getKernelVersion() == KernelVersion::Catalina;
 			auto fn = solveOrSignature(patcher, index, "_CailReadinOverrideRegistrySetting", slide, size);
 			bool carrizo = family == ChipFamily::Carrizo;
 			const char *loadRlcName = carrizo ? "_Carrizo_LoadRlcUcode" : "_Stoney_LoadRlcUcode";
@@ -4595,8 +4693,9 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			}
 			// Stoney's RLC loader tests DisableCailLoadUcode ([cail+0x6F2] bit 0x20) near its start; Carrizo's has a
 			// different flow (the KDK's Carrizo_LoadRlcUcode doesn't test that bit), so only the registry reader is checked.
-			if (!codeHas(fn, 0x100, "8983f0060000|41898424f0060000") ||
-				(!carrizo && !codeHas(rlc, 0x60, "f683f206000020|41f68424f206000020")) || !rlc) {
+			if (!codeHas(fn, 0x100, catalina ? "41898424e8060000" : "8983f0060000|41898424f0060000") ||
+				(!carrizo && !codeHas(rlc, 0x60, catalina ? "41f68424ea06000020" : "f683f206000020|41f68424f206000020")) ||
+				!rlc || (catalina && carrizo)) {
 				traceNote("directucode=nomatch ");
 			} else if (routeHwlibs(patcher, index, request, slide, size, HookFlags) && !checkKernelArgument("-crnosmuload")) {
 				// See smuLoadFirmware. The size function must end by storing its total at [cail+0xCD8]
@@ -4616,7 +4715,8 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 					ucodeGoldenSettings = format + 0x16 + rel;
 				}
 				if ((!info && !ucodeGoldenSettings) ||
-					!codeHas(format, 0x130, carrizo ? "4489b3d80c0000|4589a6d80c0000" : "8983d80c0000|418986d80c0000")) {
+					!codeHas(format, 0x130, catalina ? "418986d00c0000" :
+						carrizo ? "4489b3d80c0000|4589a6d80c0000" : "8983d80c0000|418986d80c0000")) {
 					traceNote("smuload=nomatch ");
 				} else {
 					stoneyUcodeInfo = reinterpret_cast<Smu8::CailUcode **>(info);
@@ -8411,9 +8511,9 @@ static void raiseOnlyIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords) {
 static void interpFixScan() {
 	auto *hw = static_cast<uint8_t *>(accelHardware);
 	auto *mmio = gpuMmio;
-	if (!hw || !mmio || !interpLock)
+	if (!hw || !mmio || !interpLock || !ringLayoutKnown)
 		return;
-	auto *pm4 = *reinterpret_cast<uint8_t **>(hw + 0x3B0);
+	auto *pm4 = *reinterpret_cast<uint8_t **>(hw + hwEngines);
 	auto *ring = pm4 ? *reinterpret_cast<uint8_t **>(pm4 + 0x50) : nullptr;
 	auto *cpu = ring ? *reinterpret_cast<uint32_t **>(ring + 0x40) : nullptr;
 	uint32_t dwords = ring ? *reinterpret_cast<uint32_t *>(ring + 0x30) : 0;
@@ -8484,8 +8584,8 @@ static void interpHookBody(uint8_t *info) {
 			if (!locked) {
 				ibHookBusy++;
 				for (uint32_t i = 0; i < count && i < 8; i++) {
-					uint32_t dw = *reinterpret_cast<uint32_t *>(info + submitEntriesOff + i * 0x28);
-					uint64_t va = *reinterpret_cast<uint64_t *>(info + submitEntriesOff + 0xC + i * 0x28);
+					uint32_t dw = *reinterpret_cast<uint32_t *>(info + submitEntriesOff + i * submitStride);
+					uint64_t va = *reinterpret_cast<uint64_t *>(info + submitEntriesOff + submitVaOff + i * submitStride);
 					if (dw && va)
 						raiseOnlyIb(vmid, va, dw);
 				}
@@ -8494,8 +8594,8 @@ static void interpHookBody(uint8_t *info) {
 			}
 			vmCacheBegin();
 			for (uint32_t i = 0; i < count && i < 8; i++) {
-				uint32_t dw = *reinterpret_cast<uint32_t *>(info + submitEntriesOff + i * 0x28);
-				uint64_t va = *reinterpret_cast<uint64_t *>(info + submitEntriesOff + 0xC + i * 0x28);
+				uint32_t dw = *reinterpret_cast<uint32_t *>(info + submitEntriesOff + i * submitStride);
+				uint64_t va = *reinterpret_cast<uint64_t *>(info + submitEntriesOff + submitVaOff + i * submitStride);
 				if (dw && va) {
 					ibHookIbs++;
 					processUserIb(vmid, va, dw, interpBump);
@@ -8663,8 +8763,8 @@ static uint64_t wrapCommitSdma(void *channel, uint8_t *info) {
 			__atomic_fetch_add(&hookDepth, 1, __ATOMIC_ACQ_REL);
 			vmCacheBegin();
 			for (uint32_t i = 0; i < count && i < 8; i++) {
-				uint32_t dw = *reinterpret_cast<uint32_t *>(info + submitEntriesOff + i * 0x28);
-				uint64_t va = *reinterpret_cast<uint64_t *>(info + submitEntriesOff + 0xC + i * 0x28);
+				uint32_t dw = *reinterpret_cast<uint32_t *>(info + submitEntriesOff + i * submitStride);
+				uint64_t va = *reinterpret_cast<uint64_t *>(info + submitEntriesOff + submitVaOff + i * submitStride);
 				if (dw && va && vmid) {
 					sdmaIbs++;
 					sdmaWalk(vmid, va, dw);
@@ -8710,9 +8810,9 @@ static void captureUserIbs(char *out, size_t size) {
 	out[0] = 0;
 	auto *hw = static_cast<uint8_t *>(accelHardware);
 	auto *mmio = gpuMmio;
-	if (!hw || !mmio)
+	if (!hw || !mmio || !ringLayoutKnown)
 		return;
-	auto *pm4 = *reinterpret_cast<uint8_t **>(hw + 0x3B0);
+	auto *pm4 = *reinterpret_cast<uint8_t **>(hw + hwEngines);
 	auto *ring = pm4 ? *reinterpret_cast<uint8_t **>(pm4 + 0x50) : nullptr;
 	auto *cpu = ring ? *reinterpret_cast<uint32_t **>(ring + 0x40) : nullptr;
 	uint32_t dwords = ring ? *reinterpret_cast<uint32_t *>(ring + 0x30) : 0;
@@ -9435,8 +9535,8 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 		// The GFX ring's contents around the read pointer (nvram54: stuck at dword 0x88 with an SRBM request pending).
 		// AMDBaffinHardware +0x3B0 = PM4 engine, +0x50 = its GFX ring (AMDVICommandsRing <- AMDCommandRing: +0x30 size in
 		// dwords, +0x40 CPU mapping, +0x48 GPU address).
-		if (auto *hw = static_cast<uint8_t *>(accelHardware)) {
-			auto *pm4 = *reinterpret_cast<uint8_t **>(hw + 0x3B0);
+		if (auto *hw = ringLayoutKnown ? static_cast<uint8_t *>(accelHardware) : nullptr) {
+			auto *pm4 = *reinterpret_cast<uint8_t **>(hw + hwEngines);
 			auto *ring = pm4 ? *reinterpret_cast<uint8_t **>(pm4 + 0x50) : nullptr;
 			auto *cpu = ring ? *reinterpret_cast<uint32_t **>(ring + 0x40) : nullptr;
 			uint32_t dwords = ring ? *reinterpret_cast<uint32_t *>(ring + 0x30) : 0;
