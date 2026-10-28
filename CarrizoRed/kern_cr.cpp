@@ -6728,8 +6728,8 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 		return true;
 	};
 	// Operands a member must move with the others: instruction position, bit 31 set for its write.
-	static uint32_t forced[16][32];
-	uint32_t forcedNum[16] {};
+	static uint32_t forced[32][32];  // up to 32 members: the voted masks are 32-bit
+	uint32_t forcedNum[32] {};
 	if (k > arrsize(forced))
 		return false;
 	for (uint32_t attempt = 0;; attempt++) {
@@ -6915,7 +6915,12 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 					return false;
 				}
 				bool inBlock = v >= base && v + f[q].count <= base + k;
-				if (entry && moveRead && (webEntry[i] & 1) && !(v == base && f[q].count == k)) {
+				// Starting values may reach multi-register reads inside the block only: the slots of an image address the
+				// decoder counts as 4 registers (GFX8 doesn't encode how many the texture uses) and the instruction
+				// doesn't use. Not only the whole-block read: once a block has grown (Sonoma: three blur shaders, 0x203,
+				// image_sample addresses v0..v1 and v2..v3 counted as v0..v3 and v2..v5), its original reads cover part
+				// of it.
+				if (entry && moveRead && (webEntry[i] & 1) && !(f[q].count > 1 && inBlock)) {
 					fail = member | 3;  // the starting value is read outside the block reads: not an unused slot
 					return false;
 				}
@@ -7199,7 +7204,8 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 			// Move the whole block to fresh registers above everything the shader uses (raising the allocation if
 			// needed). A multi-register operand that covers a member and registers outside the block (fail code 5;
 			// Monterey: three shaders, 0x305) can't move in part: grow the block over it and plan again, the extra
-			// registers then being members like the others (refused as usual if they can't move).
+			// registers then being members like the others (refused as usual if they can't move), up to 32 registers: the
+			// decoder counts every image address as 4 registers, so overlapping addresses chain (Sonoma: v0..v16).
 			uint32_t F = maxVgpr + 1, need = 0, newAllocated = allocated;
 			// Room for every operand a block move touches: Sonoma's 144 KB lock screen shader failed at 256 (code 7).
 			static RegChange changes[4096];
@@ -7218,7 +7224,7 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 				if (planBlockMove(code, end, at, p2, vI, blockAt, blockBase, blockCount, F, changes, changeNum,
 						arrsize(changes), blockFail))
 					break;
-				if ((blockFail & 0xFF) == 5 && grow < 4 && blockGrowEnd - blockGrowBase <= 16 &&
+				if ((blockFail & 0xFF) == 5 && grow < 32 && blockGrowEnd - blockGrowBase <= 32 &&
 					(blockGrowBase != blockBase || blockGrowEnd != blockBase + blockCount)) {
 					blockBase = blockGrowBase;
 					blockCount = blockGrowEnd - blockGrowBase;
