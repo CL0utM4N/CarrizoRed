@@ -6405,7 +6405,7 @@ static void reportPixelShaders(uint32_t vmid, const uint64_t *addrs, uint32_t co
 struct InterpFixStats {
 	uint32_t scans, shaders, hazards, fixed, skipped, lastSkip, writes, writeFails, deadRegs, bumps;
 	uint32_t lastSkipWhy, lastLoopTarget, lastShaderLen, lastHazardAt, lastUnknownWord, lastUnknownAt;
-	uint32_t probeReverts, blockMoves, lastBlockFail, revertMoved;
+	uint32_t probeReverts, blockMoves, lastBlockFail, revertMoved, blockGrows;
 };
 static InterpFixStats interpFix;
 
@@ -6692,6 +6692,9 @@ static uint8_t webKind[MaxShaderDwords], webDef[MaxShaderDwords], webIn[MaxShade
 	webEntry[MaxShaderDwords];
 static uint32_t webStack[MaxShaderDwords + MaxShaderDwords / 4];
 
+// With fail code 5: the registers [blockGrowBase, blockGrowEnd) the block and that operand cover together.
+static uint32_t blockGrowBase, blockGrowEnd;
+
 static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint32_t p2, uint32_t vI, uint32_t blockAt,
 	uint32_t base, uint32_t k, uint32_t F, RegChange *out, uint32_t &outNum, uint32_t outMax, uint32_t &fail) {
 	VgprField f[8];
@@ -6917,6 +6920,9 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 					return false;
 				}
 				if (f[q].count > 1 && !inBlock) {
+					// The caller can grow the block to cover this operand and plan again.
+					blockGrowBase = v < base ? v : base;
+					blockGrowEnd = v + f[q].count > base + k ? v + f[q].count : base + k;
 					fail = member | 5;  // a register range reaching outside the block
 					return false;
 				}
@@ -7191,23 +7197,34 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 		}
 		if (blockCount) {
 			// Move the whole block to fresh registers above everything the shader uses (raising the allocation if
-			// needed).
-			uint32_t F = maxVgpr + 1;
-			uint32_t need = F + blockCount;
-			uint32_t newAllocated = allocated;
-			if (need > allocated) {
-				if (!allowBump || need > 256) {
-					interpFix.lastSkipWhy = 6;
-					skip = SkipRange;
-					return fixedHere;
-				}
-				newAllocated = (need + 3) & ~3U;
-			}
+			// needed). A multi-register operand that covers a member and registers outside the block (fail code 5;
+			// Monterey: three shaders, 0x305) can't move in part: grow the block over it and plan again, the extra
+			// registers then being members like the others (refused as usual if they can't move).
+			uint32_t F = maxVgpr + 1, need = 0, newAllocated = allocated;
 			// Room for every operand a block move touches: Sonoma's 144 KB lock screen shader failed at 256 (code 7).
 			static RegChange changes[4096];
 			uint32_t changeNum = 0, blockFail = 0;
-			if (!planBlockMove(code, end, at, p2, vI, blockAt, blockBase, blockCount, F, changes, changeNum,
-					arrsize(changes), blockFail)) {
+			for (uint32_t grow = 0;; grow++) {
+				need = F + blockCount;
+				newAllocated = allocated;
+				if (need > allocated) {
+					if (!allowBump || need > 256) {
+						interpFix.lastSkipWhy = 6;
+						skip = SkipRange;
+						return fixedHere;
+					}
+					newAllocated = (need + 3) & ~3U;
+				}
+				if (planBlockMove(code, end, at, p2, vI, blockAt, blockBase, blockCount, F, changes, changeNum,
+						arrsize(changes), blockFail))
+					break;
+				if ((blockFail & 0xFF) == 5 && grow < 4 && blockGrowEnd - blockGrowBase <= 16 &&
+					(blockGrowBase != blockBase || blockGrowEnd != blockBase + blockCount)) {
+					blockBase = blockGrowBase;
+					blockCount = blockGrowEnd - blockGrowBase;
+					interpFix.blockGrows++;
+					continue;
+				}
 				interpFix.lastBlockFail = blockFail;
 				interpFix.lastSkipWhy = 7;  // see planBlockMove's fail codes
 				skip = SkipRange;
@@ -7557,6 +7574,22 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 					psVa, i, code[i], code[i + 1], code[i + 2], code[i + 3], code[i + 4], code[i + 5], code[i + 6],
 					code[i + 7], code[i + 8], code[i + 9], code[i + 10], code[i + 11], code[i + 12], code[i + 13],
 					code[i + 14], code[i + 15]);
+		}
+		// A block move refused (Monterey: three shaders, fail 0x305 before blocks could grow): the original code, for the
+		// offline fixer harness. Up to 3 shaders and 1024 dwords each.
+		static uint32_t blockDumped;
+		if (!listed && skip == SkipRange && interpFix.lastSkipWhy == 7 && blockDumped < 3) {
+			blockDumped++;
+			diskLogEvent("block refused: ps %llx %u dw, hazard at %u, fail %x", psVa, have, interpFix.lastHazardAt,
+				interpFix.lastBlockFail);
+			for (uint32_t i = 0; i < have && i < 1024; i += 16) {
+				uint32_t w[16] {};
+				for (uint32_t q = 0; q < 16 && i + q < have; q++)
+					w[q] = original[i + q];
+				diskLogEvent("block refused %llx +%u: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x "
+					"%08x %08x", psVa, i, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12],
+					w[13], w[14], w[15]);
+			}
 		}
 		if (!listed && skippedNum < arrsize(skippedShaders))
 			skippedShaders[skippedNum++] = {psVa, have,
@@ -8773,11 +8806,11 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 	for (auto &patch : pagePatches)
 		add(" %s %s%u", patch.name, patch.enabled ? "" : "off ", patch.hits);
 	add("\n");
-	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u (moved %u) block-moves %u; source fixes %u copies %u dwords %u mismatched %u too long %u unreadable; binds %u memo %u walks %u; ib-read ms %llu ps-check ms %llu ib-dw %llu pages snooped %u plain %u vram %u\n",
+	add("interp fix: scans %u, shaders %u, hazards %u, fixed %u, skipped %u (last %u), writes %u, failed %u, dead-register fixes %u, raised %u; hook %d calls %u ibs %u rsrc %u vmid %u flags %x ms %llu busy %u nomap %u raise-only %u raised-shaders %u reverts %u (moved %u) block-moves %u (grown %u); source fixes %u copies %u dwords %u mismatched %u too long %u unreadable; binds %u memo %u walks %u; ib-read ms %llu ps-check ms %llu ib-dw %llu pages snooped %u plain %u vram %u\n",
 		interpFix.scans, interpFix.shaders, interpFix.hazards, interpFix.fixed, interpFix.skipped, interpFix.lastSkip,
 		interpFix.writes, interpFix.writeFails, interpFix.deadRegs, interpFix.bumps, interpHooked, ibHookCalls, ibHookIbs,
 		ibHookRsrcBumps, ibHookLastVmid, ibHookLastFlags, ibHookNs / 1000000, ibHookBusy, ibHookNoMap, ibHookRaiseOnly,
-		raisedNum, interpFix.probeReverts, interpFix.revertMoved, interpFix.blockMoves, srcFixCopies, srcFixDwords, srcFixMismatch, srcFixOverflow, srcFixReadFail, ibHookBinds, ibHookMemoHits, vmWalks,
+		raisedNum, interpFix.probeReverts, interpFix.revertMoved, interpFix.blockMoves, interpFix.blockGrows, srcFixCopies, srcFixDwords, srcFixMismatch, srcFixOverflow, srcFixReadFail, ibHookBinds, ibHookMemoHits, vmWalks,
 		absToMs(ibReadTime), absToMs(psCheckTime), ibDwordsRead, ibPagesSnooped, ibPagesPlain, ibPagesVram);
 	// The clock samples (sampleGpuClock); "window": the SMU firmware version read through window 13 and window 0,
 	// which must match for the samples to mean anything.
