@@ -621,7 +621,9 @@ static const char *pathFramebuffer[] {"/System/Library/Extensions/AMDFramebuffer
 static const char *pathAgpm[] {
 	"/System/Library/Extensions/AppleGraphicsPowerManagement.kext/Contents/MacOS/AppleGraphicsPowerManagement"};
 static const char *pathAgdp[] {"/System/Library/Extensions/AppleGraphicsControl.kext/Contents/PlugIns/AppleGraphicsDevicePolicy.kext/Contents/MacOS/AppleGraphicsDevicePolicy"};
-static const char *pathPci[] {"/System/Library/Extensions/IOPCIFamily.kext/Contents/MacOS/IOPCIFamily"};
+// Catalina's IOPCIFamily still has the flat bundle layout.
+static const char *pathPci[] {"/System/Library/Extensions/IOPCIFamily.kext/Contents/MacOS/IOPCIFamily",
+	"/System/Library/Extensions/IOPCIFamily.kext/IOPCIFamily"};
 
 enum KextIndex : size_t {
 	KextRadeonX4000,

@@ -46,6 +46,7 @@ scales with load (400 MHz idle, up to the chip's top level).
 | Monterey 12 | **In testing** (12.7.6). Display works. Acceleration: HWLibs functions matched by their constants (41 of 46) from the installed system's kexts (no Monterey KDK exists), the hardware capability fields at Monterey's offsets, safety checks accept its register allocation, Metal patches at its offsets. Needs the xHCI reset patch's `Limit` at 2048 for USB 3 (see FCHXHCIFix) |
 | Tahoe 26 | Allowed, untested |
 | Big Sur 11 | **In testing** (11.7.11). Its HWLibs keeps its symbols, so every hook is found by name; the accelerator and command-buffer layouts differ (capability fields as Monterey, submission info, a vtable slot) and the Metal patches sit at Big Sur's offsets. Read from the installed system's kernel collection and dyld cache |
+| Catalina 10.15 | **Porting** (10.15.7). Allowed to load for the display only (`-crnoaccel`). HWLibs keeps its symbols (Polaris loads `AMDRadeonX4000HWLibs` unless the subsystem is Apple's); the Metal driver is a separate bundle rather than in the dyld cache, and the kernel has `cs_validate_range` instead of `cs_validate_page`, so the Metal patches need a different hook. The xHCI reset patch matches (`MinKernel` 19.0.0) |
 
 Each version's Metal shader-compiler patches are matched against that version's own dyld shared cache.
 
@@ -128,7 +129,7 @@ Older GCN 2 APUs (Kaveri, Kabini, Beema/Mullins) may follow later. Sequoia still
 complete GPU firmware for them, but no display or GCN 2 accelerator driver; see
 [docs/OLDER_APUS.md](docs/OLDER_APUS.md).
 
-**macOS:** Ventura, Sonoma and Sequoia work, Big Sur and Monterey are in testing (see *macOS versions* above); Big Sur through Tahoe are allowed to load.
+**macOS:** Ventura, Sonoma and Sequoia work, Big Sur and Monterey are in testing (see *macOS versions* above); Catalina through Tahoe are allowed to load (Catalina for the display only, while it is ported).
 Excavator CPUs have AVX2, so Ventura and later run without CPU hacks (AMD_Vanilla patches are still needed).
 
 **Why this family:** macOS never had drivers for these APUs, and removed its GCN 1–3 dGPU drivers in Ventura, but it
