@@ -2427,6 +2427,12 @@ namespace {
 		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator17newDisplayMachineEv", "accel.newDisplayMachine", InAccel, true, true, 0},
 		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator13newStatisticsEv", "accel.newStatistics", InAccel, true, true, 0},
 		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator19createAccelChannelsEv", "accel.createAccelChannels", InAccel, true, true, 0},
+		// Catalina installer: createAccelChannels never returned. Per hardware channel it creates an AMDAccelChannel
+		// (argument: low byte of the hardware channel, then its index) whose init adds a software scheduler queue.
+		{"__ZN30AMDRadeonX4000_AMDAccelChannel4initEP22IOGraphicsAccelerator2P28AMDRadeonX4000_IAMDHWChanneljPKc11SS_PRIORITY",
+			"chan.init", InAccel, true, true, 0, 4},
+		{"__ZN29AMDRadeonX4000_AMDSWScheduler10addSWQueueEm11SS_PRIORITYPVjmPKc", "sched.addSWQueue", InAccel, false, false, 0, 1},
+		{"__ZN29AMDRadeonX4000_AMDSWScheduler10addSWQueueEPVjmPKc", "sched.addSWQueue2", InAccel, false, false, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware4initEP11IOPCIDeviceP28AMDRadeonX4000_IAMDHWHandlerRjP16_GART_PARAMETERSP14_FB_PARAMETERS", "hw.init", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware8initCAILEv", "hw.initCAIL", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware9setupCAILEv", "hw.setupCAIL", InAccel, true, true, 0},
@@ -2645,7 +2651,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 177, "one wrapper per stage");
+		static_assert(arrsize(stages) == 180, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -2670,6 +2676,7 @@ namespace {
 			CR_WRAP(153), CR_WRAP(154), CR_WRAP(155), CR_WRAP(156), CR_WRAP(157), CR_WRAP(158), CR_WRAP(159), CR_WRAP(160),
 			CR_WRAP(161), CR_WRAP(162), CR_WRAP(163), CR_WRAP(164), CR_WRAP(165), CR_WRAP(166), CR_WRAP(167), CR_WRAP(168),
 			CR_WRAP(169), CR_WRAP(170), CR_WRAP(171), CR_WRAP(172), CR_WRAP(173), CR_WRAP(174), CR_WRAP(175), CR_WRAP(176),
+			CR_WRAP(177), CR_WRAP(178), CR_WRAP(179),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
