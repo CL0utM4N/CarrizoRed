@@ -57,42 +57,42 @@ static uint32_t hwsigResolved, hwsigMissed;
 static mach_vm_address_t hwlibsTextStart;  // HWLibs' __TEXT_EXEC (found when it loads)
 static uint64_t hwlibsTextSize;
 
+// All of this version's signatures are resolved together, on the first lookup for a load, while HWLibs is still
+// unpatched: a signature can run past its function into the next one (Monterey's 128-byte Stoney_EnableCpPowerGating
+// signature covers the start of Stoney_UpdateGfxPowerGating, 0x44 bytes on), and a route written there first broke the
+// match (hwsig 35/2 on the first Monterey boot).
 static mach_vm_address_t hwsigFind(const char *symbol, mach_vm_address_t start, size_t size) {
 	static mach_vm_address_t found[arrsize(hwlibsSignatures)];
 	static mach_vm_address_t foundStart;
-	if (foundStart != start) {
-		memset(found, 0, sizeof(found));
-		foundStart = start;
-	}
 	// Only HWLibs' executable segment, which must lie in the kext being patched.
 	if (!hwlibsTextStart || hwlibsTextStart < start || hwlibsTextStart + hwlibsTextSize > start + size)
 		return 0;
-	bool tried = false;
-	for (size_t s = 0; s < arrsize(hwlibsSignatures); s++) {
-		auto &sig = hwlibsSignatures[s];
-		// Only the entries checked against this macOS version (an occurrence-th match is build specific).
-		if (strcmp(sig.symbol, symbol) || sig.darwin != static_cast<uint32_t>(getKernelVersion()))
-			continue;
-		tried = true;
-		if (found[s])
-			return found[s];
-		mach_vm_address_t textStart = hwlibsTextStart;
-		size = hwlibsTextSize;
-		auto *base = reinterpret_cast<const uint8_t *>(textStart);
-		uint32_t seen = 0;
-		for (size_t i = 0; i + sig.size <= size; i++) {
-			size_t k = 0;
-			while (k < sig.size && (base[i + k] & sig.mask[k]) == (sig.pattern[k] & sig.mask[k]))
-				k++;
-			if (k == sig.size && seen++ == sig.occurrence) {
-				found[s] = textStart + i;
-				hwsigResolved++;
-				return found[s];
+	if (foundStart != start) {
+		memset(found, 0, sizeof(found));
+		foundStart = start;
+		auto *base = reinterpret_cast<const uint8_t *>(hwlibsTextStart);
+		for (size_t s = 0; s < arrsize(hwlibsSignatures); s++) {
+			auto &sig = hwlibsSignatures[s];
+			// Only the entries checked against this macOS version (an occurrence-th match is build specific).
+			if (sig.darwin != static_cast<uint32_t>(getKernelVersion()))
+				continue;
+			uint32_t seen = 0;
+			for (size_t i = 0; !found[s] && i + sig.size <= hwlibsTextSize; i++) {
+				size_t k = 0;
+				while (k < sig.size && (base[i + k] & sig.mask[k]) == (sig.pattern[k] & sig.mask[k]))
+					k++;
+				if (k == sig.size && seen++ == sig.occurrence)
+					found[s] = hwlibsTextStart + i;
 			}
+			if (found[s])
+				hwsigResolved++;
+			else
+				hwsigMissed++;
 		}
 	}
-	if (tried)
-		hwsigMissed++;
+	for (size_t s = 0; s < arrsize(hwlibsSignatures); s++)
+		if (found[s] && !strcmp(hwlibsSignatures[s].symbol, symbol))
+			return found[s];
 	return 0;
 }
 
