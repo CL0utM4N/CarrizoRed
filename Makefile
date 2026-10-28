@@ -14,6 +14,8 @@ PRODUCT_NAME   := CarrizoRed
 MODULE_NAME    := com.carrizored.$(PRODUCT_NAME)
 MODULE_VERSION := 0.0.1
 MIN_MACOS      := 11.0
+# The commit, in the disk log header (which build wrote a log).
+GIT_COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
 SRC_DIR  := $(PRODUCT_NAME)
 KSDK     := MacKernelSDK
@@ -42,7 +44,8 @@ DEFINES := \
 	-DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
 	-DPRODUCT_NAME=$(PRODUCT_NAME) \
 	-DMODULE_VERSION=$(MODULE_VERSION) \
-	-DMODULE_NAME=$(MODULE_NAME)
+	-DMODULE_NAME=$(MODULE_NAME) \
+	-DCR_COMMIT=$(GIT_COMMIT)
 
 # Mirrors the flags acidanthera's Lilu plugins use in their Xcode projects.
 COMMON_FLAGS := $(TARGET) $(OPTFLAGS) $(DEFINES) \

@@ -1634,6 +1634,92 @@ static void censusLog();
 static const char *sclkDpmState();
 
 // Every second from the watcher. stallTicks: the GPU stall detector's count (0.5 s ticks with the GFX ring stuck).
+#ifndef CR_COMMIT
+#define CR_COMMIT unknown
+#endif
+#ifdef DEBUG
+#define CR_BUILD_KIND "debug"
+#else
+#define CR_BUILD_KIND "release"
+#endif
+
+// CPU clock (AMD family 15h: the Excavator cores of Stoney, Bristol Ridge and Carrizo). Sonoma and later feel slow on
+// these two-core APUs while the GPU idles at its lowest level; whether the cores ever leave their base clock for boost
+// isn't known (neither macOS nor the usual AMD CPU kexts manage family 15h P-states). Once, into the disk log: the
+// P-state table (MSRC001_0064..6B: CpuFid [5:0], CpuDid [8:6], frequency 100 MHz * (CpuFid + 0x10) >> CpuDid, enabled
+// bit 63), the P-state limit (MSRC001_0061: CurPstateLimit [2:0], PstateMaxVal [6:4]) and boost (HWCR MSRC001_0015
+// bit 25, CpbDis). Every status line: the core's current P-state (MSRC001_0063) and its clock while busy: APERF (MSR
+// 0xE8, counting at the core clock) over a 200 us spin with interrupts off. BKDG for AMD Family 15h Models 70h-7Fh.
+static struct {
+	bool checked, pstates, aperf;
+} cpuInfo;
+
+static uint64_t cpuRdmsr(uint32_t msr) {
+	uint32_t lo, hi;
+	asm volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+	return static_cast<uint64_t>(hi) << 32 | lo;
+}
+
+static void cpuCheck() {
+	if (cpuInfo.checked)
+		return;
+	cpuInfo.checked = true;
+	uint32_t a = 0, b, c, d;
+	asm volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+	bool amd = b == 0x68747541 && d == 0x69746E65 && c == 0x444D4163;  // "AuthenticAMD"
+	uint32_t maxLeaf = a;
+	a = 1;
+	c = 0;
+	asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+	uint32_t family = ((a >> 8) & 0xF) + (((a >> 8) & 0xF) == 0xF ? ((a >> 20) & 0xFF) : 0);
+	cpuInfo.pstates = amd && family == 0x15;
+	if (maxLeaf >= 6) {
+		a = 6;
+		c = 0;
+		asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+		cpuInfo.aperf = cpuInfo.pstates && (c & 1);  // APERF/MPERF
+	}
+	if (!cpuInfo.pstates) {
+		diskLogEvent("cpu: not AMD family 15h (family %x), no P-state readings", family);
+		return;
+	}
+	char table[200];
+	size_t len = 0;
+	for (uint32_t p = 0; p < 8; p++) {
+		uint64_t def = cpuRdmsr(0xC0010064 + p);
+		if (!(def >> 63))
+			continue;
+		uint32_t mhz = (100 * ((def & 0x3F) + 0x10)) >> ((def >> 6) & 7);
+		int n = snprintf(table + len, sizeof(table) - len, " P%u %u MHz (vid %x)", p, mhz,
+			static_cast<uint32_t>((def >> 9) & 0x7F));
+		if (n > 0 && static_cast<size_t>(n) < sizeof(table) - len)
+			len += static_cast<size_t>(n);
+	}
+	table[len] = '\0';
+	uint64_t limit = cpuRdmsr(0xC0010061), hwcr = cpuRdmsr(0xC0010015);
+	diskLogEvent("cpu: P-states%s; limit P%u, lowest P%u; boost %s (HWCR %llx); busy-clock sampling %s", table,
+		static_cast<uint32_t>(limit & 7), static_cast<uint32_t>((limit >> 4) & 7), (hwcr >> 25) & 1 ? "disabled" : "enabled",
+		hwcr, cpuInfo.aperf ? "on" : "off (no APERF)");
+}
+
+// The calling core's P-state and its clock in MHz while kept busy for 200 us (0 if it can't be measured).
+static uint32_t cpuBusyMhz(uint32_t &pstate) {
+	pstate = cpuInfo.pstates ? static_cast<uint32_t>(cpuRdmsr(0xC0010063) & 7) : 0xFF;
+	if (!cpuInfo.aperf)
+		return 0;
+	uint64_t flags;
+	asm volatile("pushfq; popq %0; cli" : "=r"(flags)::"memory");
+	uint64_t start = mach_absolute_time(), aperf0 = cpuRdmsr(0xE8), now = start, ns = 0;
+	while (ns < 200000) {
+		now = mach_absolute_time();
+		absolutetime_to_nanoseconds(now - start, &ns);
+	}
+	uint64_t aperf1 = cpuRdmsr(0xE8);
+	if (flags & 0x200)
+		asm volatile("sti" ::: "memory");
+	return ns ? static_cast<uint32_t>((aperf1 - aperf0) * 1000 / ns) : 0;
+}
+
 static void diskLogTick(uint32_t t, uint32_t stallTicks) {
 	static uint64_t lastMs;
 	if (diskLogOff)
@@ -1655,9 +1741,12 @@ static void diskLogTick(uint32_t t, uint32_t stallTicks) {
 			len += static_cast<size_t>(n) < sizeof(line) - len ? static_cast<size_t>(n) : sizeof(line) - len - 1;
 	};
 	if (!diskLogStarted) {
-		add("CarrizoRed disk log; boot-args: %s\ncolumns: t ms | sclk cur/tgt level (profile) | vid gfx/nb | "
-			"temp C | GRBM_STATUS GRBM_STATUS2 CP_STAT | gfx rptr/wptr | sdma0 rptr/wptr | ih rptr/wptr | flips perf/irq | "
-			"submits fixed | smu msg/resp/arg | stall | dpm | ih calls/false alarms/broken\n", PE_boot_args());
+		add("CarrizoRed disk log; build %s (%s, " xStringify(MODULE_VERSION) "); boot-args: %s\ncolumns: t ms | sclk cur/tgt "
+			"level (profile) | vid gfx/nb | temp C | GRBM_STATUS GRBM_STATUS2 CP_STAT | gfx rptr/wptr | sdma0 rptr/wptr | "
+			"ih rptr/wptr | flips perf/irq | submits fixed | smu msg/resp/arg | stall | dpm | ih calls/false alarms/broken "
+			"[| uvd ... vce ...] | cpu P-state, clock while busy\n", xStringify(CR_COMMIT), CR_BUILD_KIND,
+			PE_boot_args());
+		cpuCheck();
 	}
 	auto *mmio = gpuMmio;
 	if (mmio && smuLoadOk()) {
@@ -1684,6 +1773,12 @@ static void diskLogTick(uint32_t t, uint32_t stallTicks) {
 		}
 	} else {
 		add("%llu | t=%u, GPU not up yet\n", ms, t);
+	}
+	if (cpuInfo.pstates) {
+		uint32_t pstate = 0, mhz = cpuBusyMhz(pstate);
+		if (len)
+			len--;  // drop the newline, append to the same line
+		add(" | cpu P%u %u MHz\n", pstate, mhz);
 	}
 	// Queued events go in first (they happened before this sample).
 	static char events[sizeof(diskLogEvents)];
