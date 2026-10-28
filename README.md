@@ -45,6 +45,7 @@ scales with load (400 MHz idle, up to the chip's top level).
 | Ventura 13 | **Works.** HWLibs is stripped and compiled differently: functions matched by the constants they use (45 of 46), safety checks accept Ventura's register allocation, Metal patches at Ventura's offsets |
 | Monterey 12 | **In testing** (12.7.6). Display works. Acceleration: HWLibs functions matched by their constants (41 of 46) from the installed system's kexts (no Monterey KDK exists), the hardware capability fields at Monterey's offsets, safety checks accept its register allocation, Metal patches at its offsets. Needs the xHCI reset patch's `Limit` at 2048 for USB 3 (see FCHXHCIFix) |
 | Tahoe 26 | Allowed, untested |
+| Big Sur 11 | Allowed to load (display only expected until it is ported like Monterey: boot with `-crnoaccel`) |
 
 Each version's Metal shader-compiler patches are matched against that version's own dyld shared cache.
 
@@ -127,7 +128,7 @@ Older GCN 2 APUs (Kaveri, Kabini, Beema/Mullins) may follow later. Sequoia still
 complete GPU firmware for them, but no display or GCN 2 accelerator driver; see
 [docs/OLDER_APUS.md](docs/OLDER_APUS.md).
 
-**macOS:** Ventura, Sonoma and Sequoia work (see *macOS versions* above); Monterey through Tahoe are allowed to load.
+**macOS:** Ventura, Sonoma and Sequoia work, Monterey is in testing (see *macOS versions* above); Big Sur through Tahoe are allowed to load.
 Excavator CPUs have AVX2, so Ventura and later run without CPU hacks (AMD_Vanilla patches are still needed).
 
 **Why this family:** macOS never had drivers for these APUs, and removed its GCN 1–3 dGPU drivers in Ventura, but it

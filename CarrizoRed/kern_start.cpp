@@ -24,7 +24,7 @@ PluginConfiguration ADDPR(config) {
 	arrsize(bootargDebug),
 	bootargBeta,
 	arrsize(bootargBeta),
-	KernelVersion::Monterey,
+	KernelVersion::BigSur,
 	KernelVersion::Tahoe,
 	[]() { cr.init(); },
 };
