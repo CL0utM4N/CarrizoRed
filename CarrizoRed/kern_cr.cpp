@@ -726,6 +726,20 @@ static const uint8_t dccMontereyFind[] {
 	0xF6, 0x45, 0xD4, 0x01, 0x48, 0x8B, 0x5D, 0x90, 0x0F, 0x84, 0x94, 0x00, 0x00, 0x00, 0x48, 0x8D, 0xB5, 0xA0, 0xFE, 0xFF,
 	0xFF,
 };
+// Big Sur (11.7.11 20G1443, one cache file): SCGetInstructionSet with 32-bit branches, the small-prim mask in edx
+// (chip record +0xC4), Monterey's walk-fence bytes, and the DCC test as in 15.8.1 with a mov less before the je. Each
+// pattern occurs once in that cache.
+static const uint8_t isaBigSurFind[] {
+	0x83, 0xE2, 0xFE, 0xB8, 0x0D, 0x00, 0x00, 0x00, 0x81, 0xFA, 0xA0, 0x67, 0x00, 0x00, 0x0F, 0x84, 0x0F, 0x01, 0x00, 0x00,
+	0xB8, 0x0C, 0x00, 0x00, 0x00, 0x5D, 0xC3, 0x83, 0xC6, 0xEC, 0xB8, 0x0E, 0x00, 0x00, 0x00, 0x83, 0xFE, 0x13, 0x0F, 0x87,
+	0xF7, 0x00, 0x00, 0x00, 0x81, 0xC2, 0xD7, 0x96, 0xFF, 0xFF, 0x83, 0xFA, 0x07, 0x0F, 0x83, 0xE8, 0x00, 0x00, 0x00,
+};
+static const uint8_t smallPrimBigSurFind[] {
+	0x8B, 0x96, 0xC4, 0x00, 0x00, 0x00, 0xC1, 0xE2, 0x0A, 0xC1, 0xFA, 0x1F, 0x83, 0xE2, 0x05, 0x89, 0x57, 0x38,
+};
+static const uint8_t dccBigSurFind[] {
+	0xF6, 0x45, 0xD4, 0x01, 0x0F, 0x84, 0x8F, 0x00, 0x00, 0x00, 0x0F, 0x57, 0xC0, 0x48, 0x8D, 0xB5, 0x50, 0xFE, 0xFF, 0xFF,
+};
 static const uint8_t isaReplace[] {0x1E}, smallPrimReplace[] {0x00}, walkFenceReplace[] {0xA8}, dccReplace[] {0x90, 0xE9},
 	dccVenturaReplace[] {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00};
 struct PagePatch {
@@ -767,6 +781,12 @@ static PagePatch pagePatches[] {
 	{"walkfence12", "-crnowalkfence", false, 0x1BB, walkFenceMontereyFind, sizeof(walkFenceMontereyFind), 6,
 		walkFenceReplace, sizeof(walkFenceReplace)},
 	{"dcc12", "-crdcc", false, 0x50E, dccMontereyFind, sizeof(dccMontereyFind), 8, dccReplace, sizeof(dccReplace)},
+	{"isa11", "-crnoscpatch", false, 0x4AD, isaBigSurFind, sizeof(isaBigSurFind), 0x1F, isaReplace, sizeof(isaReplace)},
+	{"smallprim11", "-crnosmallprim", false, 0x93F, smallPrimBigSurFind, sizeof(smallPrimBigSurFind), 14,
+		smallPrimReplace, sizeof(smallPrimReplace)},
+	{"walkfence11", "-crnowalkfence", false, 0xB8F, walkFenceMontereyFind, sizeof(walkFenceMontereyFind), 6,
+		walkFenceReplace, sizeof(walkFenceReplace)},
+	{"dcc11", "-crdcc", false, 0xF4F, dccBigSurFind, sizeof(dccBigSurFind), 4, dccReplace, sizeof(dccReplace)},
 };
 static mach_vm_address_t orgCsValidatePage;
 static bool scPatchHooked;
@@ -2604,6 +2624,13 @@ void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_add
 // the 15.4 recovery) and stays off if they differ.
 static bool accelSdma1Dropped, accelCapsFixed, vmFixOn, vmFixReady;
 static bool capsMonterey;  // AMDHardware's capability fields 8 bytes earlier (see the caps fix route)
+// AMD_SUBMIT_COMMAND_BUFFER_INFO (the PM4 and sDMA commit hooks): +0 flags, +4 VMID, then the command buffer count and
+// the entries, 0x28 bytes each (dwords at +0, GPU address at +0xC). Monterey and later: count at +0xC, entries from
+// +0x44; Big Sur: count at +0x8, entries from +0x3C (both commitIndirectCommandBuffer versions read them there).
+static uint32_t submitCountOff = 0xC, submitEntriesOff = 0x44;
+// The vtable slot of the info object's state getter AMDHardware::startHWEngines calls (and wrapStartHWEngines): 0x178,
+// Big Sur 0x170.
+static uint32_t hwStateSlot = 0x178;
 static void *accelHardware;  // AMDBaffinHardware, from allocateHWEngines (for the black box's ring dump)
 
 // The GPU at the first AMDHardware::resetHardware, before Apple's reset changes it: GRBM/SRBM status, CP status and
@@ -2771,6 +2798,10 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		// twice. It reads through the carve-out mapping and the kernel physmap only. -crnointerpsubmit disables it
 		// (the once-a-second scan then does the fixing, without raises).
 		interpSubmit = !checkKernelArgument("-crnointerpsubmit");
+		if (getKernelVersion() == KernelVersion::BigSur) {
+			submitCountOff = 0x8;
+			submitEntriesOff = 0x3C;
+		}
 		interpHooked = interpLock && interpSubmit && route("__ZN30AMDRadeonX4000_AMDVIPM4Channel27commitIndirectCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
 			reinterpret_cast<mach_vm_address_t>(wrapCommitIb), orgCommitIb, nullptr, 0, "commitIndirectCommandBuffer");
 		if (interpLock && interpSubmit)
@@ -2786,14 +2817,21 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 
 	if (family == ChipFamily::Stoney && !checkKernelArgument("-crnosdmafix")) {
 		// Each "a|b": Sequoia/Sonoma's encoding, then Ventura's, then Monterey's (other registers, same offsets).
-		static const char *const allocChecks[] {"4c89b3b8030000|49899fb8030000", "4c89b3c0030000|49899fc0030000", nullptr};
+		// Big Sur: r14 in allocateHWEngines, the state getter at vtable 0x170 and a 32-bit store of its word.
+		static const char *const allocChecks[] {"4c89b3b8030000|49899fb8030000|49899eb8030000",
+			"4c89b3c0030000|49899fc0030000|49899ec0030000", nullptr};
 		static const char *const startChecks[] {"4a8bbcf3b8030000|498bbcdfb8030000|498bbcdeb8030000", "ff9048010000",
 			"488b7b18|498b7f18|498b7e18", "ff9078010000", "66895008|66897008", nullptr};
+		static const char *const startChecksBigSur[] {"498bbcdeb8030000", "ff9048010000", "498b7e18", "ff9070010000",
+			"897008", nullptr};
+		bool bigSur = getKernelVersion() == KernelVersion::BigSur;
+		hwStateSlot = bigSur ? 0x170 : 0x178;
 		if (route("__ZN32AMDRadeonX4000_AMDBaffinHardware17allocateHWEnginesEv",
 				reinterpret_cast<mach_vm_address_t>(wrapAllocateHWEngines), orgAllocateHWEngines, allocChecks, 0x100,
 				"allocateHWEngines")) {
 			route("__ZN26AMDRadeonX4000_AMDHardware14startHWEnginesEv",
-				reinterpret_cast<mach_vm_address_t>(wrapStartHWEngines), orgStartHWEngines, startChecks, 0xA0,
+				reinterpret_cast<mach_vm_address_t>(wrapStartHWEngines), orgStartHWEngines,
+				bigSur ? startChecksBigSur : startChecks, 0xA0,
 				"startHWEngines");
 		}
 		static const char *const powerUpChecks[] {"4b8bbcfeb0030000|498bbcdeb0030000", nullptr};
@@ -2863,7 +2901,7 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		// active CUs AMDVIHardware's setupAndInitializeHWCapabilities stores 0x9C).
 		static const char *const capsChecksMonterey[] {"c7475c02000000", "c7476401000000", "c7879800000008000000",
 			nullptr};
-		capsMonterey = getKernelVersion() == KernelVersion::Monterey;
+		capsMonterey = getKernelVersion() <= KernelVersion::Monterey;  // and Big Sur
 		route("__ZN32AMDRadeonX4000_AMDBaffinHardware32setupAndInitializeHWCapabilitiesEv",
 			reinterpret_cast<mach_vm_address_t>(wrapSetupHWCapabilities), orgSetupHWCapabilities,
 			capsMonterey ? capsChecksMonterey : capsChecks, 0x30, "setupAndInitializeHWCapabilities");
@@ -3078,7 +3116,7 @@ bool CRDriver::wrapStartHWEngines(void *that) {
 	void *sdma0 = *reinterpret_cast<void **>(self + 0x3B8);
 	bool ok = sdma0 && vfunc<bool (*)(void *)>(sdma0, 0x148)(sdma0);
 	void *info = *reinterpret_cast<void **>(self + 0x18);
-	auto *state = vfunc<uint8_t *(*)(void *)>(info, 0x178)(info);
+	auto *state = vfunc<uint8_t *(*)(void *)>(info, hwStateSlot)(info);
 	uint32_t word = *reinterpret_cast<uint32_t *>(state + 8);
 	*reinterpret_cast<uint16_t *>(state + 8) = static_cast<uint16_t>((word & 0xFFFFFDFF) | (ok ? 0x200 : 0));
 	accelStartPatched++;
@@ -8407,7 +8445,7 @@ static void startInterpFix() {
 static void interpHookBody(uint8_t *info) {
 	if (info && interpLock && !interpFixOff && gpuMmio) {
 		uint32_t flags = *reinterpret_cast<uint32_t *>(info), vmid = *reinterpret_cast<uint32_t *>(info + 4);
-		uint32_t count = *reinterpret_cast<uint32_t *>(info + 0xC);
+		uint32_t count = *reinterpret_cast<uint32_t *>(info + submitCountOff);
 		ibHookCalls++;
 		ibHookLastVmid = vmid;
 		ibHookLastFlags = flags;
@@ -8423,8 +8461,8 @@ static void interpHookBody(uint8_t *info) {
 			if (!locked) {
 				ibHookBusy++;
 				for (uint32_t i = 0; i < count && i < 8; i++) {
-					uint32_t dw = *reinterpret_cast<uint32_t *>(info + 0x44 + i * 0x28);
-					uint64_t va = *reinterpret_cast<uint64_t *>(info + 0x50 + i * 0x28);
+					uint32_t dw = *reinterpret_cast<uint32_t *>(info + submitEntriesOff + i * 0x28);
+					uint64_t va = *reinterpret_cast<uint64_t *>(info + submitEntriesOff + 0xC + i * 0x28);
 					if (dw && va)
 						raiseOnlyIb(vmid, va, dw);
 				}
@@ -8433,8 +8471,8 @@ static void interpHookBody(uint8_t *info) {
 			}
 			vmCacheBegin();
 			for (uint32_t i = 0; i < count && i < 8; i++) {
-				uint32_t dw = *reinterpret_cast<uint32_t *>(info + 0x44 + i * 0x28);
-				uint64_t va = *reinterpret_cast<uint64_t *>(info + 0x50 + i * 0x28);
+				uint32_t dw = *reinterpret_cast<uint32_t *>(info + submitEntriesOff + i * 0x28);
+				uint64_t va = *reinterpret_cast<uint64_t *>(info + submitEntriesOff + 0xC + i * 0x28);
 				if (dw && va) {
 					ibHookIbs++;
 					processUserIb(vmid, va, dw, interpBump);
@@ -8596,14 +8634,14 @@ static void sdmaWalk(uint32_t vmid, uint64_t va, uint32_t dwords) {
 static uint64_t wrapCommitSdma(void *channel, uint8_t *info) {
 	if (info && interpLock && gpuMmio && __atomic_load_n(&carveMap, __ATOMIC_ACQUIRE)) {
 		uint32_t flags = *reinterpret_cast<uint32_t *>(info), vmid = *reinterpret_cast<uint32_t *>(info + 4);
-		uint32_t count = *reinterpret_cast<uint32_t *>(info + 0xC);
+		uint32_t count = *reinterpret_cast<uint32_t *>(info + submitCountOff);
 		sdmaHookCalls++;
 		if (!(flags & 0x12) && vmid <= 15 && IOLockTryLock(interpLock)) {
 			__atomic_fetch_add(&hookDepth, 1, __ATOMIC_ACQ_REL);
 			vmCacheBegin();
 			for (uint32_t i = 0; i < count && i < 8; i++) {
-				uint32_t dw = *reinterpret_cast<uint32_t *>(info + 0x44 + i * 0x28);
-				uint64_t va = *reinterpret_cast<uint64_t *>(info + 0x50 + i * 0x28);
+				uint32_t dw = *reinterpret_cast<uint32_t *>(info + submitEntriesOff + i * 0x28);
+				uint64_t va = *reinterpret_cast<uint64_t *>(info + submitEntriesOff + 0xC + i * 0x28);
 				if (dw && va && vmid) {
 					sdmaIbs++;
 					sdmaWalk(vmid, va, dw);
