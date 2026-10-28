@@ -706,6 +706,26 @@ static const uint8_t dccSonomaFind[] {
 	0x8B, 0x84, 0x24, 0xB8, 0x00, 0x00, 0x00, 0x3B, 0x03, 0x76, 0x02, 0x89, 0x03, 0x4C, 0x8B, 0x54, 0x24, 0x20, 0xF6, 0x44,
 	0x24, 0x08, 0x01, 0x0F, 0x84, 0x80, 0x01, 0x00, 0x00,
 };
+// Monterey (12.7.6 21H1320, read from the D509BA's cache, all four in .2): the VI branch of SCGetInstructionSet behind a
+// different preceding branch; the small-prim mask reading the chip record at +0xC4 instead of +0xD8, with no xor edx after
+// it; the walk-fence immediate through rax instead of rcx; the DCC test as in 15.8.1 (test byte [rbp - 0x2C], 1, then a
+// mov before the je). Same replacements. Each pattern occurs once in that cache.
+static const uint8_t isaMontereyFind[] {
+	0x83, 0xE6, 0xFE, 0x31, 0xC0, 0x81, 0xFE, 0x80, 0x00, 0x00, 0x00, 0x0F, 0x95, 0xC0, 0x8D, 0x04, 0x40, 0x83, 0xC0, 0x13,
+	0x5D, 0xC3, 0x83, 0xC6, 0xEC, 0xB8, 0x0E, 0x00, 0x00, 0x00, 0x83, 0xFE, 0x13, 0x77, 0x46, 0x81, 0xC2, 0xD7, 0x96, 0xFF,
+	0xFF, 0x83, 0xFA, 0x07, 0x73, 0x3B,
+};
+static const uint8_t smallPrimMontereyFind[] {
+	0x8B, 0x8E, 0xC4, 0x00, 0x00, 0x00, 0xC1, 0xE1, 0x0A, 0xC1, 0xF9, 0x1F, 0x83, 0xE1, 0x05, 0x89, 0x4F, 0x38,
+};
+static const uint8_t walkFenceMontereyFind[] {
+	0x48, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xB8, 0x01, 0x02, 0x06, 0x48, 0x89, 0x87, 0xDC, 0x02, 0x00, 0x00, 0xC7, 0x87,
+	0xE4, 0x02, 0x00, 0x00, 0xE9, 0x01, 0x00, 0x00,
+};
+static const uint8_t dccMontereyFind[] {
+	0xF6, 0x45, 0xD4, 0x01, 0x48, 0x8B, 0x5D, 0x90, 0x0F, 0x84, 0x94, 0x00, 0x00, 0x00, 0x48, 0x8D, 0xB5, 0xA0, 0xFE, 0xFF,
+	0xFF,
+};
 static const uint8_t isaReplace[] {0x1E}, smallPrimReplace[] {0x00}, walkFenceReplace[] {0xA8}, dccReplace[] {0x90, 0xE9},
 	dccVenturaReplace[] {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00};
 struct PagePatch {
@@ -741,6 +761,12 @@ static PagePatch pagePatches[] {
 	{"walkfence14", "-crnowalkfence", false, 0x8F3, walkFenceFind, sizeof(walkFenceFind), 6, walkFenceReplace,
 		sizeof(walkFenceReplace)},
 	{"dcc14", "-crdcc", false, 0x60A, dccSonomaFind, sizeof(dccSonomaFind), 0x17, dccReplace, sizeof(dccReplace)},
+	{"isa12", "-crnoscpatch", false, 0xE1F, isaMontereyFind, sizeof(isaMontereyFind), 0x1A, isaReplace, sizeof(isaReplace)},
+	{"smallprim12", "-crnosmallprim", false, 0xF6A, smallPrimMontereyFind, sizeof(smallPrimMontereyFind), 14,
+		smallPrimReplace, sizeof(smallPrimReplace)},
+	{"walkfence12", "-crnowalkfence", false, 0x1BB, walkFenceMontereyFind, sizeof(walkFenceMontereyFind), 6,
+		walkFenceReplace, sizeof(walkFenceReplace)},
+	{"dcc12", "-crdcc", false, 0x50E, dccMontereyFind, sizeof(dccMontereyFind), 8, dccReplace, sizeof(dccReplace)},
 };
 static mach_vm_address_t orgCsValidatePage;
 static bool scPatchHooked;
@@ -2482,6 +2508,7 @@ void CRDriver::traceController(KernelPatcher &patcher, size_t index, mach_vm_add
 // Field offsets come from the 15.8.1 KDK; each patch first checks the instructions that carry them (the D509BA boots
 // the 15.4 recovery) and stays off if they differ.
 static bool accelSdma1Dropped, accelCapsFixed, vmFixOn, vmFixReady;
+static bool capsMonterey;  // AMDHardware's capability fields 8 bytes earlier (see the caps fix route)
 static void *accelHardware;  // AMDBaffinHardware, from allocateHWEngines (for the black box's ring dump)
 
 // The GPU at the first AMDHardware::resetHardware, before Apple's reset changes it: GRBM/SRBM status, CP status and
@@ -2663,11 +2690,10 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 	}
 
 	if (family == ChipFamily::Stoney && !checkKernelArgument("-crnosdmafix")) {
-		// Each "a|b": Sequoia/Sonoma's encoding, then Ventura's (other registers, same offsets).
+		// Each "a|b": Sequoia/Sonoma's encoding, then Ventura's, then Monterey's (other registers, same offsets).
 		static const char *const allocChecks[] {"4c89b3b8030000|49899fb8030000", "4c89b3c0030000|49899fc0030000", nullptr};
-		static const char *const startChecks[] {"4a8bbcf3b8030000|498bbcdfb8030000", "ff9048010000", "488b7b18|498b7f18",
-			"ff9078010000",
-			"66895008", nullptr};
+		static const char *const startChecks[] {"4a8bbcf3b8030000|498bbcdfb8030000|498bbcdeb8030000", "ff9048010000",
+			"488b7b18|498b7f18|498b7e18", "ff9078010000", "66895008|66897008", nullptr};
 		if (route("__ZN32AMDRadeonX4000_AMDBaffinHardware17allocateHWEnginesEv",
 				reinterpret_cast<mach_vm_address_t>(wrapAllocateHWEngines), orgAllocateHWEngines, allocChecks, 0x100,
 				"allocateHWEngines")) {
@@ -2738,9 +2764,14 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 	// Stoney and Carrizo both have one shader engine with one shader array (Linux gfx_v8_0), against Polaris 11's two.
 	if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crnocapsfix")) {
 		static const char *const capsChecks[] {"c7476402000000", "c7476c01000000", "c787a000000008000000", nullptr};
+		// Monterey's AMDHardware has these fields 8 bytes earlier (SEs 0x5C, SH per SE 0x64, CUs per SH 0x98, the
+		// active CUs AMDVIHardware's setupAndInitializeHWCapabilities stores 0x9C).
+		static const char *const capsChecksMonterey[] {"c7475c02000000", "c7476401000000", "c7879800000008000000",
+			nullptr};
+		capsMonterey = getKernelVersion() == KernelVersion::Monterey;
 		route("__ZN32AMDRadeonX4000_AMDBaffinHardware32setupAndInitializeHWCapabilitiesEv",
-			reinterpret_cast<mach_vm_address_t>(wrapSetupHWCapabilities), orgSetupHWCapabilities, capsChecks, 0x30,
-			"setupAndInitializeHWCapabilities");
+			reinterpret_cast<mach_vm_address_t>(wrapSetupHWCapabilities), orgSetupHWCapabilities,
+			capsMonterey ? capsChecksMonterey : capsChecks, 0x30, "setupAndInitializeHWCapabilities");
 	}
 	if (!checkKernelArgument("-crnovmmcheck")) {
 		static const char *const vmmChecks[] {"ff4f3c", "488b7f28", "ff9040010000", "ff9058010000", "488b8060010000", nullptr};
@@ -2975,7 +3006,7 @@ void *CRDriver::wrapGetHWChannel(void *that, uint32_t engine, uint32_t ring) {
 
 uint64_t CRDriver::wrapSetupHWCapabilities(void *that) {
 	uint64_t ret = FunctionCast(wrapSetupHWCapabilities, callback->orgSetupHWCapabilities)(that);
-	auto *self = static_cast<uint8_t *>(that);
+	auto *self = static_cast<uint8_t *>(that) - (capsMonterey ? 8 : 0);
 	uint32_t activeCu = *reinterpret_cast<uint32_t *>(self + 0xA4);  // minimum active CUs per SH, from CAIL
 	*reinterpret_cast<uint32_t *>(self + 0x64) = 1;                   // shader engines
 	*reinterpret_cast<uint32_t *>(self + 0x6C) = 1;                   // SH per SE

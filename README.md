@@ -43,7 +43,7 @@ scales with load (400 MHz idle, up to the chip's top level).
 | Sequoia 15 | Development target. Every hook found by symbol |
 | Sonoma 14 | **Works.** Its AMD init library (HWLibs) ships stripped, so CarrizoRed finds the 46 functions it hooks by byte signatures checked against the 14.8.9 KDK ([`kern_sigs.hpp`](CarrizoRed/kern_sigs.hpp)); Metal patches at Sonoma's offsets |
 | Ventura 13 | **Works.** HWLibs is stripped and compiled differently: functions matched by the constants they use (45 of 46), safety checks accept Ventura's register allocation, Metal patches at Ventura's offsets |
-| Monterey 12 | Not yet. The display side checks out offline (recovery image); the accelerator needs its KDK |
+| Monterey 12 | **In testing** (12.7.6). Display works. Acceleration: HWLibs functions matched by their constants (41 of 46) from the installed system's kexts (no Monterey KDK exists), the hardware capability fields at Monterey's offsets, safety checks accept its register allocation, Metal patches at its offsets. Needs the xHCI reset patch's `Limit` at 2048 for USB 3 (see FCHXHCIFix) |
 | Tahoe 26 | Allowed, untested |
 
 Each version's Metal shader-compiler patches are matched against that version's own dyld shared cache.
