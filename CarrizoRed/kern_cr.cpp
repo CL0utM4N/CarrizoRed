@@ -1402,7 +1402,11 @@ static void mirrorKernelLog() {
 		return;
 	}
 	static const char *const keys[] {"PM ", "PMRD", "leep", "ake", "imeout", "ibernat", "IOPCI", "Radeon", "AMD", "ATI",
-		"GPU", "isplay", "AGDC", "AGDP"};
+		"GPU", "isplay", "AGDC", "AGDP", "ccelerator", "Failed to"};
+	// IOGraphicsAccelerator2::start reports why it gave up through os_log, which reaches the message buffer but not
+	// the verbose screen (Catalina installer: accel.start = 0 after hw.init = 1, and the installer's /var/log is lost).
+	// Echo those lines to the screen too, a few dozen at most.
+	static uint32_t echoed;
 	for (int n = 0; seen != x && n < size; n++, seen = (seen + 1) % size) {
 		char c = mb->bufc[seen];
 		if (c != '\n' && lineLen + 1 < sizeof(line)) {
@@ -1420,6 +1424,10 @@ static void mirrorKernelLog() {
 		if (want && hit) {
 			diskLogEvent("klog: %s", line);
 			mirrored++;
+			if (echoed < 40 && (strnstr(line, "ccelerator", lineLen) || strnstr(line, "Failed to", lineLen))) {
+				echoed++;
+				IOLog("CarrizoRed: klog: %s\n", line);
+			}
 		}
 		lineLen = 0;
 	}
@@ -2409,6 +2417,16 @@ namespace {
 		{"_Stoney_SetupASIC", "Stoney_SetupASIC", InHWLibs, true, true, 0},
 		{"_Stoney_LoadRlcUcode", "Stoney_LoadRlcUcode", InHWLibs, true, true, 0},
 		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator5startEP9IOService", "accel.start", InAccel, true, true, 0},
+		// What IOGraphicsAccelerator2::start (the family's start, called first) asks of the AMD accelerator; any of them
+		// failing ends it (0 = failed for the pointer results).
+		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator15configureDeviceEP11IOPCIDevice", "accel.configureDevice", InAccel, true, true, 0},
+		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator23createStatisticsManagerEv", "accel.createStatisticsManager", InAccel, true, true, 0},
+		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator15createHWHandlerEv", "accel.createHWHandler", InAccel, true, true, 0},
+		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator17createHWInterfaceEP11IOPCIDevice", "accel.createHWInterface", InAccel, true, true, 0},
+		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator19populateAccelConfigEP13IOAccelConfig", "accel.populateAccelConfig", InAccel, true, true, 0},
+		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator17newDisplayMachineEv", "accel.newDisplayMachine", InAccel, true, true, 0},
+		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator13newStatisticsEv", "accel.newStatistics", InAccel, true, true, 0},
+		{"__ZN37AMDRadeonX4000_AMDGraphicsAccelerator19createAccelChannelsEv", "accel.createAccelChannels", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware4initEP11IOPCIDeviceP28AMDRadeonX4000_IAMDHWHandlerRjP16_GART_PARAMETERSP14_FB_PARAMETERS", "hw.init", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware8initCAILEv", "hw.initCAIL", InAccel, true, true, 0},
 		{"__ZN26AMDRadeonX4000_AMDHardware9setupCAILEv", "hw.setupCAIL", InAccel, true, true, 0},
