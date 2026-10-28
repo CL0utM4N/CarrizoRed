@@ -2991,6 +2991,25 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 				bigSur ? startChecksBigSur : startChecks, 0xA0,
 				"startHWEngines");
 		}
+		// Catalina: after the hardware channels, createAccelChannels adds four more scheduler queues from a fixed list:
+		// VMPT (sDMA1, priority 0), GFX_HP, SDMA0_HP and SDMA1_HP (priority 1). With sDMA1 redirected to sDMA0, SDMA1_HP
+		// lands on SDMA0_HP's slot; Catalina's AMDSWScheduler::addSWQueue has one queue per (scheduler, priority) and
+		// refuses it, the channel's init fails, and so does the accelerator (20th chan.init = 0, accel.start = 0). Stop
+		// that loop after three (inc rbx; add r12, 0x18; cmp rbx, 4 -> 3). Lookups of SDMA1_HP go through the scheduler
+		// (getAccelChannel, priority 0-1: getSWQueue for sDMA1's channel, i.e. sDMA0's) and find SDMA0_HP; the unused
+		// slot in the channel array stays NULL, which stop() and the diagnosis report skip.
+		if (catalina) {
+			static const uint8_t find[] {0x48, 0xFF, 0xC3, 0x49, 0x83, 0xC4, 0x18, 0x48, 0x83, 0xFB, 0x04, 0x0F, 0x82};
+			static const uint8_t repl[] {0x48, 0xFF, 0xC3, 0x49, 0x83, 0xC4, 0x18, 0x48, 0x83, 0xFB, 0x03, 0x0F, 0x82};
+			KernelPatcher::LookupPatch patch {&kexts[KextRadeonX4000], find, repl, sizeof(find), 1};
+			patcher.applyLookupPatch(&patch);
+			if (patcher.getError() == KernelPatcher::Error::NoError) {
+				traceNote("queues=3 ");
+			} else {
+				traceNote("queues=err%d ", patcher.getError());
+				patcher.clearError();
+			}
+		}
 		static const char *const powerUpChecks[] {"4b8bbcfeb0030000|498bbcdeb0030000", nullptr};
 		static const char *const powerUpChecksCatalina[] {"498bbcde40030000", nullptr};
 		route("__ZN26AMDRadeonX4000_AMDHardware16powerUpHWEnginesEv",
