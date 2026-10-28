@@ -2761,8 +2761,9 @@ static uint32_t hwMmSlots[3] {0x3D8, 0x3E8, 0x400};
 // Whether the GFX ring's layout (PM4 engine +0x50, ring +0x30 size, +0x40 CPU mapping, +0x48 GPU address) is known:
 // Catalina's ring objects differ, so its ring reads (diagnostics, the fallback shader scan) are skipped.
 static bool ringLayoutKnown = true;
-// CAIL's flags word and the SMU data buffer's size (see the direct microcode load): Catalina has both 8 bytes earlier.
-static uint32_t cailFlagsOff = 0x6F0, cailSmuSizeOff = 0xCD8;
+// CAIL's flags word, the SMU data buffer's size and the micro-engine block's FB offset (see the direct microcode load):
+// Catalina has all three 8 bytes earlier.
+static uint32_t cailFlagsOff = 0x6F0, cailSmuSizeOff = 0xCD8, cailSmuBlockOff = 0xCE8;
 
 // The layouts above for the running macOS (Catalina 10.15.7 19H2, Big Sur 11.7.11 20G1443, Monterey 12.7.6).
 static void selectAccelLayouts() {
@@ -2788,6 +2789,7 @@ static void selectAccelLayouts() {
 		ringLayoutKnown = false;
 		cailFlagsOff = 0x6E8;
 		cailSmuSizeOff = 0xCD0;
+		cailSmuBlockOff = 0xCE0;
 	}
 }
 static void *accelHardware;  // AMDBaffinHardware, from allocateHWEngines (for the black box's ring dump)
@@ -3644,7 +3646,7 @@ static void smuLoadFirmware(void *cail) {
 		smuResetAfterPowerLoss();
 	}
 	auto *base = static_cast<uint8_t *>(cail);
-	smuLoad.blockOffset = *reinterpret_cast<uint64_t *>(base + 0xCE8);
+	smuLoad.blockOffset = *reinterpret_cast<uint64_t *>(base + cailSmuBlockOff);
 	if (!stoneyUcodeInfo) {
 		smuLoad.result = "no UcodeInfo";
 		return;
