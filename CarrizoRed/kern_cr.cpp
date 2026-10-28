@@ -288,6 +288,11 @@ static TraceEvent traceRing[TraceRingSize];
 static uint32_t traceHead;
 static uint32_t stageOpen[MaxTraceStages];
 static uint64_t stageEnterMs[MaxTraceStages];
+// Catalina: when acceleration doesn't come up, AMD9500Controller has no PowerPlay manager (+0x1A070 stays NULL after
+// the boot-time initializePowerPlay fails), but WindowServer's framebuffer open (AMDFramebuffer::enableHardware) calls
+// initializePowerPlay again, which dereferences it unchecked (nvram25/28: page fault at +0x85). The wrapper then
+// returns the boot-time error instead. 0 = off (other versions, or the load at +0x7E didn't match).
+static uint32_t ppmGuardOff;
 static uint32_t stageCalls[MaxTraceStages], stageLastArg[MaxTraceStages];
 static const char *stageNames[MaxTraceStages];
 // crstopat=<stage>[#n]: on entering that traced stage (the n-th time, default 1st), block the calling thread and have the
@@ -2626,6 +2631,13 @@ namespace {
 			restoreVbiosImageForSetup();
 			checkLiveHwlibs(a);
 		}
+		if (ppmGuardOff && !strcmp(stages[N].name, "initializePowerPlay") &&
+			!*reinterpret_cast<void **>(static_cast<uint8_t *>(a) + ppmGuardOff)) {
+			traceNote("initializePowerPlay=skipped(no ppm) ");
+			traceEvent(stages[N].name, true, 0xE00002F0);
+			__atomic_fetch_sub(&stageOpen[N], 1, __ATOMIC_RELAXED);
+			return 0xE00002F0;
+		}
 		if (!controllerReady && !accelDeferOff &&
 			(!strcmp(stages[N].name, "hws.probe") || !strcmp(stages[N].name, "accel.probe"))) {
 			accelDeferred = true;
@@ -2681,6 +2693,16 @@ namespace {
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
 				continue;
+			if (!strcmp(stages[i].name, "initializePowerPlay") && getKernelVersion() == KernelVersion::Catalina) {
+				// mov rdx, [rax+0x1A070] (the PowerPlay manager) at +0x7E; see ppmGuardOff.
+				static const uint8_t load[] {0x48, 0x8B, 0x90, 0x70, 0xA0, 0x01, 0x00};
+				auto func = patcher.solveSymbol(index, stages[i].symbol, slide, size);
+				patcher.clearError();
+				if (func && !memcmp(reinterpret_cast<const void *>(func + 0x7E), load, sizeof(load)))
+					ppmGuardOff = 0x1A070;
+				else
+					traceNote("ppmguard:nomatch ");
+			}
 			KernelPatcher::RouteRequest request {stages[i].symbol, wrappers[i], stages[i].org};
 			if (routeChecked(patcher, index, request, slide, size)) {
 				stageNames[i] = stages[i].name;
