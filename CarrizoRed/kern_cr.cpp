@@ -283,7 +283,8 @@ struct TraceEvent {
 };
 
 static constexpr size_t TraceRingSize = 512, MaxTraceStages = 192;
-static constexpr uint64_t WatchdogMs = 60000;
+// Catalina's GPU power-up runs ~40 s longer than Sonoma's (slow CAIL waits) but completes, so it gets more room.
+static constexpr uint64_t WatchdogMs = 60000, WatchdogMsCatalina = 180000;
 static TraceEvent traceRing[TraceRingSize];
 static uint32_t traceHead;
 static uint32_t stageOpen[MaxTraceStages];
@@ -2122,7 +2123,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			uint64_t ms = uptimeMs();
 			bool stuck = false;
 			for (size_t i = 0; i < MaxTraceStages && !stuck; i++)
-				stuck = __atomic_load_n(&stageOpen[i], __ATOMIC_RELAXED) && ms - stageEnterMs[i] > WatchdogMs;
+				stuck = __atomic_load_n(&stageOpen[i], __ATOMIC_RELAXED) && ms - stageEnterMs[i] >
+					(getKernelVersion() == KernelVersion::Catalina ? WatchdogMsCatalina : WatchdogMs);
 			if (stuck) {
 				static char reason[512];
 				size_t len = static_cast<size_t>(snprintf(reason, sizeof(reason), "%sCarrizoRed watchdog: open stages:",
