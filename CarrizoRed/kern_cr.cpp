@@ -173,6 +173,27 @@ static bool routeChecked(KernelPatcher &patcher, size_t index, KernelPatcher::Ro
 			codeLen += len;
 			copied += len;
 		}
+		// A branch later in the function into the bytes the jump overwrites would land inside it (Big Sur's
+		// AMDHardware::initializeHWEngines loops back to +0xC: invalid opcode there, nvram22). Look through the next
+		// 0x400 bytes; a decoding stop or a branch from beyond the function only makes this more careful.
+		for (size_t at = copied; at < 0x400;) {
+			hde64s hs {};
+			size_t len = Disassembler::hdeDisasm(func + at, &hs);
+			if (!len || (hs.flags & F_ERROR))
+				break;
+			if (hs.flags & F_RELATIVE) {
+				int64_t disp = (hs.flags & F_IMM8) ? static_cast<int8_t>(hs.imm.imm8) : static_cast<int32_t>(hs.imm.imm32);
+				mach_vm_address_t target = func + at + len + disp;
+				if (target > func && target < func + copied) {
+					SYSLOG("cr", "route: REFUSED %s: branch at +0x%lx goes to +0x%llx, inside the patch", request.symbol, at,
+						target - func);
+					routesFailed++;
+					routeLastFailed = request.symbol;
+					return false;
+				}
+			}
+			at += len;
+		}
 		// Trampoline: the moved instructions (checked above), then jmp [rip+0] back to func + copied.
 		if (routePoolUsed + codeLen + 14 > RoutePoolSize) {
 			SYSLOG("cr", "route: %s: trampoline pool full (%lu bytes used)", request.symbol, routePoolUsed);
