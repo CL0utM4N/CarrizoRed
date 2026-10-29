@@ -2265,8 +2265,9 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (uint64_t at = __atomic_load_n(&wakeReportAtMs, __ATOMIC_RELAXED); at && uptimeMs() >= at && !diskLogOff &&
 			diskLogStarted) {
 			__atomic_store_n(&wakeReportAtMs, 0, __ATOMIC_RELAXED);
-			const char *report = self->composeReport(t, now);
-			bool diag = __atomic_exchange_n(&wakeDisplayDiag, false, __ATOMIC_RELAXED);
+			bool diag = __atomic_load_n(&wakeDisplayDiag, __ATOMIC_RELAXED);
+			const char *report = self->composeReport(t, diag ? "" : now);  // the display sections, not the tree
+			__atomic_store_n(&wakeDisplayDiag, false, __ATOMIC_RELAXED);
 			diskLogEvent("black-box report %s after wake %u follows", diag ? "1 s after a failed DPCD transfer" : "30 s",
 				systemWakes);
 			diskLogTick(t, stallTicks);
@@ -9369,7 +9370,9 @@ void CRDriver::panicReport(uint32_t t, const char *tree, const char *reason) {
 }
 
 const char *CRDriver::composeReport(uint32_t t, const char *tree) {
-	static char report[8192];
+	// 32 KB: the disk log takes all of it (Catalina wake #8: the display sections of the post-wake report were cut off
+	// at 8 KB, inside the registry tree); a panic keeps what fits.
+	static char report[32768];
 	size_t len = 0;
 	auto add = [&](const char *fmt, ...) {
 		if (len + 1 >= sizeof(report))
