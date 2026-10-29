@@ -1455,12 +1455,22 @@ static void wakeWatchdog(thread_call_param_t, thread_call_param_t) {
 // PCI restore) or the kernel never ran again. This one is armed at "will sleep": thread call deadlines count awake
 // time only, so it fires about 150 s of awake time later, ~30 s before sleep (wifip2pd's timeout) plus ~2 min after
 // the CPU resumes. Disarmed by the wake completing (or the sleep being cancelled).
+// A dark wake (no display; nvram37, Catalina: woken by EHC1 twice, then maintenance sleep) never sends
+// kIOMessageSystemHasPoweredOn either, but the kernel runs: the watcher ticking (every 500 ms) for at least half of
+// those 150 s means the machine is alive, so stand down instead of panicking.
 static thread_call_t sleepWatchdogCall;
-static uint32_t sleepWakesAtStart;
+static uint32_t sleepWakesAtStart, sleepBeatAtStart;
 
 static void sleepWatchdog(thread_call_param_t, thread_call_param_t) {
-	CRDriver::wakeWatchdogFired("150 s of awake time after kIOMessageSystemWillSleep", systemWakes == sleepWakesAtStart,
-		20);
+	if (systemWakes != sleepWakesAtStart)
+		return;
+	uint32_t beats = watcherBeat - sleepBeatAtStart;
+	if (beats >= 150) {
+		diskLogEvent("sleep watchdog: no full wake 150 s after sleep, but the watcher ticked %u times: dark wake, not "
+			"stuck", beats);
+		return;
+	}
+	CRDriver::wakeWatchdogFired("150 s of awake time after kIOMessageSystemWillSleep", true, beats);
 }
 
 static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *, void *, vm_size_t) {
@@ -1470,6 +1480,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			diskLogEvent("system will sleep (%u)", systemSleeps);
 			if (sleepWatchdogCall) {
 				sleepWakesAtStart = systemWakes;
+				sleepBeatAtStart = watcherBeat;
 				uint64_t deadline = 0;
 				clock_interval_to_deadline(150, kSecondScale, &deadline);
 				thread_call_enter_delayed(sleepWatchdogCall, deadline);
