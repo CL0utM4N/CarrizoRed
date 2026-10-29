@@ -951,6 +951,7 @@ struct EventSourcePeek : IOEventSource {
 	static void *actionOf(IOEventSource *source) {
 		return reinterpret_cast<void *>(static_cast<EventSourcePeek *>(source)->action);
 	}
+	static IOEventSource *nextOf(IOEventSource *source) { return static_cast<EventSourcePeek *>(source)->getNext(); }
 };
 
 struct WorkLoopPeek : IOWorkLoop {
@@ -990,7 +991,7 @@ static bool wrapRunEventSources(IOWorkLoop *that) {
 	if (int32_t after = preemptionLevel(); after != before) {
 		char list[240] = "";
 		auto *source = WorkLoopPeek::chainOf(that);
-		for (int n = 0; source && n < 6; n++, source = source->getNext()) {
+		for (int n = 0; source && n < 6; n++, source = EventSourcePeek::nextOf(source)) {
 			size_t len = strlen(list);
 			snprintf(list + len, sizeof(list) - len, "%s%s/%s %p", n ? ", " : "", className(source),
 				className(EventSourcePeek::ownerOf(source)), EventSourcePeek::actionOf(source));
