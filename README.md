@@ -8,9 +8,9 @@ used them), so on a hackintosh they've only had the firmware framebuffer.
 ## Status
 
 > **Experimental, in active development.** There are no releases yet. Expect kernel panics and black screens, and
-> don't run it on a machine you depend on. Everything below is from one test laptop.
+> don't run it on a machine you depend on. Everything below is from a handful of test machines.
 
-**What it does today:** on a Stoney Ridge laptop, macOS Ventura, Sonoma and Sequoia boot to the desktop and drive
+**What it does today:** on Stoney Ridge machines, macOS Catalina through Sequoia boots to the desktop and drives
 the built-in panel through Apple's own Polaris display driver, instead of the firmware's fixed framebuffer. **Metal
 acceleration works and the desktop renders correctly:** WindowServer draws the login screen and desktop through the
 GPU, apps use Metal, and vibrancy, text, icons (folder icons included) and the Dock draw properly. The GPU clock
@@ -18,11 +18,11 @@ scales with load (400 MHz idle, up to the chip's top level).
 
 | | Status |
 |---|---|
-| Built-in eDP panel | **Works** (1366×768) through Apple's `AMD9500Controller` / `AMDFramebuffer`: Recovery, the installer and installed Ventura, Sonoma and Sequoia |
+| Built-in eDP panel | **Works** through Apple's `AMD9500Controller` / `AMDFramebuffer`: Recovery, the installer and installed Catalina through Sequoia (the D509BA's 1366×768 panel on one eDP lane, the Inspiron 3475's on two) |
 | Display interrupts (vblank) | **Works** |
 | Acceleration / Metal (`AMDRadeonX4000`) | **Works.** The SMU loads the GPU microcode, the command processor and SDMA run, interrupts work, and WindowServer and apps render with Metal. Apple's shader compiler emits an interpolation pattern Stoney's 16-bank LDS gets wrong; CarrizoRed fixes the compiled pixel shaders before the GPU runs them, including when Metal re-uploads them (see *Metal needed*). Boot with `-crnoaccel` for an unaccelerated desktop |
 | GPU clock scaling (SCLK DPM) | **Works, on by default.** Apple's PowerPlay runs its Dummy back end here, so nothing would start the SMU's clock scaling and the GPU would stay at its lowest clock. CarrizoRed starts it 90 s after boot, from the SMU's own clock table: 400 MHz minimum, up to the top level (900 MHz on an A9-9425, 800 MHz on an A9-9420). `-crnosclkdpm` turns it off |
-| Sleep | Enters sleep; **wake doesn't work yet** (a watchdog writes a report to NVRAM when it fails) |
+| Sleep | **Not working yet.** Idle sleep enters sleep, but after waking the GPU's command processor stalls (a fix is in testing); closing the lid froze the machine on Catalina. A watchdog writes a report to NVRAM when wake fails |
 | Brightness, external displays (HDMI), HDMI audio | Not done or untested |
 | Video decode/encode (UVD/VCE) | **On hold**: video plays and records in software. UVD powers up and Apple's firmware boots on it, but decoding hangs the GPU: Apple's driver gives UVD GPU virtual addresses, and Stoney's UVD has no VM support (Linux runs it in physical mode and rewrites every buffer address). Making it work means doing that translation in CarrizoRed. Findings and next steps in [docs/VIDEO.md](docs/VIDEO.md) |
 | Carrizo / Bristol Ridge | Same display engine and code paths; the SMU microcode loader, clock scaling and shader-engine fix include Carrizo's differences (second SDMA engine, second MEC), following Linux. **Untested** (no hardware): reports from owners are very welcome |
@@ -31,22 +31,21 @@ scales with load (400 MHz idle, up to the chip's top level).
 
 | Machine | APU | macOS | Result |
 |---|---|---|---|
-| ASUS VivoBook 15 D509BA | A9-9425 (Stoney Ridge, Radeon R5) | Sequoia 15.4 (Recovery, installer), 15.8.1 (installed) | Display and Metal acceleration work, desktop renders correctly |
-| ASUS VivoBook 15 D509BA | A9-9425 | Sonoma 14.x (installed) | Display and Metal acceleration work, desktop renders correctly; the animated lock-screen wallpaper is slow (10-bit 4K HEVC: decoded on the CPU, and Stoney's UVD can't decode 10-bit anyway) |
-| ASUS VivoBook 15 D509BA | A9-9425 | Ventura 13.7.8 (installed) | Display and Metal acceleration work |
-| Acer Aspire E5-523 (tester) | E2-9010 (Stoney Ridge, Radeon R2) | Ventura 13.7.8 | Reached the desktop, then crashed before the Ventura fixes; retest pending |
+| ASUS VivoBook 15 D509BA | A9-9425 (Stoney Ridge, Radeon R5) | Catalina 10.15.7 – Sequoia 15.8.1 (installed); Sequoia 15.4 Recovery and installer | Display and Metal acceleration work, desktop renders correctly |
+| Dell Inspiron 3475 (all-in-one) | A6-9225 (Stoney Ridge, Radeon R4) | Ventura 13.7.8 | Display and Metal acceleration work, desktop renders correctly |
+| Acer Aspire E5-523 ([Lost-Entrepreneur439](https://www.reddit.com/r/hackintosh/comments/1xh74lv/ive_done_a_lot_of_hackintoshes_but_this_might_be/)) | E2-9010 (Stoney Ridge, Radeon R2) | Ventura 13.7.8 | Display and Metal acceleration work |
 
 **macOS versions:**
 
 | macOS | Support |
 |---|---|
-| Sequoia 15 | Development target. Every hook found by symbol |
+| Sequoia 15 | **Works.** Development target; every hook found by symbol |
 | Sonoma 14 | **Works.** Its AMD init library (HWLibs) ships stripped, so CarrizoRed finds the 46 functions it hooks by byte signatures checked against the 14.8.9 KDK ([`kern_sigs.hpp`](CarrizoRed/kern_sigs.hpp)); Metal patches at Sonoma's offsets |
 | Ventura 13 | **Works.** HWLibs is stripped and compiled differently: functions matched by the constants they use (45 of 46), safety checks accept Ventura's register allocation, Metal patches at Ventura's offsets |
-| Monterey 12 | **In testing** (12.7.6). Display works. Acceleration: HWLibs functions matched by their constants (41 of 46) from the installed system's kexts (no Monterey KDK exists), the hardware capability fields at Monterey's offsets, safety checks accept its register allocation, Metal patches at its offsets. Needs the xHCI reset patch's `Limit` at 2048 for USB 3 (see FCHXHCIFix) |
+| Monterey 12 | **Works** (12.7.6). HWLibs functions matched by their constants (41 of 46) from the installed system's kexts (no Monterey KDK exists), the hardware capability fields at Monterey's offsets, safety checks accept its register allocation, Metal patches at its offsets. Needs the xHCI reset patch's `Limit` at 2048 for USB 3 (see FCHXHCIFix) |
+| Big Sur 11 | **Works** (11.7.11). Its HWLibs keeps its symbols, so every hook is found by name; the accelerator and command-buffer layouts differ (capability fields as Monterey, submission info, a vtable slot) and the Metal patches sit at Big Sur's offsets |
+| Catalina 10.15 | **Works** (10.15.7). HWLibs keeps its symbols (Polaris loads `AMDRadeonX4000HWLibs` unless the subsystem is Apple's); the accelerator's engine slots, capability fields and command-buffer layout, and CAIL's flags and SMU buffer fields, sit at Catalina's offsets. Its scheduler has one queue per engine and priority, so CarrizoRed creates three extra queues instead of four (the second SDMA engine is folded into the first). Metal: the shader compiler (`libSC.dylib` in AMDShared.bundle) and the Metal driver are separate files there, patched through `cs_validate_range`. The xHCI reset patch matches (`MinKernel` 19.0.0) |
 | Tahoe 26 | Allowed, untested |
-| Big Sur 11 | **In testing** (11.7.11). Its HWLibs keeps its symbols, so every hook is found by name; the accelerator and command-buffer layouts differ (capability fields as Monterey, submission info, a vtable slot) and the Metal patches sit at Big Sur's offsets. Read from the installed system's kernel collection and dyld cache |
-| Catalina 10.15 | **In testing** (10.15.7). Display works. HWLibs keeps its symbols (Polaris loads `AMDRadeonX4000HWLibs` unless the subsystem is Apple's), so every hook is found by name; the accelerator's engine slots, capability fields and command-buffer layout, and CAIL's flags and SMU buffer fields, sit at Catalina's offsets. Metal: the shader compiler (`libSC.dylib` in AMDShared.bundle) and the Metal driver are separate files there, patched through `cs_validate_range`. The xHCI reset patch matches (`MinKernel` 19.0.0) |
 
 Each version's Metal shader-compiler patches are matched against that version's own dyld shared cache.
 
@@ -95,7 +94,7 @@ And Metal needed:
 | Area | State |
 |---|---|
 | Display (built-in eDP panel) | Works |
-| Metal acceleration | Works on Ventura, Sonoma and Sequoia; the desktop renders correctly |
+| Metal acceleration | Works on Catalina through Sequoia; the desktop renders correctly |
 | Stoney's 16-bank LDS shader fix | Works: every hazardous shader fixed in recent sessions (none skipped), fixes no longer undone by Metal's re-uploads |
 | Random glitches (flat-colour images, login avatar, blue folder icons) | Fixed: Metal's SDMA shader re-uploads were undoing the shader fix. Folder icons drawn wrong by older builds stay in macOS's icon cache until it is cleared |
 | Lock screen (Sonoma) | Renders; the animated wallpaper is slow (10-bit 4K HEVC on the CPU; Stoney's UVD can't decode 10-bit). A still wallpaper avoids it |
@@ -103,7 +102,7 @@ And Metal needed:
 | Freezes with clock scaling | Fixed: CarrizoRed's own interrupt-storm breaker was tripping on real interrupt bursts at higher clocks |
 | OpenGL | Expected to work, untested: Apple's AMD GL driver compiles through the same `libSC` CarrizoRed patches for Stoney (its `ATIRadeonX4000SCLib` wraps it), and the shader fix works on every submission whatever the API |
 | Video decode/encode | On hold: software decode and encode. UVD starts with Apple's firmware, but needs CarrizoRed to translate GPU virtual addresses to physical ones before it can decode ([docs/VIDEO.md](docs/VIDEO.md)) |
-| Sleep/wake | Sleep works; wake doesn't yet (FCHXHCIFix's crash on wake fixed; a pre-sleep watchdog reports where wake stops) |
+| Sleep/wake | Not working yet: idle sleep enters sleep, but the GPU's command processor stalls after waking (fix in testing: the firmware reload after wake no longer repeats). Closing the lid froze the machine on Catalina; being looked at |
 | Carrizo / Bristol Ridge | Code paths written (SMU loader, clock scaling, caps), untested: no hardware |
 | External displays, brightness, HDMI audio | Not started / untested |
 | GPU occasionally not responding after a warm restart | Open (power off fully) |
@@ -122,14 +121,14 @@ Each fix is documented in the code, in [docs/TEST_MACHINES.md](docs/TEST_MACHINE
 
 | APU family | Examples | PCI ID | GFX | Display | Status |
 |---|---|---|---|---|---|
-| Stoney Ridge | A9-9420/9425, A6-9220/9225, A4-9120, E2-9000 | 1002:98E4 | gfx810 | DCE 11.0, 2 pipes | Display and Metal working (D509BA) |
+| Stoney Ridge | A9-9420/9425, A6-9220/9225, A4-9120, E2-9000/9010 | 1002:98E4 | gfx810 | DCE 11.0, 2 pipes | Display and Metal working (A9-9425, A6-9225, E2-9010) |
 | Carrizo / Bristol Ridge | A12-9800, A10-9700, FX-9800P, A10-8700P, FX-8800P | 1002:9870, 9874–9877 | gfx801 | DCE 11.0, 3 pipes | Untested |
 
 Older GCN 2 APUs (Kaveri, Kabini, Beema/Mullins) may follow later. Sequoia still contains AMD's init code and
 complete GPU firmware for them, but no display or GCN 2 accelerator driver; see
 [docs/OLDER_APUS.md](docs/OLDER_APUS.md).
 
-**macOS:** Ventura, Sonoma and Sequoia work, Catalina, Big Sur and Monterey are in testing (see *macOS versions* above); Catalina through Tahoe are allowed to load.
+**macOS:** Catalina through Sequoia work (see *macOS versions* above); Tahoe is allowed to load but untested.
 Excavator CPUs have AVX2, so Ventura and later run without CPU hacks (AMD_Vanilla patches are still needed).
 
 **Why this family:** macOS never had drivers for these APUs, and removed its GCN 1–3 dGPU drivers in Ventura, but it
