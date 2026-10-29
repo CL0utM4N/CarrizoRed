@@ -314,6 +314,7 @@ and the list of affected machines.
 | `-crnocensus` | Don't record each distinct draw set-up in the disk log |
 | `-crnomodel` | Leave the iGPU's `model` alone (by default it is named from the CPU brand string, e.g. "AMD Radeon R5 Graphics", or a `model` from DeviceProperties is kept) |
 | `-crnowakepanic` | No wake watchdogs (otherwise a wake that doesn't complete panics with the black-box report, so it lands in NVRAM) |
+| `-crnopreemptcheck` | Don't check work loop event sources and the IH handler for leaked preemption disables (otherwise the one that leaks panics by name, instead of a later "thread_invoke: preemption_level" panic with no culprit) |
 
 ## Layout
 

@@ -16,6 +16,8 @@
 #include <Headers/kern_util.hpp>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IODeviceTreeSupport.h>
+#include <IOKit/IOEventSource.h>
+#include <IOKit/IOWorkLoop.h>
 #include <kern/thread.h>
 #include <kern/thread_call.h>
 #include <kern/debug.h>
@@ -929,6 +931,102 @@ static int wrapCsValidateRange(void *vnode, void *pager, uint64_t offset, const 
 	return validated;
 }
 
+// nvram32/33/35 (Catalina): "thread_invoke: preemption_level 1" from IOWorkLoop::threadMain about 85 s after each wake.
+// A work loop went to sleep with preemption still disabled: something it ran, or an interrupt it took, left a spinlock
+// held or a _disable_preemption unmatched, and the kernel only notices at the loop's next block, with nothing of the
+// culprit left on the stack. These wrappers compare the CPU's preemption level (cpu_data, gs-relative; the offset is
+// read from _disable_preemption) around each interrupt and timer event source, each run of a work loop's sources and
+// the IH interrupt handler, and panic naming whichever leaked. -crnopreemptcheck turns them off.
+static int32_t preemptionLevelOff = -1;
+static mach_vm_address_t orgIesCheckForWork, orgTimerCheckForWork, orgRunEventSources;
+
+static inline int32_t preemptionLevel() {
+	int32_t level;
+	asm volatile("movl %%gs:(%1), %0" : "=r"(level) : "r"(static_cast<uint64_t>(preemptionLevelOff)));
+	return level;
+}
+
+struct EventSourcePeek : IOEventSource {
+	static OSObject *ownerOf(IOEventSource *source) { return static_cast<EventSourcePeek *>(source)->owner; }
+	static void *actionOf(IOEventSource *source) {
+		return reinterpret_cast<void *>(static_cast<EventSourcePeek *>(source)->action);
+	}
+};
+
+struct WorkLoopPeek : IOWorkLoop {
+	static IOEventSource *chainOf(IOWorkLoop *loop) { return static_cast<WorkLoopPeek *>(loop)->eventChain; }
+};
+
+static const char *className(const OSObject *object) {
+	return object ? object->getMetaClass()->getClassName() : "none";
+}
+
+[[noreturn]] static void preemptionLeak(const char *where, IOEventSource *source, int32_t before, int32_t after) {
+	OSObject *owner = source ? EventSourcePeek::ownerOf(source) : nullptr;
+	panic("CarrizoRed: preemption level %d -> %d across %s: %s, owner %s, action %p", before, after, where,
+		className(source), className(owner), source ? EventSourcePeek::actionOf(source) : nullptr);
+}
+
+static bool wrapIesCheckForWork(IOEventSource *that) {
+	int32_t before = preemptionLevel();
+	bool more = FunctionCast(wrapIesCheckForWork, orgIesCheckForWork)(that);
+	if (int32_t after = preemptionLevel(); after != before)
+		preemptionLeak("IOInterruptEventSource::checkForWork", that, before, after);
+	return more;
+}
+
+static bool wrapTimerCheckForWork(IOEventSource *that) {
+	int32_t before = preemptionLevel();
+	bool more = FunctionCast(wrapTimerCheckForWork, orgTimerCheckForWork)(that);
+	if (int32_t after = preemptionLevel(); after != before)
+		preemptionLeak("IOTimerEventSource::checkForWork", that, before, after);
+	return more;
+}
+
+// Anything else on the loop (command queues, power management queues, other source classes): name the loop's sources.
+static bool wrapRunEventSources(IOWorkLoop *that) {
+	int32_t before = preemptionLevel();
+	bool ok = FunctionCast(wrapRunEventSources, orgRunEventSources)(that);
+	if (int32_t after = preemptionLevel(); after != before) {
+		char list[240] = "";
+		auto *source = WorkLoopPeek::chainOf(that);
+		for (int n = 0; source && n < 6; n++, source = source->getNext()) {
+			size_t len = strlen(list);
+			snprintf(list + len, sizeof(list) - len, "%s%s/%s %p", n ? ", " : "", className(source),
+				className(EventSourcePeek::ownerOf(source)), EventSourcePeek::actionOf(source));
+		}
+		panic("CarrizoRed: preemption level %d -> %d across IOWorkLoop::runEventSources, sources: %s", before, after,
+			list);
+	}
+	return ok;
+}
+
+static void hookPreemptionCheck(KernelPatcher &patcher) {
+	if (checkKernelArgument("-crnopreemptcheck"))
+		return;
+	// _disable_preemption: push rbp; mov rbp, rsp; inc dword gs:[disp32] (65 FF 04 25 disp32).
+	auto *code = reinterpret_cast<const uint8_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "__disable_preemption"));
+	patcher.clearError();
+	for (int i = 0; code && i < 24 && preemptionLevelOff < 0; i++)
+		if (code[i] == 0x65 && code[i + 1] == 0xFF && code[i + 2] == 0x04 && code[i + 3] == 0x25)
+			preemptionLevelOff = *reinterpret_cast<const int32_t *>(code + i + 4);
+	if (preemptionLevelOff < 0) {
+		SYSLOG("cr", "preemption check: level offset not found");
+		return;
+	}
+	KernelPatcher::RouteRequest requests[] {
+		{"__ZN22IOInterruptEventSource12checkForWorkEv", wrapIesCheckForWork, orgIesCheckForWork},
+		{"__ZN18IOTimerEventSource12checkForWorkEv", wrapTimerCheckForWork, orgTimerCheckForWork},
+		{"__ZN10IOWorkLoop15runEventSourcesEv", wrapRunEventSources, orgRunEventSources},
+	};
+	for (auto &request : requests)
+		if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1)) {
+			SYSLOG("cr", "preemption check: failed to hook %s (error %d)", request.symbol, patcher.getError());
+			patcher.clearError();
+		}
+	DBGLOG("cr", "preemption check on, level at gs:%x", preemptionLevelOff);
+}
+
 void CRDriver::init() {
 	callback = this;
 	SYSLOG("cr", "CarrizoRed starting on kernel %d.%d", getKernelVersion(), getKernelMinorVersion());
@@ -989,6 +1087,7 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 			patcher.clearError();
 		}
 	}
+	hookPreemptionCheck(patcher);
 
 	auto *devInfo = DeviceInfo::create();
 	if (!devInfo) {
@@ -5387,7 +5486,11 @@ void CRDriver::wrapIhHandler(void *that, void *owner, void *arg, void *nub, int 
 		ihStormBroken = true;
 		return;
 	}
+	int32_t before = preemptionLevelOff >= 0 ? preemptionLevel() : 0;
 	FunctionCast(wrapIhHandler, callback->orgIhHandler)(that, owner, arg, nub, source);
+	if (int32_t after = preemptionLevelOff >= 0 ? preemptionLevel() : 0; after != before)
+		panic("CarrizoRed: preemption level %d -> %d across BaffinInterruptManager::handler (IH rptr %x wptr %x)", before,
+			after, gpuMmio ? gpuMmio[IhReg::RB_RPTR] : 0, gpuMmio ? gpuMmio[IhReg::RB_WPTR] : 0);
 }
 
 void CRDriver::wrapIhSetReadPointer(void *that, uint32_t pointer) {
