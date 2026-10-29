@@ -34,6 +34,8 @@ scales with load (400 MHz idle, up to the chip's top level).
 | ASUS VivoBook 15 D509BA | A9-9425 (Stoney Ridge, Radeon R5) | Catalina 10.15.7 – Sequoia 15.8.1 (installed); Sequoia 15.4 Recovery and installer | Display and Metal acceleration work, desktop renders correctly |
 | Dell Inspiron 3475 (all-in-one) | A6-9225 (Stoney Ridge, Radeon R4) | Ventura 13.7.8 | Display and Metal acceleration work, desktop renders correctly |
 | Acer Aspire E5-523 ([Lost-Entrepreneur439](https://www.reddit.com/r/hackintosh/comments/1xh74lv/ive_done_a_lot_of_hackintoshes_but_this_might_be/)) | E2-9010 (Stoney Ridge, Radeon R2) | Ventura 13.7.8 | Display and Metal acceleration work |
+| HP 17-ak0xx ([u/macos12345](https://www.reddit.com/r/hackintosh/comments/1xhaqvw/finally_macos_is_possible_on_pre_ryzen_apus/)) | A6-9220 (Stoney Ridge, Radeon R4) | Ventura | Display and Metal acceleration work |
+| ASUS X555B ([u/Azusawaga](https://www.reddit.com/r/hackintosh/comments/1xb8mct/what_used_to_be_impossible_today_is_the_reality/)) | A9-9410 (Stoney Ridge, Radeon R5) | Sequoia 15.8.1 | Display and Metal acceleration work |
 
 **macOS versions:**
 
@@ -121,7 +123,7 @@ Each fix is documented in the code, in [docs/TEST_MACHINES.md](docs/TEST_MACHINE
 
 | APU family | Examples | PCI ID | GFX | Display | Status |
 |---|---|---|---|---|---|
-| Stoney Ridge | A9-9420/9425, A6-9220/9225, A4-9120, E2-9000/9010 | 1002:98E4 | gfx810 | DCE 11.0, 2 pipes | Display and Metal working (A9-9425, A6-9225, E2-9010) |
+| Stoney Ridge | A9-9410/9420/9425, A6-9220/9225, A4-9120, E2-9000/9010 | 1002:98E4 | gfx810 | DCE 11.0, 2 pipes | Display and Metal working (A9-9410, A9-9425, A6-9220, A6-9225, E2-9010) |
 | Carrizo / Bristol Ridge | A12-9800, A10-9700, FX-9800P, A10-8700P, FX-8800P | 1002:9870, 9874–9877 | gfx801 | DCE 11.0, 3 pipes | Untested |
 
 Older GCN 2 APUs (Kaveri, Kabini, Beema/Mullins) may follow later. Sequoia still contains AMD's init code and
