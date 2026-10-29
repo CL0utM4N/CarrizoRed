@@ -510,6 +510,8 @@ struct AtomCall {
 static constexpr uint32_t AtomRingSize = 32, AtomAuxTable = 0x4E, AtomTransmitterTable = 0x4C, AtomEncoderTable = 0x04;
 static bool dpExtClkOff;    // -crnodpextclk, see wrapExecuteBiosCommandTable
 static bool edpPowerOnOff;  // -crnoedppoweron, see wrapExecuteBiosCommandTable
+static bool edpSeen;                 // Apple enabled an eDP transmitter (connector 0x14) this boot
+static volatile bool edpWakePowerOn;  // a full wake is under way: power the eDP panel before the next AUX transaction
 
 // eDP block state at the moment Apple starts training pattern 1 (DPCD 0x102 written with TPS1): panel power
 // sequencer, DIG0, DP0, pixel rate, backlight. The black box otherwise only sees the state after Apple gave up.
@@ -1501,6 +1503,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			break;
 		case kIOMessageSystemWillPowerOn:
 			diskLogEvent("system will power on");
+			__atomic_store_n(&edpWakePowerOn, true, __ATOMIC_RELAXED);
 			if (wakeWatchdogCall) {
 				wakeWakesAtStart = systemWakes;
 				wakeBeatAtStart = watcherBeat;
@@ -5872,27 +5875,49 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	// gates the PHY data output. Before Apple's transmitter ENABLE (action 1) for connector 0x14 (eDP), run the table
 	// the way amdgpu_atombios_encoder_set_edp_panel_power() does (all parameters zero, ucAction = POWER_ON) and allow
 	// the 300 ms it gives the panel to raise HPD. -crnoedppoweron disables.
+	auto powerOnEdp = [&]() {
+		uint8_t power[32] {};
+		power[3] = 12;  // ATOM_TRANSMITTER_ACTION_POWER_ON
+		uint8_t powered = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
+			AtomTransmitterTable, power, flag);
+		AtomCall injected {};
+		injected.table = static_cast<uint16_t>(AtomTransmitterTable);
+		injected.ok = static_cast<uint8_t>((powered & 1) | 0x40);  // 0x40 = injected by CarrizoRed
+		injected.repeat = 1;
+		memcpy(injected.in, power, sizeof(injected.in));
+		memcpy(injected.out, power, sizeof(injected.out));
+		ringPushMerged(atomRing, AtomRingSize, atomHead, injected, +[](const AtomCall &, const AtomCall &) {
+			return false;
+		});
+		if (ml_get_interrupts_enabled() && !ml_at_interrupt_context())
+			IOSleep(300);
+		else
+			IODelay(300000);
+		return powered;
+	};
 	if (table == AtomTransmitterTable && params && !edpPowerOnOff) {
 		auto *bytes = static_cast<uint8_t *>(params);
 		if (bytes[3] == 1 && bytes[5] == 0x14) {
-			uint8_t power[32] {};
-			power[3] = 12;  // ATOM_TRANSMITTER_ACTION_POWER_ON
-			uint8_t powered = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
-				table, power, flag);
-			AtomCall injected {};
-			injected.table = static_cast<uint16_t>(table);
-			injected.ok = static_cast<uint8_t>((powered & 1) | 0x40);  // 0x40 = injected by CarrizoRed
-			injected.repeat = 1;
-			memcpy(injected.in, power, sizeof(injected.in));
-			memcpy(injected.out, power, sizeof(injected.out));
-			ringPushMerged(atomRing, AtomRingSize, atomHead, injected, +[](const AtomCall &, const AtomCall &) {
-				return false;
-			});
-			if (ml_get_interrupts_enabled() && !ml_at_interrupt_context())
-				IOSleep(300);
-			else
-				IODelay(300000);
+			edpSeen = true;
+			__atomic_store_n(&edpWakePowerOn, false, __ATOMIC_RELAXED);
+			powerOnEdp();
 		}
+	}
+	// The same after a wake from S3 (Catalina, log 1793304455): the panel comes back unpowered (LVTMA_PWRSEQ_CNTL
+	// 0x20211 before sleep, 0x2000011 after), and Apple first wakes the sink with DPCD 0x600 = 1 over AUX, which failed
+	// 75 times (kIOReturnIOError) and left the CRTC stopped, so it never got as far as a transmitter ENABLE. Power the
+	// panel before the first AUX transaction of a full wake.
+	// An eDP panel is also known from the first VBIOS call of the boot: the firmware left LVTMA_PWRSEQ_CNTL.LVTMA_DIGON
+	// (0x10000) set for the panel it lit (D509BA: 0x30311).
+	static bool pwrseqChecked;
+	if (!pwrseqChecked && gpuMmio) {
+		pwrseqChecked = true;
+		if (gpuMmio[0x481B] & 0x10000)
+			edpSeen = true;
+	}
+	if (aux && edpSeen && !edpPowerOnOff && __atomic_exchange_n(&edpWakePowerOn, false, __ATOMIC_RELAXED)) {
+		uint8_t powered = powerOnEdp();
+		diskLogEvent("eDP power on before the first AUX transaction after wake: ok %u", powered & 1);
 	}
 	uint8_t ok = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that, table, params,
 		flag);
