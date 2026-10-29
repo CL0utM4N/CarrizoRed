@@ -7704,6 +7704,7 @@ static uint32_t fixInterpInShader(uint32_t *code, uint32_t got, uint32_t rsrc1, 
 									continue;
 								if (f[k].count > 1 && !f[k].exact && v != vI) {
 									interpFix.lastSkipWhy = 5;  // a write that may or may not cover vI
+									interpFix.lastUnknownWord = code[i];  // which instruction (Tahoe: 119 shaders)
 									skip = SkipRange;
 									return fixedHere;
 								}
@@ -8199,13 +8200,18 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 					code[i + 7], code[i + 8], code[i + 9], code[i + 10], code[i + 11], code[i + 12], code[i + 13],
 					code[i + 14], code[i + 15]);
 		}
-		// A block move refused (Monterey: three shaders, fail 0x305 before blocks could grow): the original code, for the
-		// offline fixer harness. Up to 3 shaders and 1024 dwords each.
-		static uint32_t blockDumped;
-		if (!listed && skip == SkipRange && interpFix.lastSkipWhy == 7 && blockDumped < 3) {
-			blockDumped++;
-			diskLogEvent("block refused: ps %llx %u dw, hazard at %u, fail %x", psVa, have, interpFix.lastHazardAt,
-				interpFix.lastBlockFail);
+		// A block move refused (Monterey: three shaders, fail 0x305 before blocks could grow), or a write of unknown size
+		// that may cover vI (Tahoe: 119 of 507 hazard shaders): the original code, for the offline fixer harness. Up to 3
+		// shaders of each and 1024 dwords each.
+		static uint32_t blockDumped, rangeDumped;
+		if (!listed && skip == SkipRange && ((interpFix.lastSkipWhy == 7 && blockDumped < 3) ||
+			(interpFix.lastSkipWhy == 5 && rangeDumped < 3))) {
+			if (interpFix.lastSkipWhy == 5)
+				rangeDumped++;
+			else
+				blockDumped++;
+			diskLogEvent("block refused: ps %llx %u dw, hazard at %u, why %u, fail %x, word %08x", psVa, have,
+				interpFix.lastHazardAt, interpFix.lastSkipWhy, interpFix.lastBlockFail, interpFix.lastUnknownWord);
 			for (uint32_t i = 0; i < have && i < 1024; i += 16) {
 				uint32_t w[16] {};
 				for (uint32_t q = 0; q < 16 && i + q < have; q++)
@@ -8218,7 +8224,7 @@ static uint32_t handlePixelShader(uint32_t vmid, uint64_t psVa, uint32_t rsrc1, 
 		if (!listed && skippedNum < arrsize(skippedShaders))
 			skippedShaders[skippedNum++] = {psVa, have,
 				skip == SkipUnknownEncoding ? interpFix.lastUnknownAt : interpFix.lastHazardAt, static_cast<uint32_t>(skip),
-				interpFix.lastSkipWhy, skip == SkipUnknownEncoding ? interpFix.lastUnknownWord :
+				interpFix.lastSkipWhy, skip == SkipUnknownEncoding || interpFix.lastSkipWhy == 5 ? interpFix.lastUnknownWord :
 				interpFix.lastSkipWhy == 7 ? interpFix.lastBlockFail : 0};
 	}
 	bool ok = true;
