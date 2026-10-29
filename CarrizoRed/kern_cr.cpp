@@ -793,6 +793,14 @@ static const uint8_t dccCatalinaFind[] {
 	0x41, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x4D, 0x89, 0xE9, 0xF6, 0x45, 0xD0, 0x01, 0x0F, 0x84, 0xA0, 0x00, 0x00, 0x00, 0x4D,
 	0x89, 0xCD,
 };
+// Tahoe (26.7.2 25G332, read from the Dell's cache, all four in .03): SCGetInstructionSet is byte for byte 15.8.1's at
+// the same page offset (the "isa" entry), the small-prim and walk-fence code is 15.8.1's at other page offsets, and the
+// DCC flag test is cmp byte [rbp - 0x2C], 0; je <no DCC> (the same set-up follows): make the je a jmp. Each pattern
+// occurs once in that cache.
+static const uint8_t dccTahoeFind[] {
+	0x8B, 0x45, 0xC0, 0x48, 0x8B, 0x00, 0x4C, 0x8B, 0x45, 0xA0, 0x4C, 0x8B, 0x75, 0x88, 0x80, 0x7D, 0xD4, 0x00, 0x0F, 0x84,
+	0x67, 0x01, 0x00, 0x00,
+};
 static const uint8_t isaReplace[] {0x1E}, smallPrimReplace[] {0x00}, walkFenceReplace[] {0xA8}, dccReplace[] {0x90, 0xE9},
 	dccVenturaReplace[] {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00}, isaCatalinaReplace[] {0x0E};
 struct PagePatch {
@@ -847,6 +855,11 @@ static PagePatch pagePatches[] {
 	{"walkfence10", "-crnowalkfence", false, 0x472, walkFenceCatalinaFind, sizeof(walkFenceCatalinaFind), 2,
 		walkFenceReplace, sizeof(walkFenceReplace)},
 	{"dcc10", "-crdcc", false, 0xAD9, dccCatalinaFind, sizeof(dccCatalinaFind), 13, dccReplace, sizeof(dccReplace)},
+	{"smallprim26", "-crnosmallprim", false, 0x3BF, smallPrimFind, sizeof(smallPrimFind), 14, smallPrimReplace,
+		sizeof(smallPrimReplace)},
+	{"walkfence26", "-crnowalkfence", false, 0x654, walkFenceFind, sizeof(walkFenceFind), 6, walkFenceReplace,
+		sizeof(walkFenceReplace)},
+	{"dcc26", "-crdcc", false, 0x31E, dccTahoeFind, sizeof(dccTahoeFind), 18, dccReplace, sizeof(dccReplace)},
 };
 static mach_vm_address_t orgCsValidatePage, orgCsValidateRange;
 static bool scPatchHooked;
@@ -7367,6 +7380,38 @@ static bool planBlockMove(const uint32_t *code, uint32_t end, uint32_t at, uint3
 		if (r == vI && !(webDef[at] && webDef[p2])) {
 			fail = member | 4;
 			return false;
+		}
+		// An image address slot holding nothing but an interpolation input on entry (Tahoe: 13 shaders, 0x303,
+		// image_sample_b v0..v2 = bias, u, v counted as v0..v3, v3 being the J that the shader's own v_interp_p2 reads),
+		// past the registers a 2D sample of that kind needs (two coordinates, plus one each for an offset, bias, compare
+		// value, LOD and clamp, four for derivatives): a raw barycentric is never a slice or third coordinate, so it is a
+		// slot the instruction doesn't use. Leave the input where it is and let the moved address read a fresh register
+		// there (inside the raised allocation, never written). Samples and gathers only (MIMG 0x20-0x5F).
+		bool webDefined = false;
+		for (uint32_t i = 0; i < end && !webDefined; i++)
+			webDefined = webDef[i];
+		uint32_t imageOp = (code[blockAt] >> 18) & 0x7F, used2d = 0;
+		if (imageOp >= 0x20 && imageOp <= 0x5F) {
+			static const uint8_t variant[8] {0, 1, 4, 5, 1, 1, 2, 0};  // -, cl, d, d_cl, l, b, b_cl, lz
+			used2d = 2 + variant[imageOp & 7] + ((imageOp >> 3) & 1) + ((imageOp >> 4) & 1);
+		}
+		if (entry && !webDefined && r != vI && r <= maxInterpSource && !forcedNum[r - base] &&
+			(code[blockAt] >> 26) == 0x3C && blockAt + 1 < end && used2d &&
+			r >= (code[blockAt + 1] & 0xFF) + used2d) {
+			uint32_t vaddr = code[blockAt + 1] & 0xFF;
+			gcn3VgprFields(code + blockAt, end - blockAt, f, n);
+			bool voted = false;
+			for (uint32_t q = 0; q < n && !voted; q++)
+				if (f[q].dword == 1 && f[q].shift == 0 && f[q].read && vaddr >= base && vaddr <= r &&
+					r < vaddr + f[q].count) {
+					if (!addChange(blockAt, f[q], F + vaddr - base, r)) {
+						fail = member | (full ? 11 : 7);
+						return false;
+					}
+					voted = true;
+				}
+			if (voted)
+				continue;
 		}
 		if (entry && (r == vI || r <= maxInterpSource)) {
 			fail = member | 3;  // an input (or the result's register on entry) would move
