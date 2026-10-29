@@ -165,9 +165,11 @@ similar machines. It includes:
 
 The pieces CarrizoRed needs:
 1. **Kexts:** add `Lilu.kext`, then `CarrizoRed.kext`, to `EFI/OC/Kexts` and to `config.plist` (Lilu first).
-2. **Device ID spoof:** a `DeviceProperties` entry on the iGPU (`PciRoot(0x0)/Pci(0x1,0x0)`) setting `device-id` to
-   `EF670000` (Polaris 11 / Baffin, `0x67EF`). That's what makes Apple's Polaris kexts match. CAIL still reads the real
-   ID from the hardware.
+2. **Device ID spoof:** a `DeviceProperties` entry on the iGPU setting `device-id` to `EF670000` (Polaris 11 / Baffin,
+   `0x67EF`). That's what makes Apple's Polaris kexts match. CAIL still reads the real ID from the hardware. The iGPU is
+   always PCI device 1, function 0, but the `PciRoot` number differs between machines: `PciRoot(0x0)/Pci(0x1,0x0)` on
+   the D509BA, `PciRoot(0x1)/Pci(0x1,0x0)` on a Dell Inspiron 3475. Check yours (see *Finding the iGPU's path* below).
+   With the wrong path OpenCore silently skips the entry, and nothing from CarrizoRed's acceleration ever loads.
 3. **Boot-args:** `-v keepsyms=1 debug=0x100` for testing, plus `-crnoaccel` to bring up the display without the
    accelerator.
 4. **When something goes wrong:** with `crpanicat=N`, CarrizoRed panics on purpose N seconds after the display driver
@@ -176,6 +178,32 @@ The pieces CarrizoRed needs:
    (`AAPL,PanicInfo`) after the next boot, e.g. with OpenShell `dmpstore -all -s fs0:\nvram.bin`.
 5. **After boot:** `log show --last boot --predicate 'eventMessage CONTAINS "CarrizoRed"'` and
    `ioreg -lw0 | grep CarrizoRed`.
+
+### Finding the iGPU's path
+
+OpenCore names a PCI device by its UEFI device path. Its first part, `PciRoot(N)`, is the `_UID` of the PCI root
+bridge in the firmware's ACPI tables, not a bus number. AMD's reference firmware uses `_UID` 0 on some machines and 1
+on others. The rest, `Pci(0x1,0x0)`, is the iGPU at device 1, function 0 on every one of these APUs.
+
+The usual OpenCore way, [gfxutil](https://github.com/acidanthera/gfxutil), works here too. It reads the same `_UID`,
+so the path it prints is the one OpenCore matches. In macOS (it doesn't need acceleration):
+
+```
+gfxutil -f VGA
+```
+
+The iGPU's ACPI name is usually `VGA` on these machines (`GFX0` on some). If neither matches, `gfxutil` alone lists
+every device; look for the line with `00:01.0` and `1002:98e4` (Stoney) or `1002:9874` (Carrizo / Bristol Ridge).
+
+Before macOS is installed:
+- **Linux live USB:** `cat /sys/bus/acpi/devices/PNP0A08:00/uid` gives the `PciRoot` number (`0` or `1`).
+  `lspci -nn -s 00:01.0` should show the GPU.
+- **ACPI dump** (OpenCore's `SysReport` quirk, or `sudo acpidump -b` on Linux, then `iasl -d DSDT.aml`): in `DSDT.dsl`,
+  find `Device (PCI0)` and its `Name (_UID, ...)`: `Zero` means `PciRoot(0x0)`, `One` means `PciRoot(0x1)`.
+
+To check that the spoof took effect, run `ioreg -lw0 -r -c IOPCIDevice | grep '"device-id" = <ef670000>'` in
+macOS. No output means OpenCore didn't apply the entry. Another sign is "Graphics 7 MB" in About This Mac with no
+`/private/var/log/CarrizoRed-*.log`.
 
 ## USB on these machines
 
