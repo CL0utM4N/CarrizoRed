@@ -8582,7 +8582,12 @@ static void raiseOnlyIb(uint32_t vmid, uint64_t ibVa, uint32_t dwords) {
 static void interpFixScan() {
 	auto *hw = static_cast<uint8_t *>(accelHardware);
 	auto *mmio = gpuMmio;
-	if (!hw || !mmio || !interpLock || !ringLayoutKnown)
+	if (!hw || !mmio || !interpLock)
+		return;
+	// The submit hook only reads through this mapping, so make it even where the ring scan below can't run (Catalina).
+	if (interpSubmit)
+		carveInit();
+	if (!ringLayoutKnown)
 		return;
 	auto *pm4 = *reinterpret_cast<uint8_t **>(hw + hwEngines);
 	auto *ring = pm4 ? *reinterpret_cast<uint8_t **>(pm4 + 0x50) : nullptr;
@@ -8590,8 +8595,6 @@ static void interpFixScan() {
 	uint32_t dwords = ring ? *reinterpret_cast<uint32_t *>(ring + 0x30) : 0;
 	if (!cpu || dwords < 0x100 || (dwords & (dwords - 1)))
 		return;
-	if (interpSubmit)
-		carveInit();
 	if (interpHooked && __atomic_load_n(&ibHookCalls, __ATOMIC_RELAXED))
 		return;  // the submit hook sees everything; don't compete for the lock
 	IOLockLock(interpLock);
