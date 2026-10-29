@@ -433,6 +433,8 @@ static void checkGpuAlive(volatile uint32_t *mmio) {
 
 // Defined with the SMU loader / black box below; called from the stage wrappers.
 static void smuReloadCp();
+// Set by a full SMU load (boot, wake), cleared by the next pm4.initializeMicroEngine: that one needs no CP reload.
+static bool smuFreshLoad;
 static void snapshotHang(uint32_t arg);
 
 static void parseStopAt() {
@@ -2613,9 +2615,15 @@ namespace {
 		uint32_t calls = stageCalls[N];
 		if (calls == 1 && !strcmp(stages[N].name, "uc.resetHW"))
 			snapshotHang(arg);
-		// After a reset the CP microcode is gone and only the SMU can reload it (see smuReloadCp).
-		if (calls > 1 && !strcmp(stages[N].name, "pm4.initializeMicroEngine"))
-			smuReloadCp();
+		// After a reset the CP microcode is gone and only the SMU can reload it (see smuReloadCp). Not after a wake: the
+		// full load has just run, and halting and reloading the CP on top of it stalled the CP (Catalina, both wakes).
+		if (!strcmp(stages[N].name, "pm4.initializeMicroEngine")) {
+			if (calls > 1 && !smuFreshLoad)
+				smuReloadCp();
+			else if (calls > 1)
+				traceNote("smureload=skipped(fresh load) ");
+			smuFreshLoad = false;
+		}
 		traceEvent(stages[N].name, false, arg);
 		if (stages[N].summary)  // start-up stages (and their re-runs on wake) into the disk log
 			diskLogEvent("> %s (call %u)", stages[N].name, calls);
@@ -3845,6 +3853,7 @@ static void smuLoadFirmware(void *cail) {
 	OSSafeReleaseNULL(map);
 	OSSafeReleaseNULL(desc);
 	smuLoad.result = (status & loadMask) == loadMask ? "loaded" : "timed out";
+	smuFreshLoad = true;
 	traceNote("smuload=%x->%x ", smuLoad.before, smuLoad.after);
 }
 
