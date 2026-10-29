@@ -957,7 +957,8 @@ static int wrapCsValidateRange(void *vnode, void *pager, uint64_t offset, const 
 // read from _disable_preemption) around each interrupt and timer event source, each run of a work loop's sources and
 // the IH interrupt handler, and panic naming whichever leaked. -crnopreemptcheck turns them off.
 static int32_t preemptionLevelOff = -1;
-static mach_vm_address_t orgIesCheckForWork, orgTimerCheckForWork, orgRunEventSources;
+static mach_vm_address_t orgIesCheckForWork, orgTimerCheckForWork, orgRunEventSources, orgMessageClient;
+static mach_vm_address_t kextLookupByAddress, kextIdentifier;  // OSKext::lookupKextWithAddress, getIdentifierCString
 
 static inline int32_t preemptionLevel() {
 	int32_t level;
@@ -1008,9 +1009,9 @@ static bool wrapRunEventSources(IOWorkLoop *that) {
 	int32_t before = preemptionLevel();
 	bool ok = FunctionCast(wrapRunEventSources, orgRunEventSources)(that);
 	if (int32_t after = preemptionLevel(); after != before) {
-		char list[240] = "";
+		char list[480] = "";
 		auto *source = WorkLoopPeek::chainOf(that);
-		for (int n = 0; source && n < 6; n++, source = EventSourcePeek::nextOf(source)) {
+		for (int n = 0; source && n < 12; n++, source = EventSourcePeek::nextOf(source)) {
 			size_t len = strlen(list);
 			snprintf(list + len, sizeof(list) - len, "%s%s/%s %p", n ? ", " : "", className(source),
 				className(EventSourcePeek::ownerOf(source)), EventSourcePeek::actionOf(source));
@@ -1019,6 +1020,40 @@ static bool wrapRunEventSources(IOWorkLoop *that) {
 			list);
 	}
 	return ok;
+}
+
+// nvram42 (Catalina, after a wake): the leak was in IOPMrootDomain's work loop, which runs every driver's power
+// management: its request, work, completion and power-state queues. Those deliver sleep/wake messages (will sleep,
+// capability change, will power on) to registered interest handlers through IOService::messageClient, i.e. other
+// drivers' code. Check around each delivery and name the client: for an interest notifier (_IOServiceInterestNotifier,
+// whose messageClient calls [notifier + 0x20] with target [notifier + 0x28] on Catalina), its handler and the kext that
+// holds it.
+static const char *kextOf(mach_vm_address_t address) {
+	if (!kextLookupByAddress || !kextIdentifier || !address)
+		return "?";
+	auto *kext = reinterpret_cast<OSObject *(*)(vm_address_t)>(kextLookupByAddress)(static_cast<vm_address_t>(address));
+	if (!kext)
+		return "none";
+	const char *id = reinterpret_cast<const char *(*)(OSObject *)>(kextIdentifier)(kext);
+	kext->release();  // the identifier string is the kext's own, and loaded kexts stay
+	return id ? id : "?";
+}
+
+static IOReturn wrapMessageClient(IOService *that, UInt32 type, OSObject *client, void *arg, vm_size_t size) {
+	int32_t before = preemptionLevel();
+	IOReturn ret = FunctionCast(wrapMessageClient, orgMessageClient)(that, type, client, arg, size);
+	if (int32_t after = preemptionLevel(); after != before) {
+		const char *cls = className(client);
+		mach_vm_address_t handler = 0, target = 0;
+		if (client && !strcmp(cls, "_IOServiceInterestNotifier")) {
+			handler = *reinterpret_cast<mach_vm_address_t *>(reinterpret_cast<uint8_t *>(client) + 0x20);
+			target = *reinterpret_cast<mach_vm_address_t *>(reinterpret_cast<uint8_t *>(client) + 0x28);
+		}
+		panic("CarrizoRed: preemption level %d -> %d across IOService::messageClient: message %x from %s to %s, "
+			"handler %p in %s, target %p", before, after, type, className(that), cls, reinterpret_cast<void *>(handler),
+			kextOf(handler), reinterpret_cast<void *>(target));
+	}
+	return ret;
 }
 
 static void hookPreemptionCheck(KernelPatcher &patcher) {
@@ -1038,7 +1073,12 @@ static void hookPreemptionCheck(KernelPatcher &patcher) {
 		{"__ZN22IOInterruptEventSource12checkForWorkEv", wrapIesCheckForWork, orgIesCheckForWork},
 		{"__ZN18IOTimerEventSource12checkForWorkEv", wrapTimerCheckForWork, orgTimerCheckForWork},
 		{"__ZN10IOWorkLoop15runEventSourcesEv", wrapRunEventSources, orgRunEventSources},
+		{"__ZN9IOService13messageClientEjP8OSObjectPvm", wrapMessageClient, orgMessageClient},
 	};
+	kextLookupByAddress = patcher.solveSymbol(KernelPatcher::KernelID, "__ZN6OSKext21lookupKextWithAddressEm");
+	patcher.clearError();
+	kextIdentifier = patcher.solveSymbol(KernelPatcher::KernelID, "__ZN6OSKext20getIdentifierCStringEv");
+	patcher.clearError();
 	for (auto &request : requests)
 		if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1)) {
 			SYSLOG("cr", "preemption check: failed to hook %s (error %d)", request.symbol, patcher.getError());
