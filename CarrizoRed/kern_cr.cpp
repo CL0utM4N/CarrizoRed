@@ -1334,6 +1334,9 @@ void CRDriver::wrapSetCrtcToPixelClock(void *that, uint8_t crtc, uint8_t pll, vo
 // microcode load, the FB window move, SCLK DPM, RB+, video power) has to be redone on wake. First, see the sequence.
 static void diskLogEvent(const char *fmt, ...);
 static uint32_t systemSleeps, systemWakes;
+// Set on each wake: the watcher writes a full black-box report to the disk log 30 s later (the GPU's state once macOS
+// has brought it back, which the periodic reports miss when the machine dies first).
+static uint64_t wakeReportAtMs;
 static volatile uint32_t watcherBeat;  // watcher ticks, for the wake watchdog
 
 // Wake watchdog (21:34 sleep: the log ends at "sleep params" and the machine never came back, nothing in NVRAM). 45 s
@@ -1385,6 +1388,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 		case kIOMessageSystemHasPoweredOn:
 			systemWakes++;
 			diskLogEvent("system has powered on (%u)", systemWakes);
+			__atomic_store_n(&wakeReportAtMs, uptimeMs() + 30000, __ATOMIC_RELAXED);
 			break;
 		default:
 			break;
@@ -2082,6 +2086,15 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (!diskLogOff && diskLogStarted && t >= 120 && (t - 120) % 300 == 0 && tick % 2 == 0) {
 			const char *report = self->composeReport(t, now);
 			diskLogEvent("black-box report at t=%u s follows", t);
+			diskLogTick(t, stallTicks);
+			diskLogAppend(report, strlen(report));
+			diskLogAppend("\n", 1);
+		}
+		if (uint64_t at = __atomic_load_n(&wakeReportAtMs, __ATOMIC_RELAXED); at && uptimeMs() >= at && !diskLogOff &&
+			diskLogStarted) {
+			__atomic_store_n(&wakeReportAtMs, 0, __ATOMIC_RELAXED);
+			const char *report = self->composeReport(t, now);
+			diskLogEvent("black-box report 30 s after wake %u follows", systemWakes);
 			diskLogTick(t, stallTicks);
 			diskLogAppend(report, strlen(report));
 			diskLogAppend("\n", 1);
@@ -5773,6 +5786,10 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 
 static void dpcdRecord(uint32_t address, uint32_t length, bool write, const uint8_t *data, IOReturn ret) {
 	__atomic_fetch_add(&dpcdCount, 1, __ATOMIC_RELAXED);
+	// Link set-up (0x100-0x10A) and sink power (0x600) writes into the disk log: whether the panel was trained again
+	// after a wake, and with what.
+	if (write && data && length && ((address >= 0x100 && address <= 0x10A) || address == 0x600))
+		diskLogEvent("dpcd write %x = %02x%s (len %u) -> %x", address, data[0], length > 1 ? "..." : "", length, ret);
 	if (write && address == 0x102 && length >= 1 && data && (data[0] & 3) == 1 && gpuMmio) {
 		for (size_t i = 0; i < sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0]); i++)
 			trainSnap[i] = gpuMmio[trainSnapRegs[i]];
