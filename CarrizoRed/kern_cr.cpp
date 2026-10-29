@@ -512,6 +512,10 @@ static bool dpExtClkOff;    // -crnodpextclk, see wrapExecuteBiosCommandTable
 static bool edpPowerOnOff;  // -crnoedppoweron, see wrapExecuteBiosCommandTable
 static bool edpSeen;                 // Apple enabled an eDP transmitter (connector 0x14) this boot
 static volatile bool edpWakePowerOn;  // a full wake is under way: power the eDP panel before the next AUX transaction
+// Catalina wake #7 (log 1793307460): with the panel powered, AUX still failed after the full wake, and the machine was
+// restarted 10 s later, before the 30 s report. The first failed DPCD transfer of a full wake brings the report forward
+// to 1 s later and adds the display sections (VBIOS calls, DPCD, the register diff against the firmware's boot state).
+static volatile bool wakeAuxWatch, wakeDisplayDiag;
 
 // eDP block state at the moment Apple starts training pattern 1 (DPCD 0x102 written with TPS1): panel power
 // sequencer, DIG0, DP0, pixel rate, backlight. The black box otherwise only sees the state after Apple gave up.
@@ -1504,6 +1508,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 		case kIOMessageSystemWillPowerOn:
 			diskLogEvent("system will power on");
 			__atomic_store_n(&edpWakePowerOn, true, __ATOMIC_RELAXED);
+			__atomic_store_n(&wakeAuxWatch, true, __ATOMIC_RELAXED);
 			if (wakeWatchdogCall) {
 				wakeWakesAtStart = systemWakes;
 				wakeBeatAtStart = watcherBeat;
@@ -2221,7 +2226,9 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			diskLogStarted) {
 			__atomic_store_n(&wakeReportAtMs, 0, __ATOMIC_RELAXED);
 			const char *report = self->composeReport(t, now);
-			diskLogEvent("black-box report 30 s after wake %u follows", systemWakes);
+			bool diag = __atomic_exchange_n(&wakeDisplayDiag, false, __ATOMIC_RELAXED);
+			diskLogEvent("black-box report %s after wake %u follows", diag ? "1 s after a failed DPCD transfer" : "30 s",
+				systemWakes);
 			diskLogTick(t, stallTicks);
 			diskLogAppend(report, strlen(report));
 			diskLogAppend("\n", 1);
@@ -5943,6 +5950,10 @@ static void dpcdRecord(uint32_t address, uint32_t length, bool write, const uint
 	// after a wake, and with what.
 	if (write && data && length && ((address >= 0x100 && address <= 0x10A) || address == 0x600))
 		diskLogEvent("dpcd write %x = %02x%s (len %u) -> %x", address, data[0], length > 1 ? "..." : "", length, ret);
+	if (ret != kIOReturnSuccess && __atomic_exchange_n(&wakeAuxWatch, false, __ATOMIC_RELAXED)) {
+		__atomic_store_n(&wakeDisplayDiag, true, __ATOMIC_RELAXED);
+		__atomic_store_n(&wakeReportAtMs, uptimeMs() + 1000, __ATOMIC_RELAXED);
+	}
 	if (write && address == 0x102 && length >= 1 && data && (data[0] & 3) == 1 && gpuMmio) {
 		for (size_t i = 0; i < sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0]); i++)
 			trainSnap[i] = gpuMmio[trainSnapRegs[i]];
@@ -6034,8 +6045,10 @@ static const struct {
 	{0x1A00, 0x200}, // pipe 0: DCP (surface, DVMM, CSC, gamma), LB, DCFE, DMIF_PG/DPG, SCL, BLND, CRTC, FMT
 	{0x4800, 0x100}, // LVTMA power sequencer, backlight, HPD, DCIO
 	{0x4A00, 0x100}, // DIG0 / DP0
+	{0x1898, 0x30},  // DC_HPD1-6 (INT_STATUS, INT_CONTROL, CONTROL, ...)
+	{0x5C00, 0xB0},  // DP_AUX0-5 (AUX_CONTROL, arbitration, DPHY TX/RX set-up)
 };
-static constexpr uint32_t DiffRegCount = 0x60 + 0x80 + 0x200 + 0x100 + 0x100;
+static constexpr uint32_t DiffRegCount = 0x60 + 0x80 + 0x200 + 0x100 + 0x100 + 0x30 + 0xB0;
 static uint32_t diffBoot[DiffRegCount];
 static bool diffBootValid;
 
@@ -9667,7 +9680,8 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 	add("tree:\n%s", tree ? tree : "");
 	// The display-debugging sections (VBIOS calls, DPCD, link training, block diff, surface and pixels) are left out of
 	// accelerated boots, whose trace summary needs the room in NVRAM; -crdisplaydiag keeps them.
-	bool displayDiag = checkKernelArgument("-crnoaccel") || checkKernelArgument("-crdisplaydiag");
+	bool displayDiag = checkKernelArgument("-crnoaccel") || checkKernelArgument("-crdisplaydiag") ||
+		__atomic_load_n(&wakeDisplayDiag, __ATOMIC_RELAXED);
 	if (gpuMmio) {
 		// Registers as offset=now/boot (boot = what the firmware's GOP left, with a working eDP link) where they
 		// changed, then the offsets that still hold their boot value.
