@@ -7114,18 +7114,22 @@ static bool gcn3VgprFields(const uint32_t *code, uint32_t len, VgprField *f, uin
 		case 0x3C: {  // MIMG: vaddr range read; vdata written by loads/samples, read by stores, both by atomics
 			if (len < 2)
 				return false;
+			// vdata: one register per dmask component (gathers: always 4), plus one for the TFE/LWE status. GFX8's d16 is
+			// unpacked (each half in its own register's low bits), so d16 doesn't change the count (Tahoe, log
+			// 1793354624: 119 shaders refused at a d16 image_sample_b, f0940f00 80450103, counted as a bound).
 			uint32_t op = (w >> 18) & 0x7F, dmask = (w >> 8) & 0xF;
-			bool d16 = code[1] >> 31;
-			uint8_t count = static_cast<uint8_t>(__builtin_popcount(dmask) ? __builtin_popcount(dmask) : 1);
+			bool status = (w >> 16) & 3;  // TFE, LWE
 			bool gather = op >= 0x40 && op <= 0x5F;
+			uint32_t components = gather ? 4 : __builtin_popcount(dmask) ? __builtin_popcount(dmask) : 1;
+			uint8_t count = static_cast<uint8_t>(components + (status ? 1 : 0));
 			bool store = op >= 0x08 && op <= 0x0B, atomic = op >= 0x0F && op <= 0x1C;
 			add(1, 0, 8, 4, true, false);
 			if (store)
-				add(1, 8, 8, count, true, false, !d16);
+				add(1, 8, 8, static_cast<uint8_t>(components), true, false, true);
 			else if (atomic)
 				add(1, 8, 8, 4, true, true);
 			else
-				add(1, 8, 8, gather ? 4 : count, false, true, !d16);
+				add(1, 8, 8, count, false, true, true);
 			return true;
 		}
 		case 0x38: {  // MUBUF: exact vdata sizes for the plain loads and stores; d16, lds and atomics are bounds
