@@ -5232,9 +5232,22 @@ static constexpr uint32_t IhCntlEnableIntr = 0x1, IhCntlRptrRearm = 0x10;
 // storm that left the accelerator's submissions waiting forever. Move the ring into our VRAM region (after the SMU
 // data) with Apple's own BaffinInterruptManager::setRingBufferLocation({cpu, gpu, size}), as the accelerator does on a
 // discrete card; the CPU reads it through an uncached mapping of the carve-out. -crnoihmove disables it.
+// A wake re-initialises the IH with Apple's original ring (Catalina, both wakes: RB_BASE 25c300 instead of ours, RPTR
+// stuck at 0x20 while WPTR lapped the ring, then the storm breaker and fence time-outs), so the enable wrapper checks
+// RB_BASE and moves the ring again (reapplyIhRing).
 static IOMemoryMap *ihRingMap;
 static const char *ihMoveResult;
 static uint64_t ihMovedGpu;
+static uint32_t ihRingSize, ihRingMoves;
+
+static void reapplyIhRing(void *manager) {
+	memset(reinterpret_cast<void *>(ihRingMap->getVirtualAddress()), 0, ihRingSize + 0x1000);
+	struct {
+		uint64_t cpu, gpu, size;
+	} info {static_cast<uint64_t>(ihRingMap->getVirtualAddress()), ihMovedGpu, ihRingSize};
+	reinterpret_cast<uint32_t (*)(void *, void *)>(ihSetRingBufferLocation)(manager, &info);
+	ihRingMoves++;
+}
 
 static void moveIhRing(void *manager) {
 	using namespace Smu8;
@@ -5260,14 +5273,11 @@ static void moveIhRing(void *manager) {
 		ihMoveResult = "can't map the ring";
 		return;
 	}
-	memset(reinterpret_cast<void *>(ihRingMap->getVirtualAddress()), 0, size + 0x1000);
-	struct {
-		uint64_t cpu, gpu, size;
-	} info {static_cast<uint64_t>(ihRingMap->getVirtualAddress()), smuLoad.mc + IhOffset, size};
-	ihMovedGpu = info.gpu;
-	reinterpret_cast<uint32_t (*)(void *, void *)>(ihSetRingBufferLocation)(manager, &info);
+	ihMovedGpu = smuLoad.mc + IhOffset;
+	ihRingSize = size;
+	reapplyIhRing(manager);
 	ihMoveResult = "moved";
-	traceNote("ihring=%llx ", info.gpu);
+	traceNote("ihring=%llx ", ihMovedGpu);
 }
 
 void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
@@ -5279,6 +5289,23 @@ void CRDriver::wrapIhSetHardwareEnabled(void *that, bool enable) {
 	ihManager = that;
 	traceEvent(off ? "IH enable (forced off by -crnoih)" : enable ? "IH enable" : "IH disable", true, enable);
 	FunctionCast(wrapIhSetHardwareEnabled, callback->orgIhSetHardwareEnabled)(that, enable && !off);
+	if (enable && !off && gpuMmio && ihMoveResult && !strcmp(ihMoveResult, "moved") &&
+		gpuMmio[IhReg::RB_BASE] != static_cast<uint32_t>(ihMovedGpu >> 8)) {
+		uint32_t was = gpuMmio[IhReg::RB_BASE];
+		FunctionCast(wrapIhSetHardwareEnabled, callback->orgIhSetHardwareEnabled)(that, false);
+		reapplyIhRing(that);
+		FunctionCast(wrapIhSetHardwareEnabled, callback->orgIhSetHardwareEnabled)(that, true);
+		diskLogEvent("ih ring moved again: RB_BASE %x -> %x", was, gpuMmio[IhReg::RB_BASE]);
+		traceNote("ihring again(%u) ", ihRingMoves);
+	}
+	// A new enable starts from a freshly programmed ring: give the storm breaker a clean slate (it tripped on the stale
+	// interrupts right after a wake, before the GPU was re-initialised, and then ignored every interrupt for good).
+	if (enable && !off && __atomic_load_n(&ihStormBroken, __ATOMIC_RELAXED)) {
+		ihWindowStart = 0;
+		ihWindowCalls = 0;
+		__atomic_store_n(&ihStormBroken, false, __ATOMIC_RELAXED);
+		diskLogEvent("ih storm breaker re-armed on IH enable");
+	}
 	if (gpuMmio && !checkKernelArgument("-crnoihfix")) {
 		uint32_t cntl = gpuMmio[IhReg::CNTL];
 		if (enable && !off)
@@ -9404,7 +9431,7 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 		} else {
 			add("ih: rptr writes %u last %x\n", ihReadPointerWrites, ihLastReadPointer);
 		}
-		add("ih ring move: %s, gpu %llx", ihMoveResult ? ihMoveResult : "not tried", ihMovedGpu);
+		add("ih ring move: %s, gpu %llx, applied %u", ihMoveResult ? ihMoveResult : "not tried", ihMovedGpu, ihRingMoves);
 		if (ihRingMap) {
 			auto *ring = reinterpret_cast<volatile uint32_t *>(ihRingMap->getVirtualAddress());
 			uint32_t size = static_cast<uint32_t>(ihRingMap->getLength()) - 0x1000;
