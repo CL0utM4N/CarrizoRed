@@ -522,6 +522,26 @@ static uint32_t atomFlag;
 // "will sleep", done right after Apple's DPCD 0x600 = 2 (sink power down) succeeds. -crnosleeppoweroff disables.
 static volatile bool panelOffPending;
 static uint32_t panelOffDone;
+// DIG1TransmitterControl v1.5 parameters for the eDP transmitter built the way Linux's DC builds them
+// (bios/command_table.c transmitter_control_v1_5 with dce110's helpers), not copied from Apple's calls: Apple's last call
+// before sleep is a DISABLE in DVI mode (ucDigMode 2) with a symbol clock and DIG encoder 1, which made our INIT set the
+// eDP PHY up for TMDS. From DC: UNIPHY id and HPD from the panel's own transmitter, the eDP connector (0x14), DP mode,
+// 4 lanes, no symbol clock, clock source P0PLL (DC's zeroed pll_id = CLOCK_SOURCE_ID_PLL0), not coherent, DIG encoder
+// select 0 (DC programs the FE selection itself on DCE 11).
+static void dcTransmitterParams(uint8_t action, uint8_t *p) {
+	memset(p, 0, 32);
+	p[2] = edpTransmitter[2];  // ucPhyId (ATOM_PHY_ID_UNIPHYA ...)
+	p[3] = action;
+	p[4] = 4;                  // ucLaneNum: LANE_COUNT_FOUR
+	p[5] = 0x14;               // ucConnObjId: eDP
+	p[6] = 0;                  // ucDigMode: ATOM_TRANSMITTER_DIGMODE_V5_DP
+	// asConfig: [1] ucCoherentMode 0, [3:2] ucPhyClkSrcId ATOM_TRANSMITTER_CONFIG_V5_P0PLL (2), [6:4] ucHPDSel (Apple's)
+	p[7] = static_cast<uint8_t>((edpTransmitter[7] & 0x70) | (2 << 2));
+}
+// Linux's DC panel_cntl keeps the backlight PWM set-up across suspend (dce_panel_cntl: BL_PWM_CNTL, BL_PWM_CNTL2,
+// BL_PWM_PERIOD_CNTL, LVTMA_PWRSEQ_REF_DIV) and writes it back at resume if S3 cleared it. Saved at "will sleep".
+static uint32_t panelCntlSaved[4];
+static bool panelCntlValid;
 static volatile bool edpWakePowerOn;  // a full wake is under way: power the eDP panel before the next AUX transaction
 // Catalina wake #7 (log 1793307460): with the panel powered, AUX still failed after the full wake, and the machine was
 // restarted 10 s later, before the 30 s report. The first failed DPCD transfer of a full wake brings the report forward
@@ -1674,6 +1694,13 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			systemSleeps++;
 			if (edpSeen && !checkKernelArgument("-crnosleeppoweroff"))
 				__atomic_store_n(&panelOffPending, true, __ATOMIC_RELAXED);
+			if (gpuMmio) {
+				panelCntlSaved[0] = gpuMmio[0x4820];  // BL_PWM_CNTL
+				panelCntlSaved[1] = gpuMmio[0x4821];  // BL_PWM_CNTL2
+				panelCntlSaved[2] = gpuMmio[0x4822];  // BL_PWM_PERIOD_CNTL
+				panelCntlSaved[3] = gpuMmio[0x481D];  // LVTMA_PWRSEQ_REF_DIV
+				panelCntlValid = true;
+			}
 			diskLogEvent("last AUX call before sleep: in %08x %08x %08x %08x -> out %08x %08x, ok %x; HPD_ID learned %x "
 				"(successes by HPD_ID %u %u %u %u %u %u), forced %u times", lastAuxCall.in[0], lastAuxCall.in[1],
 				lastAuxCall.in[2], lastAuxCall.in[3], lastAuxCall.out[0], lastAuxCall.out[1], lastAuxCall.ok, auxHpdGood,
@@ -6162,16 +6189,17 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 				gpuMmio ? gpuMmio[0x1707] : 0);
 		}
 		uint32_t restored = restoreAfterWake();
-		diskLogEvent("wake: %u display registers restored to their boot values before the first AUX transaction", restored);
+		diskLogEvent("wake: %u registers restored before the first AUX transaction (VBIOS scratch and backlight from sleep%s)",
+			restored, checkKernelArgument("-crwakeregrestore") ? ", boot-time display registers" : "");
 		// Wake #14 (log 1793329705): with 44 registers back (DC_GPIO_DEBUG included) AUX still timed out. Linux's legacy
 		// DCE 11 resume (dce_v11_0_resume -> amdgpu_atombios_encoder_init_dig) runs each DIG transmitter's
 		// ATOM_TRANSMITTER_ACTION_INIT (7) after power loss, which sets the PHY up again; Apple never does. Replay Apple's
 		// own last eDP transmitter call with that action, before the panel power-on and the first AUX transaction.
 		// -crnowakerestore disables this too.
+		// Built as DC builds it (dce110_link_encoder_hw_init), see dcTransmitterParams.
 		if (edpTransmitterSeen && !checkKernelArgument("-crnowakerestore")) {
 			uint8_t init[32];
-			memcpy(init, edpTransmitter, sizeof(init));
-			init[3] = 7;  // ATOM_TRANSMITTER_ACTION_INIT
+			dcTransmitterParams(7, init);  // ATOM_TRANSMITTER_ACTION_INIT
 			uint8_t inited = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
 				AtomTransmitterTable, init, flag);
 			diskLogEvent("wake: eDP transmitter INIT (phy %u lanes %u mode %u config %02x): ok %u", init[2], init[4], init[6],
@@ -6186,10 +6214,7 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 		// calibrated as Linux does. So: a clean power cycle with Apple's eDP transmitter parameters, as DC does it.
 		if (edpTransmitterSeen && !checkKernelArgument("-crnowakepowercycle")) {
 			uint8_t power[32];
-			memcpy(power, edpTransmitter, sizeof(power));
-			power[4] = 4;  // LANE_COUNT_FOUR, as DC
-			power[6] = 0;  // ATOM_ENCODER_MODE_DP (eDP)
-			power[3] = 13;  // ATOM_TRANSMITTER_ACTION_POWER_OFF
+			dcTransmitterParams(13, power);  // ATOM_TRANSMITTER_ACTION_POWER_OFF, as dce110_edp_power_control
 			uint8_t off = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
 				AtomTransmitterTable, power, flag);
 			bool sleepOk = ml_get_interrupts_enabled() && !ml_at_interrupt_context();
@@ -6197,10 +6222,7 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 				IOSleep(500);
 			else
 				IODelay(500000);
-			memcpy(power, edpTransmitter, sizeof(power));
-			power[4] = 4;
-			power[6] = 0;
-			power[3] = 12;  // ATOM_TRANSMITTER_ACTION_POWER_ON
+			dcTransmitterParams(12, power);  // ATOM_TRANSMITTER_ACTION_POWER_ON
 			uint8_t on = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
 				AtomTransmitterTable, power, flag);
 			// Wait for the panel's HPD (DC_HPD1_INT_STATUS.DC_HPD_SENSE), up to 500 ms, then 50 ms more.
@@ -6297,10 +6319,10 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	// every swing. At boot, Apple's VBIOS ENABLE runs with the UNIPHY analogue registers still holding the firmware's
 	// values (UNIPHY_TMDP_REG3-5 230e0001/9000000/48a300aa) and training passes; after S3 they read reset values
 	// (e0001/0/0), which the ENABLE doesn't program. Put the UNIPHY macro registers back right after Apple's eDP
-	// transmitter ENABLE in a wake session. -crnotmdprestore disables.
+	// transmitter ENABLE in a wake session. A copy of boot-time registers, not what Linux does: opt-in (-crtmdprestore).
 	if (table == AtomTransmitterTable && params && static_cast<uint8_t *>(params)[3] == 1 &&
 		static_cast<uint8_t *>(params)[5] == 0x14 && __atomic_load_n(&dcAuxOn, __ATOMIC_RELAXED) && gpuMmio &&
-		!checkKernelArgument("-crnotmdprestore")) {
+		checkKernelArgument("-crtmdprestore")) {
 		uint32_t before[3] {gpuMmio[0x48D1], gpuMmio[0x48D2], gpuMmio[0x48D3]}, written = 0;
 		for (uint32_t r = 0x48C0; r < 0x4A00; r++) {
 			uint32_t boot;
@@ -6432,9 +6454,9 @@ IOReturn CRDriver::wrapAuxWriteBytes(void *that, uint32_t address, uint32_t leng
 	// boot's 0x20211 (SYNCEN_OVRD and DIGON_OVRD; SYNCEN gates the transmitter's data output) and DIG_FE_CNTL 0 against
 	// 0x1000000 (DIG_SYMCLK_FE_ON), and clock recovery failed every time. In a wake session, just before Apple starts
 	// training (DPCD 0x102 = TPS1), put the power sequencer and DIG front end as they were at the boot's TPS1.
-	// -crnotps1restore disables.
+	// A copy of boot-time registers, not what Linux does: opt-in (-crtps1restore).
 	if (address == 0x102 && length >= 1 && data && (data[0] & 3) == 1 && trainBootValid && gpuMmio &&
-		__atomic_load_n(&dcAuxOn, __ATOMIC_RELAXED) && !checkKernelArgument("-crnotps1restore")) {
+		__atomic_load_n(&dcAuxOn, __ATOMIC_RELAXED) && checkKernelArgument("-crtps1restore")) {
 		// Wake #28 (log 1793358173): PWRSEQ_CNTL then matched, but UNIPHYB_LINK_CNTL (Apple's own boot value 0x100100,
 		// not the firmware's), UNIPHY_TMDP_REG3/5 (reset again by the VBIOS swing set-up after our post-ENABLE restore)
 		// and DIG_FE_CNTL still differed at TPS1. Put all the boot TPS1 control registers back here.
@@ -6455,10 +6477,7 @@ IOReturn CRDriver::wrapAuxWriteBytes(void *that, uint32_t address, uint32_t leng
 	if (address == 0x600 && length >= 1 && data && data[0] == 2 && ret == kIOReturnSuccess && edpTransmitterSeen &&
 		atomParser && __atomic_exchange_n(&panelOffPending, false, __ATOMIC_RELAXED)) {
 		uint8_t power[32];
-		memcpy(power, edpTransmitter, sizeof(power));
-		power[3] = 13;  // ATOM_TRANSMITTER_ACTION_POWER_OFF
-		power[4] = 4;   // LANE_COUNT_FOUR, as DC
-		power[6] = 0;   // ATOM_ENCODER_MODE_DP
+		dcTransmitterParams(13, power);  // ATOM_TRANSMITTER_ACTION_POWER_OFF
 		uint8_t off = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(atomParser,
 			AtomTransmitterTable, power, atomFlag);
 		panelOffDone++;
@@ -6599,20 +6618,32 @@ static uint32_t restoreAfterWake() {
 				gpuMmio[0x5C9 + i] = biosScratch[i];
 				written++;
 			}
-	for (auto r : early)
-		regs[n++] = r;
-	for (uint32_t r = 0x48C0; r < 0x48D8; r++)
-		regs[n++] = r;
-	for (uint32_t ch = 0; ch < 6; ch++)
-		for (uint32_t r = 0; r < 4; r++)
-			regs[n++] = 0x5C08 + ch * 0x1C + r;
-	for (uint32_t r = 0x481D; r <= 0x4822; r++)
-		regs[n++] = r;
-	for (uint32_t i = 0; i < n; i++) {
-		uint32_t boot;
-		if (diffBootValue(regs[i], boot) && gpuMmio[regs[i]] != boot) {
-			gpuMmio[regs[i]] = boot;
-			written++;
+	// The backlight PWM set-up as it was at "will sleep", where S3 cleared it, as Linux's DC panel_cntl does at resume.
+	static const uint32_t panelCntlRegs[] {0x4820, 0x4821, 0x4822, 0x481D};
+	if (panelCntlValid)
+		for (size_t i = 0; i < arrsize(panelCntlRegs); i++)
+			if (gpuMmio[panelCntlRegs[i]] != panelCntlSaved[i]) {
+				gpuMmio[panelCntlRegs[i]] = panelCntlSaved[i];
+				written++;
+			}
+	// The rest copies the firmware's boot-time values back, which Linux never does (it sets these up through its own code
+	// and the VBIOS): opt-in (-crwakeregrestore) since the DC-style INIT, power gating and power cycle (wake #29).
+	if (checkKernelArgument("-crwakeregrestore")) {
+		for (auto r : early)
+			regs[n++] = r;
+		for (uint32_t r = 0x48C0; r < 0x48D8; r++)
+			regs[n++] = r;
+		for (uint32_t ch = 0; ch < 6; ch++)
+			for (uint32_t r = 0; r < 4; r++)
+				regs[n++] = 0x5C08 + ch * 0x1C + r;
+		for (uint32_t r = 0x481D; r <= 0x4822; r++)
+			regs[n++] = r;
+		for (uint32_t i = 0; i < n; i++) {
+			uint32_t boot;
+			if (diffBootValue(regs[i], boot) && gpuMmio[regs[i]] != boot) {
+				gpuMmio[regs[i]] = boot;
+				written++;
+			}
 		}
 	}
 	// AUX_CONTROL (0x5C00 + 0x1C per channel): pulse AUX_RESET (0x10) on each enabled engine (AUX_EN, 0x1) and wait for

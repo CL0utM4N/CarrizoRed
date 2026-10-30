@@ -239,11 +239,12 @@ and the list of affected machines.
 | `-crnovramtest` | Reporting `ATIController::TestVRAM` as passed (the real result is still logged) |
 | `-crnolbfix` | DCE 11.0's line-buffer size (0x6B0) in `LB_MEMORY_CTRL` instead of Apple's |
 | `-crnoedppoweron` | The eDP panel POWER_ON transmitter action before Apple enables the eDP transmitter, and before the first AUX transaction after a wake |
-| `-crnowakerestore` | Don't run the VBIOS EnableDispPowerGating INIT/DISABLE on both pipes after a wake, and don't restore the display registers S3 resets (display PLL bandgap, display reference clock and time bases, DENTIST display clock, AUX pad calibration, panel power pads, UNIPHY0 macro settings, AUX PHY set-up, panel power sequencer delays, backlight PWM) to their boot values after a wake |
+| `-crnowakerestore` | Don't run Linux DC's resume steps after a wake: VBIOS EnableDispPowerGating INIT/DISABLE on both pipes, the VBIOS scratch and backlight PWM registers from before sleep, the eDP transmitter INIT with DC's parameters, the AUX engine reset |
+| `-crwakeregrestore` | Experimental: after a wake, also copy the firmware's boot-time display registers back (display clocks and time bases, PLL bandgap, AUX pad calibration and PHY set-up, panel power pads, UNIPHY0 macro). Not what Linux does |
 | `-crnoauxprobe` | Skip the diagnostic native AUX read of DPCD 0 (Linux DC's register sequence, bypassing the VBIOS AUX table) at boot and after a wake |
 | `-crnosleeppoweroff` | Don't power the eDP panel off before sleep (VBIOS POWER_OFF with the panel's parameters, right after Apple's DPCD 0x600 = 2), as Linux's DC does at suspend |
-| `-crnotps1restore` | After a wake, don't put LVTMA_PWRSEQ_CNTL and DIG_FE_CNTL back to their values at the boot's link training (TPS1) just before Apple's training starts |
-| `-crnotmdprestore` | After a wake, don't put the UNIPHY analogue (TMDP) registers back to the firmware's values right after Apple's eDP transmitter ENABLE |
+| `-crtps1restore` | Experimental: after a wake, copy LVTMA_PWRSEQ_CNTL, the UNIPHY link controls, TMDP_REG3/5 and DIG_FE_CNTL from the boot's link training (TPS1) back just before Apple's training. A boot-time copy, not what Linux does |
+| `-crtmdprestore` | Experimental: after a wake, copy the UNIPHY macro registers' boot values back right after Apple's eDP transmitter ENABLE. A boot-time copy, not what Linux does |
 | `-crnowakepowercycle` | After a wake, don't power-cycle the eDP panel the way Linux's DC does (VBIOS POWER_OFF and POWER_ON with the panel's transmitter parameters, 500 ms apart, then wait for HPD); use the all-zero POWER_ON instead |
 | `-crnodcaux` | After a wake, don't prepare each VBIOS AUX transfer the way Linux's DC does (clear the AUX pads' calibration errors, force a recalibration, acknowledge the last transfer; once: receive window 1, LS reads off) |
 | `-crauxhpd` | Experimental: put the HPD_ID learned from working AUX calls into byte 8 of Apple's VBIOS AUX parameters (put back after each call). Off by default: that byte is Apple's own DPCD address, and AUX works at boot whatever it holds |
