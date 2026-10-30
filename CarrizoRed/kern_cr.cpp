@@ -6209,8 +6209,15 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			// registers (UNIPHY_TMDP_REG3-5, 0x48D1-0x48D3) read e0001/0/0 against the firmware's 230e0001/9000000/
 			// 48a300aa, and UNIPHY2's TMDP_REG5 (0x4913) lacks bit 28: the restore had put UNIPHY0's back, then the VBIOS
 			// calls reset them. Put the UNIPHY0-8 macro blocks back now, right before AUX.
+			// Wake #24 (log 1793352655): with the bandgap and power gating set up, AUX answered, but Apple's link
+			// training then failed clock recovery 12 times at every swing. This and the transmitter-enabled AUX read
+			// below ran just before it, with the firmware's link-running PHY settings and an ENABLE/DISABLE; both opt-in
+			// now (-cruniphyrestore, -crauxprobeenable). LVTMA_PWRSEQ_CNTL.BLON_OVRD (0x2000000), forcing the backlight off
+			// since S3 (the firmware doesn't set it), is cleared.
+			if (gpuMmio && !checkKernelArgument("-crnowakerestore"))
+				gpuMmio[0x481B] = gpuMmio[0x481B] & ~0x2000000U;
 			uint32_t uniphy = 0;
-			if (!checkKernelArgument("-crnowakerestore") && gpuMmio) {
+			if (checkKernelArgument("-cruniphyrestore") && gpuMmio) {
 				for (uint32_t r = 0x48C0; r < 0x4A00; r++) {
 					uint32_t boot;
 					if (diffBootValue(r, boot) && gpuMmio[r] != boot) {
@@ -6225,21 +6232,26 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 				// panel powered and HPD up. At boot the firmware has the eDP transmitter enabled; here it is off. Try the
 				// read with the transmitter on too (VBIOS ENABLE with Apple's recorded parameters), then turn it off again
 				// so Apple's own sequence runs as it would.
-				uint8_t reply2, data2;
+				uint8_t reply2 = 0xFF, data2 = 0;
+				uint32_t status2 = 0;
+				uint8_t enabled = 0;
 				uint8_t enable[32];
-				memcpy(enable, edpTransmitter, sizeof(enable));
-				enable[3] = 1;  // ATOM_TRANSMITTER_ACTION_ENABLE
-				uint8_t enabled = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
-					AtomTransmitterTable, enable, flag);
-				IODelay(1000);
-				uint32_t status2 = nativeAuxRead(0, &reply2, &data2);
-				memcpy(enable, edpTransmitter, sizeof(enable));
-				enable[3] = 0;  // ATOM_TRANSMITTER_ACTION_DISABLE
-				FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that, AtomTransmitterTable,
-					enable, flag);
-				diskLogEvent("native AUX read of DPCD 0 after wake with the eDP transmitter enabled (ok %u, symclk %x): "
-					"SW_STATUS %x, reply %x, DPCD revision %02x, RX_STATUS %x", enabled & 1,
-					edpTransmitter[0] | edpTransmitter[1] << 8, status2, reply2, data2, gpuMmio ? gpuMmio[0x5C0D] : 0);
+				if (checkKernelArgument("-crauxprobeenable")) {
+					memcpy(enable, edpTransmitter, sizeof(enable));
+					enable[3] = 1;  // ATOM_TRANSMITTER_ACTION_ENABLE
+					enabled = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
+						AtomTransmitterTable, enable, flag);
+					IODelay(1000);
+					status2 = nativeAuxRead(0, &reply2, &data2);
+					memcpy(enable, edpTransmitter, sizeof(enable));
+					enable[3] = 0;  // ATOM_TRANSMITTER_ACTION_DISABLE
+					FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that, AtomTransmitterTable,
+						enable, flag);
+				}
+				if (enabled)
+					diskLogEvent("native AUX read of DPCD 0 after wake with the eDP transmitter enabled (ok %u, symclk %x): "
+						"SW_STATUS %x, reply %x, DPCD revision %02x, RX_STATUS %x", enabled & 1,
+						edpTransmitter[0] | edpTransmitter[1] << 8, status2, reply2, data2, gpuMmio ? gpuMmio[0x5C0D] : 0);
 				uint8_t reply, data;
 				uint32_t status = nativeAuxRead(0, &reply, &data);
 				diskLogEvent("native AUX read of DPCD 0 after wake: SW_STATUS %x, reply %x (0 = ACK), DPCD revision %02x, "
