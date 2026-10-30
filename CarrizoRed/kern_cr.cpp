@@ -615,12 +615,24 @@ static volatile uint32_t *gpuMmio;  // BAR5, mapped by probeMMIO
 // get_channel_status, read_channel_reply), bypassing the VBIOS AUX table: does the panel answer at all? Run once at boot
 // (where AUX works, to prove this code) and once on a wake after the panel power cycle. Returns AUX_SW_STATUS; *reply
 // gets the reply command (0 = ACK), *data the first byte read.
+static uint32_t nativeAuxDdcMask[7];  // DC_GPIO_DDC1-6_MASK, DDCVGA_MASK as found by the last native read
+static void dcAuxCalibrate();
 static uint32_t nativeAuxRead(uint32_t address, uint8_t *reply, uint8_t *data) {
 	auto *m = gpuMmio;
 	*reply = 0xFF;
 	*data = 0;
 	if (!m)
 		return 0xFFFFFFFF;
+	// Wake #20 (log 1793337523): this read timed out at boot too (0xA1), where the VBIOS AUX calls right after it
+	// worked, so it lacked a step. DC's acquire() first puts the line's pads in AUX mode (dal_ddc_open, MODE_AUX:
+	// DC_GPIO_DDC1_MASK.AUX_PAD1_MODE, 0x10000), and submit_channel_request recalibrates the pads. AUX0 is DDC1's
+	// pads; the mode is put back afterwards for the VBIOS.
+	for (uint32_t i = 0; i < 7; i++)
+		nativeAuxDdcMask[i] = m[0x4868 + i * 4];
+	uint32_t ddc1 = m[0x4868];
+	if (!(ddc1 & 0x10000))
+		m[0x4868] = ddc1 | 0x10000;
+	dcAuxCalibrate();
 	if (!(m[0x5C00] & 1))
 		m[0x5C00] = m[0x5C00] | 1;  // AUX_CONTROL.AUX_EN
 	m[0x5C02] = m[0x5C02] | 0x10000;  // AUX_ARB_CONTROL.AUX_SW_USE_AUX_REG_REQ
@@ -646,6 +658,7 @@ static uint32_t nativeAuxRead(uint32_t address, uint8_t *reply, uint8_t *data) {
 			*data = static_cast<uint8_t>((m[0x5C06] >> 8) & 0xFF);
 	}
 	m[0x5C02] = (m[0x5C02] & ~0x10000U) | 0x20000;  // AUX_SW_DONE_USING_AUX_REG
+	m[0x4868] = ddc1;
 	return status;
 }
 
@@ -657,6 +670,13 @@ static void dcAuxPrepare() {
 		m[0x5C00] = m[0x5C00] & ~0x100U;                    // AUX_CONTROL.AUX_LS_READ_EN = 0
 		m[0x5C0A] = (m[0x5C0A] & ~0x700U) | (1U << 8);      // AUX_DPHY_RX_CONTROL0.AUX_RX_RECEIVE_WINDOW = 1
 	}
+	dcAuxCalibrate();
+}
+
+static void dcAuxCalibrate() {
+	auto *m = gpuMmio;
+	if (!m)
+		return;
 	// clear_aux_error: AUXN/AUXP_CALOUT_ERROR_AK (0x400) 1 then 0.
 	static const uint32_t impcal[] {0x483C, 0x483B};
 	for (auto reg : impcal) {
@@ -6153,7 +6173,9 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 				uint8_t reply, data;
 				uint32_t status = nativeAuxRead(0, &reply, &data);
 				diskLogEvent("native AUX read of DPCD 0 after wake: SW_STATUS %x, reply %x (0 = ACK), DPCD revision %02x, "
-					"RX_STATUS %x", status, reply, data, gpuMmio ? gpuMmio[0x5C0D] : 0);
+					"RX_STATUS %x; DDC1-6/VGA masks %x %x %x %x %x %x %x", status, reply, data, gpuMmio ? gpuMmio[0x5C0D] : 0,
+					nativeAuxDdcMask[0], nativeAuxDdcMask[1], nativeAuxDdcMask[2], nativeAuxDdcMask[3], nativeAuxDdcMask[4],
+					nativeAuxDdcMask[5], nativeAuxDdcMask[6]);
 			}
 			diskLogEvent("wake: eDP power cycle with the panel's transmitter parameters: off %u, 500 ms, on %u, HPD after "
 				"%u ms (sense %u); PWRSEQ_CNTL %x STATE %x GPIO_PWRSEQ mask %x Y %x", off & 1, on & 1, waited,
@@ -6169,8 +6191,9 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 		bootAuxProbed = true;
 		uint8_t reply, data;
 		uint32_t status = nativeAuxRead(0, &reply, &data);
-		diskLogEvent("native AUX read of DPCD 0 at boot: SW_STATUS %x, reply %x (0 = ACK), DPCD revision %02x", status, reply,
-			data);
+		diskLogEvent("native AUX read of DPCD 0 at boot: SW_STATUS %x, reply %x (0 = ACK), DPCD revision %02x; DDC1-6/VGA "
+			"masks %x %x %x %x %x %x %x", status, reply, data, nativeAuxDdcMask[0], nativeAuxDdcMask[1], nativeAuxDdcMask[2],
+			nativeAuxDdcMask[3], nativeAuxDdcMask[4], nativeAuxDdcMask[5], nativeAuxDdcMask[6]);
 	}
 	if (aux && __atomic_load_n(&dcAuxOn, __ATOMIC_RELAXED))
 		dcAuxPrepare();
