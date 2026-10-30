@@ -6282,6 +6282,27 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	uint8_t ok = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that, table, params,
 		flag);
 	call->ok = static_cast<uint8_t>((ok & 1) | patched);
+	// Wake #25 (log 1793354410): AUX works and the backlight comes on, but Apple's link training fails clock recovery at
+	// every swing. At boot, Apple's VBIOS ENABLE runs with the UNIPHY analogue registers still holding the firmware's
+	// values (UNIPHY_TMDP_REG3-5 230e0001/9000000/48a300aa) and training passes; after S3 they read reset values
+	// (e0001/0/0), which the ENABLE doesn't program. Put the UNIPHY macro registers back right after Apple's eDP
+	// transmitter ENABLE in a wake session. -crnotmdprestore disables.
+	if (table == AtomTransmitterTable && params && static_cast<uint8_t *>(params)[3] == 1 &&
+		static_cast<uint8_t *>(params)[5] == 0x14 && __atomic_load_n(&dcAuxOn, __ATOMIC_RELAXED) && gpuMmio &&
+		!checkKernelArgument("-crnotmdprestore")) {
+		uint32_t before[3] {gpuMmio[0x48D1], gpuMmio[0x48D2], gpuMmio[0x48D3]}, written = 0;
+		for (uint32_t r = 0x48C0; r < 0x4A00; r++) {
+			uint32_t boot;
+			if (diffBootValue(r, boot) && gpuMmio[r] != boot) {
+				gpuMmio[r] = boot;
+				written++;
+			}
+		}
+		static uint32_t tmdpLogs;
+		if (tmdpLogs++ < 4)
+			diskLogEvent("wake: %u UNIPHY registers restored after Apple's eDP transmitter ENABLE (TMDP_REG3-5 were %x %x %x)",
+				written, before[0], before[1], before[2]);
+	}
 	if (params)
 		memcpy(call->out, params, sizeof(call->out));
 	call->repeat = 1;
