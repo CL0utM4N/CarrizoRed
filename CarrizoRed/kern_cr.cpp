@@ -611,8 +611,7 @@ static void atomReport(Add &add) {
 		add("at the boot's TPS1:");
 		for (size_t i = 0; i < sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0]); i++)
 			add(" %x=%x", trainSnapRegs[i], trainBoot[i]);
-		add(" (wake TPS1 restores %u)
-", trainRestores);
+		add(" (wake TPS1 restores %u)\n", trainRestores);
 	}
 	add("at TPS1 (%u times):", trainSnaps);
 	for (size_t i = 0; i < sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0]); i++)
