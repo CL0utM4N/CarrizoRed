@@ -240,6 +240,7 @@ and the list of affected machines.
 | `-crnolbfix` | DCE 11.0's line-buffer size (0x6B0) in `LB_MEMORY_CTRL` instead of Apple's |
 | `-crnoedppoweron` | The eDP panel POWER_ON transmitter action before Apple enables the eDP transmitter, and before the first AUX transaction after a wake |
 | `-crnowakerestore` | Don't restore the display registers S3 resets (display reference clock and time bases, DENTIST display clock, AUX pad calibration, panel power pads, UNIPHY0 macro settings, AUX PHY set-up, panel power sequencer delays, backlight PWM) to their boot values after a wake |
+| `-crnoauxprobe` | Skip the diagnostic native AUX read of DPCD 0 (Linux DC's register sequence, bypassing the VBIOS AUX table) at boot and after a wake |
 | `-crnowakepowercycle` | After a wake, don't power-cycle the eDP panel the way Linux's DC does (VBIOS POWER_OFF and POWER_ON with the panel's transmitter parameters, 500 ms apart, then wait for HPD); use the all-zero POWER_ON instead |
 | `-crnodcaux` | After a wake, don't prepare each VBIOS AUX transfer the way Linux's DC does (clear the AUX pads' calibration errors, force a recalibration, acknowledge the last transfer; once: receive window 1, LS reads off) |
 | `-crauxhpd` | Experimental: put the HPD_ID learned from working AUX calls into byte 8 of Apple's VBIOS AUX parameters (put back after each call). Off by default: that byte is Apple's own DPCD address, and AUX works at boot whatever it holds |

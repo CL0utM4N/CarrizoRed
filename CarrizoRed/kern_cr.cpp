@@ -611,6 +611,44 @@ namespace IhReg {
 }
 static volatile uint32_t *gpuMmio;  // BAR5, mapped by probeMMIO
 
+// One native AUX read on AUX0, the way Linux's DC does it (dce_aux.c: acquire_engine, submit_channel_request,
+// get_channel_status, read_channel_reply), bypassing the VBIOS AUX table: does the panel answer at all? Run once at boot
+// (where AUX works, to prove this code) and once on a wake after the panel power cycle. Returns AUX_SW_STATUS; *reply
+// gets the reply command (0 = ACK), *data the first byte read.
+static uint32_t nativeAuxRead(uint32_t address, uint8_t *reply, uint8_t *data) {
+	auto *m = gpuMmio;
+	*reply = 0xFF;
+	*data = 0;
+	if (!m)
+		return 0xFFFFFFFF;
+	if (!(m[0x5C00] & 1))
+		m[0x5C00] = m[0x5C00] | 1;  // AUX_CONTROL.AUX_EN
+	m[0x5C02] = m[0x5C02] | 0x10000;  // AUX_ARB_CONTROL.AUX_SW_USE_AUX_REG_REQ
+	m[0x5C03] = m[0x5C03] | 2;        // AUX_INTERRUPT_CONTROL.AUX_SW_DONE_ACK
+	for (uint32_t us = 0; us < 2400 && (m[0x5C04] & 1); us += 10)
+		IODelay(10);
+	// AUX_SW_CONTROL: no start delay, 4 bytes to send (command/address 3 bytes, length 1).
+	m[0x5C01] = (m[0x5C01] & ~0x1F00F0U) | (4U << 16);
+	// AUX_SW_DATA: index 0, write direction, auto-increment off for the first byte, then on.
+	m[0x5C06] = 0x80000000U | ((0x90U | ((address >> 16) & 0xF)) << 8);  // DP read, address 19:16
+	m[0x5C06] = ((address >> 8) & 0xFF) << 8;
+	m[0x5C06] = (address & 0xFF) << 8;
+	m[0x5C06] = 0;  // length - 1 = 0: one byte
+	m[0x5C01] = m[0x5C01] | 1;  // AUX_SW_GO
+	for (uint32_t us = 0; us < 2400 && !(m[0x5C04] & 1); us += 10)
+		IODelay(10);
+	uint32_t status = m[0x5C04];
+	if ((status & 1) && ((status >> 24) & 0x1F)) {
+		// As read_channel_reply: index 0, auto-increment disable, read direction; then each read returns the next byte.
+		m[0x5C06] = 0x80000001U;
+		*reply = static_cast<uint8_t>(((m[0x5C06] >> 8) & 0xFF) >> 4);
+		if (((status >> 24) & 0x1F) > 1)
+			*data = static_cast<uint8_t>((m[0x5C06] >> 8) & 0xFF);
+	}
+	m[0x5C02] = (m[0x5C02] & ~0x10000U) | 0x20000;  // AUX_SW_DONE_USING_AUX_REG
+	return status;
+}
+
 static void dcAuxPrepare() {
 	auto *m = gpuMmio;
 	if (!m)
@@ -6111,6 +6149,12 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 				IOSleep(50);
 			else
 				IODelay(50000);
+			if (!checkKernelArgument("-crnoauxprobe")) {
+				uint8_t reply, data;
+				uint32_t status = nativeAuxRead(0, &reply, &data);
+				diskLogEvent("native AUX read of DPCD 0 after wake: SW_STATUS %x, reply %x (0 = ACK), DPCD revision %02x, "
+					"RX_STATUS %x", status, reply, data, gpuMmio ? gpuMmio[0x5C0D] : 0);
+			}
 			diskLogEvent("wake: eDP power cycle with the panel's transmitter parameters: off %u, 500 ms, on %u, HPD after "
 				"%u ms (sense %u); PWRSEQ_CNTL %x STATE %x GPIO_PWRSEQ mask %x Y %x", off & 1, on & 1, waited,
 				gpuMmio ? (gpuMmio[0x1898] >> 1) & 1 : 0, gpuMmio ? gpuMmio[0x481B] : 0, gpuMmio ? gpuMmio[0x481C] : 0,
@@ -6119,6 +6163,14 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			uint8_t powered = powerOnEdp();
 			diskLogEvent("eDP power on before the first AUX transaction after wake: ok %u", powered & 1);
 		}
+	}
+	static bool bootAuxProbed;
+	if (aux && !bootAuxProbed && !checkKernelArgument("-crnoauxprobe")) {
+		bootAuxProbed = true;
+		uint8_t reply, data;
+		uint32_t status = nativeAuxRead(0, &reply, &data);
+		diskLogEvent("native AUX read of DPCD 0 at boot: SW_STATUS %x, reply %x (0 = ACK), DPCD revision %02x", status, reply,
+			data);
 	}
 	if (aux && __atomic_load_n(&dcAuxOn, __ATOMIC_RELAXED))
 		dcAuxPrepare();
