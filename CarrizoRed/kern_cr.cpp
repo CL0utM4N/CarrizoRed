@@ -527,6 +527,14 @@ static bool biosScratchSaved;
 // full wake go into the disk log, to compare the channel, HPD and reply status with the working ones.
 static AtomCall lastAuxCall;
 static volatile uint32_t wakeAuxLogs;
+// Wake #17 (log 1793333154): the last working AUX call before sleep had ucHPD_ID (byte 8) = 2; the failing ones after the
+// wake had 0x11, 0, 0 and 0 there, with bytes 9-10 holding the DPCD address (0x111, 0x600): Apple fills in the 8-byte
+// v1 parameters and the v2 table reads its HPD_ID (the hot-plug pin the AUX engine is tied to) from whatever is on the
+// stack, which happened to be usable at boot. Learn the HPD_ID of calls that succeed (reply status 0, three agreeing) and
+// put it in every AUX call. -crnoauxhpd disables.
+static uint8_t auxHpdGood = 0xFF;
+static uint32_t auxHpdOk[8], auxHpdForced;
+static int auxHpdOff = -1;
 static uint32_t restoreAfterWake();
 
 // eDP block state at the moment Apple starts training pattern 1 (DPCD 0x102 written with TPS1): panel power
@@ -1548,9 +1556,10 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 	switch (messageType) {
 		case kIOMessageSystemWillSleep:
 			systemSleeps++;
-			diskLogEvent("last AUX call before sleep: in %08x %08x %08x %08x -> out %08x %08x, ok %x", lastAuxCall.in[0],
-				lastAuxCall.in[1], lastAuxCall.in[2], lastAuxCall.in[3], lastAuxCall.out[0], lastAuxCall.out[1],
-				lastAuxCall.ok);
+			diskLogEvent("last AUX call before sleep: in %08x %08x %08x %08x -> out %08x %08x, ok %x; HPD_ID learned %x "
+				"(successes by HPD_ID %u %u %u %u %u %u), forced %u times", lastAuxCall.in[0], lastAuxCall.in[1],
+				lastAuxCall.in[2], lastAuxCall.in[3], lastAuxCall.out[0], lastAuxCall.out[1], lastAuxCall.ok, auxHpdGood,
+				auxHpdOk[0], auxHpdOk[1], auxHpdOk[2], auxHpdOk[3], auxHpdOk[4], auxHpdOk[5], auxHpdForced);
 			if (gpuMmio) {
 				for (uint32_t i = 0; i < 16; i++)
 					biosScratch[i] = gpuMmio[0x5C9 + i];
@@ -5894,6 +5903,17 @@ IOReturn CRDriver::wrapInstallInterrupts(void *that) {
 uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *params, uint32_t flag) {
 	__atomic_fetch_add(&atomCalls, 1, __ATOMIC_RELAXED);
 	bool aux = table == AtomAuxTable;
+	uint8_t auxHpdUsed = 0xFF;
+	if (aux && params) {
+		if (auxHpdOff < 0)
+			auxHpdOff = checkKernelArgument("-crnoauxhpd");
+		auto *bytes = static_cast<uint8_t *>(params);
+		if (!auxHpdOff && auxHpdGood != 0xFF && bytes[8] != auxHpdGood) {
+			bytes[8] = auxHpdGood;
+			auxHpdForced++;
+		}
+		auxHpdUsed = bytes[8];
+	}
 	if (aux)
 		__atomic_fetch_add(&auxCalls, 1, __ATOMIC_RELAXED);
 	AtomCall entry {};
@@ -6025,10 +6045,14 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 		if (!(ok & 1))
 			__atomic_fetch_add(&auxFailures, 1, __ATOMIC_RELAXED);
 		lastAuxCall = entry;
+		if (params && (ok & 1) && static_cast<uint8_t *>(params)[5] == 0 && auxHpdUsed < arrsize(auxHpdOk) &&
+			++auxHpdOk[auxHpdUsed] >= 3 && auxHpdGood == 0xFF)
+			auxHpdGood = auxHpdUsed;
 		if (__atomic_load_n(&wakeAuxLogs, __ATOMIC_RELAXED) && __atomic_fetch_sub(&wakeAuxLogs, 1, __ATOMIC_RELAXED))
 			diskLogEvent("AUX call after wake: in %08x %08x %08x %08x -> out %08x %08x, ok %x; AUX0 SW_STATUS %x "
-				"RX_STATUS %x", entry.in[0], entry.in[1], entry.in[2], entry.in[3], entry.out[0], entry.out[1], entry.ok,
-				gpuMmio ? gpuMmio[0x5C04] : 0, gpuMmio ? gpuMmio[0x5C0D] : 0);
+				"RX_STATUS %x; HPD_ID learned %x, forced %u times", entry.in[0], entry.in[1], entry.in[2], entry.in[3],
+				entry.out[0], entry.out[1], entry.ok, gpuMmio ? gpuMmio[0x5C04] : 0, gpuMmio ? gpuMmio[0x5C0D] : 0,
+				auxHpdGood, auxHpdForced);
 	} else {
 		ringPushMerged(atomRing, AtomRingSize, atomHead, entry, +[](const AtomCall &a, const AtomCall &b) {
 			return a.table == b.table && a.ok == b.ok && !memcmp(a.in, b.in, sizeof(a.in)) &&
