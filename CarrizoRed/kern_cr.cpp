@@ -535,6 +535,13 @@ static volatile uint32_t wakeAuxLogs;
 // overwriting it sent Apple's link training to the wrong DPCD registers (boot with ea18a14: vertical stripes), and AUX
 // works at boot whatever it holds. When on, the byte is put back after the call.
 static uint8_t auxHpdGood = 0xFF;
+// Linux's DC drives AUX itself (dce_aux.c) and, before every request (submit_channel_request), clears the AUX pads'
+// latched impedance-calibration errors and forces a recalibration, then acknowledges the last transfer's DONE; at
+// encoder set-up (aux_initialize) it turns AUX_LS_READ_EN off and widens AUX_RX_RECEIVE_WINDOW to 1. Apple's path, the
+// VBIOS AUX table, does none of it, and after S3 the AUX pads read uncalibrated (AUXN_IMPCAL value 1, firmware 2):
+// copying their registers back can't calibrate them. Set at a full wake, for the rest of the boot. -crnodcaux disables.
+static volatile bool dcAuxOn, dcAuxInitPending;
+static void dcAuxPrepare();
 static uint32_t auxHpdOk[8], auxHpdForced;
 static int auxHpdOff = -1;
 static uint32_t restoreAfterWake();
@@ -603,6 +610,31 @@ namespace IhReg {
 	                          RB_WPTR_ADDR_LO = 0xE35, CNTL = 0xE36, STATUS = 0xE38;
 }
 static volatile uint32_t *gpuMmio;  // BAR5, mapped by probeMMIO
+
+static void dcAuxPrepare() {
+	auto *m = gpuMmio;
+	if (!m)
+		return;
+	if (__atomic_exchange_n(&dcAuxInitPending, false, __ATOMIC_RELAXED)) {
+		m[0x5C00] = m[0x5C00] & ~0x100U;                    // AUX_CONTROL.AUX_LS_READ_EN = 0
+		m[0x5C0A] = (m[0x5C0A] & ~0x700U) | (1U << 8);      // AUX_DPHY_RX_CONTROL0.AUX_RX_RECEIVE_WINDOW = 1
+	}
+	// clear_aux_error: AUXN/AUXP_CALOUT_ERROR_AK (0x400) 1 then 0.
+	for (uint32_t reg : {0x483CU, 0x483BU}) {
+		m[reg] = m[reg] | 0x400;
+		m[reg] = m[reg] & ~0x400U;
+	}
+	// force_default_calibrate: AUXN_IMPCAL_ENABLE = 1 then AUXN_IMPCAL_OVERRIDE_ENABLE = 0; AUXP_IMPCAL_OVERRIDE_ENABLE
+	// (0x10000000) 1 then 0.
+	m[0x483C] = m[0x483C] | 1;
+	m[0x483C] = m[0x483C] & ~0x10000000U;
+	m[0x483B] = m[0x483B] | 0x10000000;
+	m[0x483B] = m[0x483B] & ~0x10000000U;
+	// AUX_INTERRUPT_CONTROL.AUX_SW_DONE_ACK, then wait for AUX_SW_STATUS.AUX_SW_DONE to clear (up to 1 ms).
+	m[0x5C03] = m[0x5C03] | 2;
+	for (uint32_t us = 0; us < 1000 && (m[0x5C04] & 1); us += 10)
+		IODelay(10);
+}
 static uint32_t probeValues[4];       // CONFIG_MEMSIZE, MC_VM_FB_LOCATION, MC_VM_FB_OFFSET, GRBM_STATUS at the mapping
 static uint64_t probeMs, probePhys;
 static uint32_t mmioMapMethod, mmioMapFailures;  // 1 IOKit, 2 BAR5 from config space; failed attempts
@@ -1582,6 +1614,10 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			__atomic_store_n(&wakeAuxWatch, true, __ATOMIC_RELAXED);
 			__atomic_store_n(&wakeRestorePending, true, __ATOMIC_RELAXED);
 			__atomic_store_n(&wakeAuxLogs, 4, __ATOMIC_RELAXED);
+			if (!checkKernelArgument("-crnodcaux")) {
+				__atomic_store_n(&dcAuxInitPending, true, __ATOMIC_RELAXED);
+				__atomic_store_n(&dcAuxOn, true, __ATOMIC_RELAXED);
+			}
 			if (wakeWatchdogCall) {
 				wakeWakesAtStart = systemWakes;
 				wakeBeatAtStart = watcherBeat;
@@ -6040,6 +6076,8 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 		uint8_t powered = powerOnEdp();
 		diskLogEvent("eDP power on before the first AUX transaction after wake: ok %u", powered & 1);
 	}
+	if (aux && __atomic_load_n(&dcAuxOn, __ATOMIC_RELAXED))
+		dcAuxPrepare();
 	uint8_t ok = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that, table, params,
 		flag);
 	call->ok = static_cast<uint8_t>((ok & 1) | patched);
