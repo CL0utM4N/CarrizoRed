@@ -508,7 +508,7 @@ struct AtomCall {
 	uint32_t in[4], out[2];
 };
 static constexpr uint32_t AtomRingSize = 32, AtomAuxTable = 0x4E, AtomTransmitterTable = 0x4C, AtomEncoderTable = 0x04,
-	AtomDispPowerGatingTable = 0x0D;
+	AtomDispPowerGatingTable = 0x0D, AtomPixelClockTable = 0x0C;
 static bool dpExtClkOff;    // -crnodpextclk, see wrapExecuteBiosCommandTable
 static bool edpPowerOnOff;  // -crnoedppoweron, see wrapExecuteBiosCommandTable
 static bool edpSeen;                 // Apple enabled an eDP transmitter (connector 0x14) this boot
@@ -6106,6 +6106,31 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			bytes[6] = atomBpc;
 			patched = 0x80;
 			__atomic_fetch_add(&bpcCaps, 1, __ATOMIC_RELAXED);
+		}
+	}
+	// DP pixel clock. Linux's DC drives DP/eDP from its external clock source and calls SetPixelClock (V6,
+	// set_pixel_clock_v6) with ucPpll = ATOM_PPLL_INVALID (0xFF) and no dividers, so the VBIOS programs the DP DTO
+	// (phase = pixel clock, modulo = DPREFCLK). Apple's assigner hands DP its "no PLL" index 6, a Baffin PHY PLL number
+	// this VBIOS doesn't know, with dividers, so nothing programs the DTO: at boot the firmware's DTO is still there; after
+	// S3 DP_DTO0_MODULO is 0, the hardware-generated DP_VID_M came out 0x8e39 against the boot's 0x243d, the steering
+	// FIFO overflowed and the trained link showed black (wake #30, log 1793359358). Make Apple's DP calls DC's:
+	// PIXEL_CLOCK_PARAMETERS_V6 ucPpll (byte 8) = 0xFF, usFbDiv/ucPostDiv/ucRefDiv (4-7) and ulFbDivDecFrac (12-15) 0,
+	// ucMiscInfo (11) without REF_DIV_SRC (0x10), for ucEncoderMode (10) DP (0) or DP MST (5) and a ucPpll that isn't a
+	// DCE 11 PLL (ATOM_PPLL1 0, PPLL2 1, PPLL0/DCPLL 2, EXT_PLL1/2 8/9, EXT_CLOCK 10, INVALID 0xFF). -crnodppclk disables.
+	if (table == AtomPixelClockTable && params && !checkKernelArgument("-crnodppclk")) {
+		auto *bytes = static_cast<uint8_t *>(params);
+		uint8_t ppll = bytes[8], mode = bytes[10];
+		bool dcePll = ppll <= 2 || (ppll >= 8 && ppll <= 10) || ppll == 0xFF;
+		if ((mode == 0 || mode == 5) && !dcePll) {
+			memset(bytes + 4, 0, 4);
+			memset(bytes + 12, 0, 4);
+			bytes[8] = 0xFF;
+			bytes[11] &= static_cast<uint8_t>(~0x10);
+			patched = 0x80;
+			static uint32_t pclkLogs;
+			if (pclkLogs++ < 6)
+				diskLogEvent("DP pixel clock: SetPixelClock PLL %u -> ATOM_PPLL_INVALID (DP DTO), clock %u0 kHz, CRTC %u%s", ppll,
+					(bytes[0] | bytes[1] << 8 | bytes[2] << 16), bytes[3], systemSleeps ? " (after a sleep)" : "");
 		}
 	}
 	if (params)
