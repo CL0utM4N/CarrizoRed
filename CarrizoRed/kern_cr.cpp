@@ -507,10 +507,21 @@ struct AtomCall {
 	uint16_t repeat;
 	uint32_t in[4], out[2];
 };
-static constexpr uint32_t AtomRingSize = 32, AtomAuxTable = 0x4E, AtomTransmitterTable = 0x4C, AtomEncoderTable = 0x04;
+static constexpr uint32_t AtomRingSize = 32, AtomAuxTable = 0x4E, AtomTransmitterTable = 0x4C, AtomEncoderTable = 0x04,
+	AtomDispPowerGatingTable = 0x0D;
 static bool dpExtClkOff;    // -crnodpextclk, see wrapExecuteBiosCommandTable
 static bool edpPowerOnOff;  // -crnoedppoweron, see wrapExecuteBiosCommandTable
 static bool edpSeen;                 // Apple enabled an eDP transmitter (connector 0x14) this boot
+// Apple's last DIG1TransmitterControl call for the eDP connector (0x14), and the VBIOS parser and flag of the last table
+// call, to run the panel's power-off before sleep and its INIT / power cycle after a wake.
+static uint8_t edpTransmitter[32];
+static bool edpTransmitterSeen;
+static void *atomParser;
+static uint32_t atomFlag;
+// The panel is powered off before S3 the way Linux's DC does at suspend (dce110_edp_power_control(false)): armed at
+// "will sleep", done right after Apple's DPCD 0x600 = 2 (sink power down) succeeds. -crnosleeppoweroff disables.
+static volatile bool panelOffPending;
+static uint32_t panelOffDone;
 static volatile bool edpWakePowerOn;  // a full wake is under way: power the eDP panel before the next AUX transaction
 // Catalina wake #7 (log 1793307460): with the panel powered, AUX still failed after the full wake, and the machine was
 // restarted 10 s later, before the 30 s report. The first failed DPCD transfer of a full wake brings the report forward
@@ -1650,6 +1661,8 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 	switch (messageType) {
 		case kIOMessageSystemWillSleep:
 			systemSleeps++;
+			if (edpSeen && !checkKernelArgument("-crnosleeppoweroff"))
+				__atomic_store_n(&panelOffPending, true, __ATOMIC_RELAXED);
 			diskLogEvent("last AUX call before sleep: in %08x %08x %08x %08x -> out %08x %08x, ok %x; HPD_ID learned %x "
 				"(successes by HPD_ID %u %u %u %u %u %u), forced %u times", lastAuxCall.in[0], lastAuxCall.in[1],
 				lastAuxCall.in[2], lastAuxCall.in[3], lastAuxCall.out[0], lastAuxCall.out[1], lastAuxCall.ok, auxHpdGood,
@@ -5999,6 +6012,8 @@ IOReturn CRDriver::wrapInstallInterrupts(void *that) {
 }
 
 uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *params, uint32_t flag) {
+	atomParser = that;
+	atomFlag = flag;
 	__atomic_fetch_add(&atomCalls, 1, __ATOMIC_RELAXED);
 	bool aux = table == AtomAuxTable;
 	uint8_t auxHpdUsed = 0xFF;
@@ -6088,8 +6103,6 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	};
 	// Apple's last DIG1TransmitterControl call for the eDP connector (0x14): its PHY, lane count, mode and config, for the
 	// INIT replayed after a wake (below).
-	static uint8_t edpTransmitter[32];
-	static bool edpTransmitterSeen;
 	if (table == AtomTransmitterTable && params && static_cast<uint8_t *>(params)[5] == 0x14) {
 		memcpy(edpTransmitter, params, sizeof(edpTransmitter));
 		edpTransmitterSeen = true;
@@ -6115,6 +6128,28 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			edpSeen = true;
 	}
 	if (aux && __atomic_exchange_n(&wakeRestorePending, false, __ATOMIC_RELAXED)) {
+		// Wake #23 (log 1793351154, the wider diff): the display PLL bandgap is powered down after S3
+		// (DISPPLL_BG_CNTL.DISPPLL_BG_PDN = 1, the firmware's 0x80 read 0x81), and PLL0's reference select was reset. Linux
+		// DC's init_hw starts by running the VBIOS EnableDispPowerGating table on every pipe, with ATOM_INIT (7) and then
+		// ATOM_DISABLE (power gating off), which sets the display block up again. Do the same for both pipes first.
+		if (!checkKernelArgument("-crnowakerestore")) {
+			uint8_t results[4] {};
+			for (uint8_t pipe = 0; pipe < 2; pipe++) {
+				uint8_t pg[16] {};
+				pg[0] = pipe;
+				pg[1] = 7;  // ATOM_INIT
+				results[pipe * 2] = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
+					AtomDispPowerGatingTable, pg, flag);
+				memset(pg, 0, sizeof(pg));
+				pg[0] = pipe;
+				pg[1] = 0;  // ATOM_DISABLE: no power gating
+				results[pipe * 2 + 1] = FunctionCast(wrapExecuteBiosCommandTable,
+					callback->orgExecuteBiosCommandTable)(that, AtomDispPowerGatingTable, pg, flag);
+			}
+			diskLogEvent("wake: EnableDispPowerGating INIT/DISABLE pipe 0 %u/%u pipe 1 %u/%u; DISPPLL_BG_CNTL %x PLL_CNTL %x",
+				results[0] & 1, results[1] & 1, results[2] & 1, results[3] & 1, gpuMmio ? gpuMmio[0x171E] : 0,
+				gpuMmio ? gpuMmio[0x1707] : 0);
+		}
 		uint32_t restored = restoreAfterWake();
 		diskLogEvent("wake: %u display registers restored to their boot values before the first AUX transaction", restored);
 		// Wake #14 (log 1793329705): with 44 registers back (DC_GPIO_DEBUG included) AUX still timed out. Linux's legacy
@@ -6330,6 +6365,19 @@ IOReturn CRDriver::wrapAuxWriteBytes(void *that, uint32_t address, uint32_t leng
 	assrProbe(that, flags, read);
 	IOReturn ret = write(that, address, length, data, flags);
 	dpcdRecord(address, length, true, data, ret);
+	if (address == 0x600 && length >= 1 && data && data[0] == 2 && ret == kIOReturnSuccess && edpTransmitterSeen &&
+		atomParser && __atomic_exchange_n(&panelOffPending, false, __ATOMIC_RELAXED)) {
+		uint8_t power[32];
+		memcpy(power, edpTransmitter, sizeof(power));
+		power[3] = 13;  // ATOM_TRANSMITTER_ACTION_POWER_OFF
+		power[4] = 4;   // LANE_COUNT_FOUR, as DC
+		power[6] = 0;   // ATOM_ENCODER_MODE_DP
+		uint8_t off = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(atomParser,
+			AtomTransmitterTable, power, atomFlag);
+		panelOffDone++;
+		diskLogEvent("sleep: eDP panel powered off after DPCD 0x600 = 2: ok %u; PWRSEQ_CNTL %x STATE %x", off & 1,
+			gpuMmio ? gpuMmio[0x481B] : 0, gpuMmio ? gpuMmio[0x481C] : 0);
+	}
 	if (!assrOff && assrCap != 0xFF && (assrCap & 1) && address <= 0x108 && address + length > 0x108 &&
 		ret == kIOReturnSuccess) {
 		uint8_t value = 1;  // ALTERNATE_SCRAMBLER_RESET_ENABLE
@@ -6452,8 +6500,9 @@ static uint32_t restoreAfterWake() {
 	// Wake #13 (log 1793328382): 43 restored, still 0xA1; DIGON (panel VDD) is driven high by the VBIOS power-on, HPD is
 	// sensed. DC_GPIO_DEBUG reads 0x101 for the firmware's 0: DC_GPIO_MACRO_DEBUG = 1 puts the DCIO pad macro in a debug
 	// mode, which can take the AUX pads away from the AUX engine. Clear it first.
-	static const uint32_t early[] {0x4804, 0x109, 0x130, 0x13B, 0x113, 0x114, 0x115, 0x132, 0x124, 0x131, 0x483A,
-		0x483B, 0x483C, 0x4890, 0x4891, 0x4892};
+	// Wake #23: DISPPLL_BG_CNTL (0x171E, the display PLL bandgap's power-down) too.
+	static const uint32_t early[] {0x4804, 0x171E, 0x109, 0x130, 0x13B, 0x113, 0x114, 0x115, 0x132, 0x124, 0x131,
+		0x483A, 0x483B, 0x483C, 0x4890, 0x4891, 0x4892};
 	uint32_t regs[arrsize(early) + 0x18 + 6 * 4 + 6], n = 0, written = 0;
 	// Wake #15 (log 1793331595): with the transmitter INIT too, the AUX receiver saw no reply at all (RX_STATUS sync
 	// count 0, 11 at boot). The VBIOS scratch registers first, from "will sleep", as Linux restores them at resume.
