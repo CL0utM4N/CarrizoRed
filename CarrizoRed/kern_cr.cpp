@@ -560,7 +560,8 @@ static bool diffBootValue(uint32_t offset, uint32_t &value);
 
 // eDP block state at the moment Apple starts training pattern 1 (DPCD 0x102 written with TPS1): panel power
 // sequencer, DIG0, DP0, pixel rate, backlight. The black box otherwise only sees the state after Apple gave up.
-static const uint32_t trainSnapRegs[] {0x481B, 0x481C, 0x4A00, 0x4A47, 0x4AA0, 0x4AA3, 0x4AA4, 0x4AAF, 0x140, 0x4820};
+static const uint32_t trainSnapRegs[] {0x481B, 0x481C, 0x4A00, 0x4A47, 0x4AA0, 0x4AA3, 0x4AA4, 0x4AAF, 0x140, 0x4820,
+	0x4805, 0x4806, 0x4807, 0x48D1, 0x48D3};
 static uint32_t trainSnap[sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0])], trainSnaps;
 static AtomCall atomRing[AtomRingSize];
 static uint32_t atomHead, atomCalls, auxCalls, auxFailures;
@@ -6297,6 +6298,23 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 				gpuMmio[r] = boot;
 				written++;
 			}
+		}
+		// Wake #26 (log 1793355347): with those back, clock recovery still failed. The UNIPHY link controls differ too:
+		// UNIPHY_LINK_ENABLE_HPD_MASK is swapped between UNIPHYA_LINK_CNTL (0x4805, firmware 0x100100, after S3
+		// 0x1100100) and UNIPHYB_LINK_CNTL (0x4807, 0x1100100 / 0x100100), so A's link output is gated by HPD; the
+		// firmware also has UNIPHYA_CHANNEL_XBAR_CNTL.UNIPHY_LINK_ENABLE (0x4806) and DIG_FE_CNTL.DIG_SYMCLK_FE_ON
+		// (0x4A00) on. Put those back too.
+		static const uint32_t link[] {0x4805, 0x4807, 0x4806};
+		for (auto r : link) {
+			uint32_t boot;
+			if (diffBootValue(r, boot) && gpuMmio[r] != boot) {
+				gpuMmio[r] = boot;
+				written++;
+			}
+		}
+		if (!(gpuMmio[0x4A00] & 0x1000000)) {
+			gpuMmio[0x4A00] = gpuMmio[0x4A00] | 0x1000000;
+			written++;
 		}
 		static uint32_t tmdpLogs;
 		if (tmdpLogs++ < 4)
