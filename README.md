@@ -239,6 +239,7 @@ and the list of affected machines.
 | `-crnovramtest` | Reporting `ATIController::TestVRAM` as passed (the real result is still logged) |
 | `-crnolbfix` | DCE 11.0's line-buffer size (0x6B0) in `LB_MEMORY_CTRL` instead of Apple's |
 | `-crnoedppoweron` | The eDP panel POWER_ON transmitter action before Apple enables the eDP transmitter, and before the first AUX transaction after a wake |
+| `-crnodprefclk` | After a wake, don't have the VBIOS program DPREFCLK (SetDCEClock, type DPREFCLK, as Linux DC's DCE 11.2 clock manager does); after S3 the DP DTO modulo stays 0 without it |
 | `-crnodppclk` | Don't send Apple's DP/eDP SetPixelClock calls to the VBIOS the way Linux's DC does (ucPpll = ATOM_PPLL_INVALID, no dividers, so the VBIOS programs the DP DTO); Apple passes its Polaris "no PLL" index 6, and after a sleep nothing set the DTO up, so a trained link stayed black |
 | `-crnowakerestore` | Don't run Linux DC's resume steps after a wake: VBIOS EnableDispPowerGating INIT/DISABLE on both pipes, the VBIOS scratch and backlight PWM registers from before sleep, the eDP transmitter INIT with DC's parameters, the AUX engine reset |
 | `-crwakeregrestore` | Experimental: after a wake, also copy the firmware's boot-time display registers back (display clocks and time bases, PLL bandgap, AUX pad calibration and PHY set-up, panel power pads, UNIPHY0 macro). Not what Linux does |

@@ -508,7 +508,9 @@ struct AtomCall {
 	uint32_t in[4], out[2];
 };
 static constexpr uint32_t AtomRingSize = 32, AtomAuxTable = 0x4E, AtomTransmitterTable = 0x4C, AtomEncoderTable = 0x04,
-	AtomDispPowerGatingTable = 0x0D, AtomPixelClockTable = 0x0C;
+	AtomDispPowerGatingTable = 0x0D, AtomPixelClockTable = 0x0C, AtomDceClockTable = 0x2E;
+// Every non-AUX VBIOS call of a wake session goes to the disk log (up to this many), with DP_DTO0_PHASE/MODULO after it.
+static volatile uint32_t wakeAtomLogs;
 static bool dpExtClkOff;    // -crnodpextclk, see wrapExecuteBiosCommandTable
 static bool edpPowerOnOff;  // -crnoedppoweron, see wrapExecuteBiosCommandTable
 static bool edpSeen;                 // Apple enabled an eDP transmitter (connector 0x14) this boot
@@ -1725,6 +1727,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			__atomic_store_n(&wakeAuxWatch, true, __ATOMIC_RELAXED);
 			__atomic_store_n(&wakeRestorePending, true, __ATOMIC_RELAXED);
 			__atomic_store_n(&wakeAuxLogs, 4, __ATOMIC_RELAXED);
+			__atomic_store_n(&wakeAtomLogs, 80, __ATOMIC_RELAXED);
 			if (!checkKernelArgument("-crnodcaux")) {
 				__atomic_store_n(&dcAuxInitPending, true, __ATOMIC_RELAXED);
 				__atomic_store_n(&dcAuxOn, true, __ATOMIC_RELAXED);
@@ -6213,6 +6216,24 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 				results[0] & 1, results[1] & 1, results[2] & 1, results[3] & 1, gpuMmio ? gpuMmio[0x171E] : 0,
 				gpuMmio ? gpuMmio[0x1707] : 0);
 		}
+		// After S3 DP_DTO0_MODULO is 0 (the firmware set it to DPREFCLK at boot), and the VBIOS's DP DTO set-up in
+		// SetPixelClock only writes the phase: DC's understanding is that "MODULO is programmed equal to DPREFCLK" by the
+		// VBIOS. DC's DCE 11.2 clock manager (dce112_set_clock) has the VBIOS program DPREFCLK through SetDCEClock with
+		// type DPREFCLK and no frequency ("VBIOS will determine DPREFCLK frequency"), source DFS; Apple's SetDCEClock
+		// object doesn't exist for this VBIOS (setDisplayClock: ASSERT m_setDceClock), so nothing does it after S3. Run
+		// it here (SET_DCE_CLOCK_PARAMETERS_V2_1: ulDCEClkFreq 0, ucDCEClkType 1, ucDCEClkSrc ATOM_GCK_DFS 8).
+		// -crnodprefclk disables.
+		if (!checkKernelArgument("-crnodprefclk")) {
+			uint32_t before[2] {gpuMmio ? gpuMmio[0x141] : 0, gpuMmio ? gpuMmio[0x142] : 0};
+			uint8_t dce[16] {};
+			dce[4] = 1;  // DCE_CLOCK_TYPE_DPREFCLK
+			dce[5] = 8;  // ATOM_GCK_DFS
+			uint8_t set = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
+				AtomDceClockTable, dce, flag);
+			diskLogEvent("wake: SetDCEClock DPREFCLK ok %u, returned %u0 kHz; DTO0 phase %x -> %x, modulo %x -> %x", set & 1,
+				dce[0] | dce[1] << 8 | dce[2] << 16 | dce[3] << 24, before[0], gpuMmio ? gpuMmio[0x141] : 0, before[1],
+				gpuMmio ? gpuMmio[0x142] : 0);
+		}
 		uint32_t restored = restoreAfterWake();
 		diskLogEvent("wake: %u registers restored before the first AUX transaction (VBIOS scratch and backlight from sleep%s)",
 			restored, checkKernelArgument("-crwakeregrestore") ? ", boot-time display registers" : "");
@@ -6381,6 +6402,10 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	if (params)
 		memcpy(call->out, params, sizeof(call->out));
 	call->repeat = 1;
+	if (!aux && __atomic_load_n(&wakeAtomLogs, __ATOMIC_RELAXED) && __atomic_fetch_sub(&wakeAtomLogs, 1, __ATOMIC_RELAXED))
+		diskLogEvent("wake VBIOS call: table %x ok %x in %08x %08x %08x %08x -> out %08x %08x; DTO0 phase %x modulo %x",
+			table, call->ok, call->in[0], call->in[1], call->in[2], call->in[3], call->out[0], call->out[1],
+			gpuMmio ? gpuMmio[0x141] : 0, gpuMmio ? gpuMmio[0x142] : 0);
 	if (aux) {
 		if (!(ok & 1))
 			__atomic_fetch_add(&auxFailures, 1, __ATOMIC_RELAXED);
