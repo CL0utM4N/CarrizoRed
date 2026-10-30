@@ -228,7 +228,8 @@ and the list of affected machines.
 | `-crnomcloc` | Forcing `CFG_NON_ZERO_MC_LOC` (VRAM base from `AtiAsicInfo::getFbLocationBase()`) |
 | `-crnovramtest` | Reporting `ATIController::TestVRAM` as passed (the real result is still logged) |
 | `-crnolbfix` | DCE 11.0's line-buffer size (0x6B0) in `LB_MEMORY_CTRL` instead of Apple's |
-| `-crnoedppoweron` | The eDP panel POWER_ON transmitter action before Apple enables the eDP transmitter |
+| `-crnoedppoweron` | The eDP panel POWER_ON transmitter action before Apple enables the eDP transmitter, and before the first AUX transaction after a wake |
+| `-crnowakerestore` | Don't restore the display registers S3 resets (AUX PHY clock and receiver set-up, panel power sequencer delays, backlight PWM) to their boot values after a wake |
 | `-crnodpextclk` | Switching the DP PHY to the external reference clock (`DIG1TransmitterControl`) |
 | `-crnolanecap` | Capping DP training at the lane count the firmware used for the eDP link |
 | `-crnobpccap` | Capping the DP colour depth at the firmware's (encoder `ucBitPerColor`, `DP_PIXEL_FORMAT`) |

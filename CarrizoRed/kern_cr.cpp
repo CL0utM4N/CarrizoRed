@@ -516,6 +516,8 @@ static volatile bool edpWakePowerOn;  // a full wake is under way: power the eDP
 // restarted 10 s later, before the 30 s report. The first failed DPCD transfer of a full wake brings the report forward
 // to 1 s later and adds the display sections (VBIOS calls, DPCD, the register diff against the firmware's boot state).
 static volatile bool wakeAuxWatch, wakeDisplayDiag;
+static volatile bool wakeRestorePending;  // a full wake is under way: put back the display set-up S3 lost, see below
+static uint32_t restoreAfterWake();
 
 // eDP block state at the moment Apple starts training pattern 1 (DPCD 0x102 written with TPS1): panel power
 // sequencer, DIG0, DP0, pixel rate, backlight. The black box otherwise only sees the state after Apple gave up.
@@ -1549,6 +1551,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			diskLogEvent("system will power on");
 			__atomic_store_n(&edpWakePowerOn, true, __ATOMIC_RELAXED);
 			__atomic_store_n(&wakeAuxWatch, true, __ATOMIC_RELAXED);
+			__atomic_store_n(&wakeRestorePending, true, __ATOMIC_RELAXED);
 			if (wakeWatchdogCall) {
 				wakeWakesAtStart = systemWakes;
 				wakeBeatAtStart = watcherBeat;
@@ -5963,6 +5966,10 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 		if (gpuMmio[0x481B] & 0x10000)
 			edpSeen = true;
 	}
+	if (aux && __atomic_exchange_n(&wakeRestorePending, false, __ATOMIC_RELAXED)) {
+		uint32_t restored = restoreAfterWake();
+		diskLogEvent("wake: %u display registers restored to their boot values before the first AUX transaction", restored);
+	}
 	if (aux && edpSeen && !edpPowerOnOff && __atomic_exchange_n(&edpWakePowerOn, false, __ATOMIC_RELAXED)) {
 		uint8_t powered = powerOnEdp();
 		diskLogEvent("eDP power on before the first AUX transaction after wake: ok %u", powered & 1);
@@ -6140,6 +6147,38 @@ static bool diffBootValue(uint32_t offset, uint32_t &value) {
 		n += block.count;
 	}
 	return false;
+}
+
+// What S3 resets and nothing sets again (Catalina wake #10, log 1793321673: the display report 1 s after the first
+// failed DPCD transfer). At a cold boot the firmware's GOP programs these; after S3 nobody posts the display block, Apple's
+// driver doesn't touch them, and they read their reset values:
+// - DP_AUX0-5 AUX_DPHY_TX_REF_CONTROL, TX_CONTROL, RX_CONTROL0/1 (0x5C08-0x5C0B, 0x1C apart): TX_REF_DIV 0x32 (50, for
+//   a 100 MHz reference) instead of the firmware's 0x18 (24), so AUX ran at the wrong bit rate. The VBIOS AUX table
+//   reported success every time (364 calls, 0 failed), yet the panel never answered: every DPCD transfer kIOReturnIOError.
+// - LVTMA_PWRSEQ_REF_DIV, DELAY1, DELAY2 (0x481D-0x481F): 0, so the panel power sequencer has no timing for POWER_ON.
+// - BL_PWM_CNTL, CNTL2, PERIOD_CNTL (0x4820-0x4822): 0, the backlight PWM off.
+// Write back the boot values (taken from the firmware's state in the diff snapshot) where they differ. -crnowakerestore
+// disables.
+static uint32_t restoreAfterWake() {
+	static int off = -1;
+	if (off < 0)
+		off = checkKernelArgument("-crnowakerestore");
+	if (off || !gpuMmio)
+		return 0;
+	uint32_t regs[6 * 4 + 6], n = 0, written = 0;
+	for (uint32_t ch = 0; ch < 6; ch++)
+		for (uint32_t r = 0; r < 4; r++)
+			regs[n++] = 0x5C08 + ch * 0x1C + r;
+	for (uint32_t r = 0x481D; r <= 0x4822; r++)
+		regs[n++] = r;
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t boot;
+		if (diffBootValue(regs[i], boot) && gpuMmio[regs[i]] != boot) {
+			gpuMmio[regs[i]] = boot;
+			written++;
+		}
+	}
+	return written;
 }
 
 static uint32_t restoreStep(size_t index) {
