@@ -22,7 +22,7 @@ scales with load (400 MHz idle, up to the chip's top level).
 | Display interrupts (vblank) | **Works** |
 | Acceleration / Metal (`AMDRadeonX4000`) | **Works.** The SMU loads the GPU microcode, the command processor and SDMA run, interrupts work, and WindowServer and apps render with Metal. Apple's shader compiler emits an interpolation pattern Stoney's 16-bank LDS gets wrong; CarrizoRed fixes the compiled pixel shaders before the GPU runs them, including when Metal re-uploads them (see *Metal needed*). Boot with `-crnoaccel` for an unaccelerated desktop |
 | GPU clock scaling (SCLK DPM) | **Works, on by default.** Apple's PowerPlay runs its Dummy back end here, so nothing would start the SMU's clock scaling and the GPU would stay at its lowest clock. CarrizoRed starts it 90 s after boot, from the SMU's own clock table: 400 MHz minimum, up to the top level (900 MHz on an A9-9425, 800 MHz on an A9-9420). `-crnosclkdpm` turns it off |
-| Sleep | **Not working yet.** Idle sleep enters sleep, but after waking the GPU's command processor stalls (a fix is in testing); closing the lid froze the machine on Catalina. A watchdog writes a report to NVRAM when wake fails |
+| Sleep | **Not working yet.** The machine sleeps (fans off) and wakes on a key press, the GPU comes back, but the panel stays black: S3 resets the display block's AUX, panel-power and backlight settings that the firmware set at boot (a restore is in testing). On the D509BA, the internal USB 2 controller (EHC1) woke it again at once until the `SSDT-GPRW` in its EFI stopped that. A watchdog writes a report to NVRAM when wake fails |
 | Brightness, external displays (HDMI), HDMI audio | Not done or untested |
 | Video decode/encode (UVD/VCE) | **On hold**: video plays and records in software. UVD powers up and Apple's firmware boots on it, but decoding hangs the GPU: Apple's driver gives UVD GPU virtual addresses, and Stoney's UVD has no VM support (Linux runs it in physical mode and rewrites every buffer address). Making it work means doing that translation in CarrizoRed. Findings and next steps in [docs/VIDEO.md](docs/VIDEO.md) |
 | Carrizo / Bristol Ridge | Same display engine and code paths; the SMU microcode loader, clock scaling and shader-engine fix include Carrizo's differences (second SDMA engine, second MEC), following Linux. **Untested** (no hardware): reports from owners are very welcome |
@@ -32,7 +32,7 @@ scales with load (400 MHz idle, up to the chip's top level).
 | Machine | APU | macOS | Result |
 |---|---|---|---|
 | ASUS VivoBook 15 D509BA | A9-9425 (Stoney Ridge, Radeon R5) | Catalina 10.15.7 – Sequoia 15.8.1 (installed); Sequoia 15.4 Recovery and installer | Display and Metal acceleration work, desktop renders correctly |
-| Dell Inspiron 3475 (all-in-one) | A6-9225 (Stoney Ridge, Radeon R4) | Ventura 13.7.8 | Display and Metal acceleration work, desktop renders correctly |
+| Dell Inspiron 3475 (all-in-one) | A6-9225 (Stoney Ridge, Radeon R4) | Ventura 13.7.8; Tahoe 26.7.2 | Ventura: display and Metal acceleration work, desktop renders correctly. Tahoe: works, with glitches (see *macOS versions*) |
 | Acer Aspire E5-523 ([Lost-Entrepreneur439](https://www.reddit.com/r/hackintosh/comments/1xh74lv/ive_done_a_lot_of_hackintoshes_but_this_might_be/)) | E2-9010 (Stoney Ridge, Radeon R2) | Ventura 13.7.8 | Display and Metal acceleration work |
 | HP 17-ak0xx ([u/macos12345](https://www.reddit.com/r/hackintosh/comments/1xhaqvw/finally_macos_is_possible_on_pre_ryzen_apus/)) | A6-9220 (Stoney Ridge, Radeon R4) | Ventura | Display and Metal acceleration work |
 | ASUS X555B ([u/Azusawaga](https://www.reddit.com/r/hackintosh/comments/1xb8mct/what_used_to_be_impossible_today_is_the_reality/)) | A9-9410 (Stoney Ridge, Radeon R5) | Sequoia 15.8.1 | Display and Metal acceleration work |
@@ -47,9 +47,17 @@ scales with load (400 MHz idle, up to the chip's top level).
 | Monterey 12 | **Works** (12.7.6). HWLibs functions matched by their constants (41 of 46) from the installed system's kexts (no Monterey KDK exists), the hardware capability fields at Monterey's offsets, safety checks accept its register allocation, Metal patches at its offsets. Needs the xHCI reset patch's `Limit` at 2048 for USB 3 (see FCHXHCIFix) |
 | Big Sur 11 | **Works** (11.7.11). Its HWLibs keeps its symbols, so every hook is found by name; the accelerator and command-buffer layouts differ (capability fields as Monterey, submission info, a vtable slot) and the Metal patches sit at Big Sur's offsets |
 | Catalina 10.15 | **Works** (10.15.7). HWLibs keeps its symbols (Polaris loads `AMDRadeonX4000HWLibs` unless the subsystem is Apple's); the accelerator's engine slots, capability fields and command-buffer layout, and CAIL's flags and SMU buffer fields, sit at Catalina's offsets. Its scheduler has one queue per engine and priority, so CarrizoRed creates three extra queues instead of four (the second SDMA engine is folded into the first). Metal: the shader compiler (`libSC.dylib` in AMDShared.bundle) and the Metal driver are separate files there, patched through `cs_validate_range`. The xHCI reset patch matches (`MinKernel` 19.0.0) |
-| Tahoe 26 | Allowed, untested |
+| Tahoe 26 | **Works, with graphical glitches; not recommended yet** (26.7.2 on the Dell Inspiron 3475). The Metal patches match Tahoe's cache and the shader fix handles its shaders, but Tahoe needs more graphics memory than these APUs' usual 512 MB: Apple's driver logs `AMD ERROR! Failed to allocate size:… There is … free memory remaining` (up to 1,749 times in one session) when the carve-out is full or too fragmented, and desktop widgets draw broken while an app is open. Unless the firmware gives the GPU at least 1 GB, stay on Sequoia or earlier for now; if you run Tahoe anyway, expect more glitches. See *Graphics memory on Tahoe* |
 
 Each version's Metal shader-compiler patches are matched against that version's own dyld shared cache.
+
+**Graphics memory on Tahoe.** The "VRAM" of these APUs is a block of system RAM the firmware reserves at boot (UMA
+frame buffer, usually 512 MB, sometimes settable in the BIOS). Apple's driver sizes its video-memory heaps from that
+block (`AMDVIHWMemory::getHWMemorySize` reads `CONFIG_MEMSIZE`), and the failures come from
+`AMDHWMemory::allocateLargeBlocks` when no free piece is large enough. The "fixed-free" figure in the message is a second
+heap over the same range, not spare memory. The block can't be grown or moved after boot: the display engine scans out
+of it and the CPU reaches it through a fixed aperture. The way forward is to have Apple's driver place more of its
+allocations in ordinary system memory, which on an APU is the same RAM at the same speed; that is not done yet.
 
 Reports from other Carrizo, Bristol Ridge or Stoney machines are welcome once it's further along; open an issue with
 the model and the black-box report (see *Installing*).
@@ -104,8 +112,9 @@ And Metal needed:
 | Freezes with clock scaling | Fixed: CarrizoRed's own interrupt-storm breaker was tripping on real interrupt bursts at higher clocks |
 | OpenGL | Expected to work, untested: Apple's AMD GL driver compiles through the same `libSC` CarrizoRed patches for Stoney (its `ATIRadeonX4000SCLib` wraps it), and the shader fix works on every submission whatever the API |
 | Video decode/encode | On hold: software decode and encode. UVD starts with Apple's firmware, but needs CarrizoRed to translate GPU virtual addresses to physical ones before it can decode ([docs/VIDEO.md](docs/VIDEO.md)) |
-| Sleep/wake | Not working yet: idle sleep enters sleep, but the GPU's command processor stalls after waking (fix in testing: the firmware reload after wake no longer repeats). Closing the lid froze the machine on Catalina; being looked at |
+| Sleep/wake | Not working yet: sleeps and wakes (D509BA, Catalina, with `SSDT-GPRW`), the GPU re-initialises, the panel stays black after wake (AUX PHY, panel-power and backlight registers reset by S3; restore in testing). A rare `preemption_level` panic after wake is being traced (`-crnopreemptcheck`) |
 | Carrizo / Bristol Ridge | Code paths written (SMU loader, clock scaling, caps), untested: no hardware |
+| Tahoe graphics memory | Open: Tahoe can fill the 512 MB carve-out (see *Graphics memory on Tahoe*) |
 | External displays, brightness, HDMI audio | Not started / untested |
 | GPU occasionally not responding after a warm restart | Open (power off fully) |
 
@@ -130,7 +139,8 @@ Older GCN 2 APUs (Kaveri, Kabini, Beema/Mullins) may follow later. Sequoia still
 complete GPU firmware for them, but no display or GCN 2 accelerator driver; see
 [docs/OLDER_APUS.md](docs/OLDER_APUS.md).
 
-**macOS:** Catalina through Sequoia work (see *macOS versions* above); Tahoe is allowed to load but untested.
+**macOS:** Catalina through Sequoia work (see *macOS versions* above); Tahoe works with glitches and isn't recommended yet
+with 512 MB of graphics memory.
 Excavator CPUs have AVX2, so Ventura and later run without CPU hacks (AMD_Vanilla patches are still needed).
 
 **Why this family:** macOS never had drivers for these APUs, and removed its GCN 1–3 dGPU drivers in Ventura, but it
