@@ -6165,7 +6165,18 @@ static uint32_t restoreAfterWake() {
 		off = checkKernelArgument("-crnowakerestore");
 	if (off || !gpuMmio)
 		return 0;
-	uint32_t regs[6 * 4 + 6], n = 0, written = 0;
+	// Wake #11 (log 1793323817): with the AUX PHY and panel registers back, AUX_SW_STATUS still read 0xA1 (done, receive
+	// timeout) and the panel never answered. Also reset: the display reference clock and its time bases (REFCLK_CNTL 0
+	// for 3; the millisecond/microsecond dividers AUX times its reply window with), the DENTIST display clock (Apple's
+	// setDisplayClock can't set it here: no SetDCEClock table for its parser), the AUX pads' impedance calibration
+	// (period 0, AUXP/AUXN calibration off), the panel power sequencer's GPIO pad mask/output/enable (the pad readback
+	// lost bit 16) and UNIPHY0's macro settings. So, in order: clocks, pads, PHY, then AUX and panel power as before.
+	static const uint32_t early[] {0x109, 0x130, 0x13B, 0x124, 0x131, 0x483A, 0x483B, 0x483C, 0x4890, 0x4891, 0x4892};
+	uint32_t regs[arrsize(early) + 0x18 + 6 * 4 + 6], n = 0, written = 0;
+	for (auto r : early)
+		regs[n++] = r;
+	for (uint32_t r = 0x48C0; r < 0x48D8; r++)
+		regs[n++] = r;
 	for (uint32_t ch = 0; ch < 6; ch++)
 		for (uint32_t r = 0; r < 4; r++)
 			regs[n++] = 0x5C08 + ch * 0x1C + r;
