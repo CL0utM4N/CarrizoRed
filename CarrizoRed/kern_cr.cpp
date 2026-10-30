@@ -6216,23 +6216,41 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 				results[0] & 1, results[1] & 1, results[2] & 1, results[3] & 1, gpuMmio ? gpuMmio[0x171E] : 0,
 				gpuMmio ? gpuMmio[0x1707] : 0);
 		}
-		// After S3 DP_DTO0_MODULO is 0 (the firmware set it to DPREFCLK at boot), and the VBIOS's DP DTO set-up in
-		// SetPixelClock only writes the phase: DC's understanding is that "MODULO is programmed equal to DPREFCLK" by the
-		// VBIOS. DC's DCE 11.2 clock manager (dce112_set_clock) has the VBIOS program DPREFCLK through SetDCEClock with
-		// type DPREFCLK and no frequency ("VBIOS will determine DPREFCLK frequency"), source DFS; Apple's SetDCEClock
-		// object doesn't exist for this VBIOS (setDisplayClock: ASSERT m_setDceClock), so nothing does it after S3. Run
-		// it here (SET_DCE_CLOCK_PARAMETERS_V2_1: ulDCEClkFreq 0, ucDCEClkType 1, ucDCEClkSrc ATOM_GCK_DFS 8).
-		// -crnodprefclk disables.
-		if (!checkKernelArgument("-crnodprefclk")) {
-			uint32_t before[2] {gpuMmio ? gpuMmio[0x141] : 0, gpuMmio ? gpuMmio[0x142] : 0};
-			uint8_t dce[16] {};
-			dce[4] = 1;  // DCE_CLOCK_TYPE_DPREFCLK
-			dce[5] = 8;  // ATOM_GCK_DFS
-			uint8_t set = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
-				AtomDceClockTable, dce, flag);
-			diskLogEvent("wake: SetDCEClock DPREFCLK ok %u, returned %u0 kHz; DTO0 phase %x -> %x, modulo %x -> %x", set & 1,
-				dce[0] | dce[1] << 8 | dce[2] << 16 | dce[3] << 24, before[0], gpuMmio ? gpuMmio[0x141] : 0, before[1],
-				gpuMmio ? gpuMmio[0x142] : 0);
+		// The display engine clock, the way Linux's DC sets it on DCE 11.0 (dce_set_clock -> program_display_engine_pll ->
+		// SetPixelClock V6 with ucPpll ATOM_EXT_PLL1, DC's DFS, and ulDispEngClkFreq). Apple sets it through SetDCEClock,
+		// which this VBIOS doesn't have (command table 46 is empty; "setDisplayClock: ASSERT m_setDceClock"), so after S3
+		// nothing sets the display clocks: DENTIST_DPREFCLK_WDIVIDER was back at its 100 MHz reset value (DID 0x64; the
+		// firmware's 0x24 is 400 MHz from the 3.6 GHz DENTIST VCO), the DP DTO modulos 0, DP_VID_M wrong and the trained
+		// link black (wake #32, log 1793402311; SetDCEClock returned 0 kHz). Use the VBIOS's default display engine clock
+		// (FirmwareInfo ulDefaultDispEngineClkFreq), as legacy Linux does at init. If the DTO modulo is still 0 after it,
+		// ask again with PIXEL_CLOCK_V6_MISC_GEN_DPREFCLK (0x40). -crnodispclk disables.
+		if (!checkKernelArgument("-crnodispclk") && vbiosImage) {
+			uint16_t fiSize = 0;
+			auto *fi = VBIOS::findDataTable(static_cast<const uint8_t *>(vbiosImage->getBytesNoCopy()),
+				vbiosImage->getLength(), 4, fiSize);  // FirmwareInfo
+			uint32_t dispclk = 0;
+			if (fi && fiSize >= 44)
+				memcpy(&dispclk, fi + 40, sizeof(dispclk));  // ulDefaultDispEngineClkFreq, 10 kHz units
+			if (dispclk) {
+				uint32_t dentist = gpuMmio ? gpuMmio[0x124] : 0, modulo = gpuMmio ? gpuMmio[0x142] : 0;
+				uint8_t ok2 = 0, pc[16] {};
+				memcpy(pc, &dispclk, sizeof(dispclk));
+				pc[8] = 8;  // ucPpll: ATOM_EXT_PLL1 (DFS)
+				uint8_t ok1 = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
+					AtomPixelClockTable, pc, flag);
+				uint32_t dentist1 = gpuMmio ? gpuMmio[0x124] : 0, modulo1 = gpuMmio ? gpuMmio[0x142] : 0;
+				if (!modulo1) {
+					memset(pc, 0, sizeof(pc));
+					memcpy(pc, &dispclk, sizeof(dispclk));
+					pc[8] = 8;
+					pc[11] = 0x40;  // PIXEL_CLOCK_V6_MISC_GEN_DPREFCLK
+					ok2 = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
+						AtomPixelClockTable, pc, flag);
+				}
+				diskLogEvent("wake: display engine clock %u0 kHz via SetPixelClock DFS: ok %u, then GEN_DPREFCLK %s; DENTIST "
+					"%x -> %x -> %x, DTO0 modulo %x -> %x -> %x", dispclk, ok1 & 1, modulo1 ? "not needed" : ok2 & 1 ? "ok" :
+					"failed", dentist, dentist1, gpuMmio ? gpuMmio[0x124] : 0, modulo, modulo1, gpuMmio ? gpuMmio[0x142] : 0);
+			}
 		}
 		uint32_t restored = restoreAfterWake();
 		diskLogEvent("wake: %u registers restored before the first AUX transaction (VBIOS scratch and backlight from sleep%s)",
