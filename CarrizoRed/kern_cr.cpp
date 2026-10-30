@@ -522,6 +522,11 @@ static volatile bool wakeRestorePending;  // a full wake is under way: put back 
 // writes them back first thing at resume (amdgpu_atombios_scratch_regs_save / _restore); see restoreAfterWake.
 static uint32_t biosScratch[16];
 static bool biosScratchSaved;
+// The VBIOS AUX calls themselves (ProcessAuxChannelTransaction v2: in[0] request/data offsets, in[1] bytes ucChannelID,
+// ucReplyStatus (out), ucDataOutLen, ucDelay, in[2] byte 0 ucHPD_ID): the last one before sleep and the first few of a
+// full wake go into the disk log, to compare the channel, HPD and reply status with the working ones.
+static AtomCall lastAuxCall;
+static volatile uint32_t wakeAuxLogs;
 static uint32_t restoreAfterWake();
 
 // eDP block state at the moment Apple starts training pattern 1 (DPCD 0x102 written with TPS1): panel power
@@ -1543,6 +1548,9 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 	switch (messageType) {
 		case kIOMessageSystemWillSleep:
 			systemSleeps++;
+			diskLogEvent("last AUX call before sleep: in %08x %08x %08x %08x -> out %08x %08x, ok %x", lastAuxCall.in[0],
+				lastAuxCall.in[1], lastAuxCall.in[2], lastAuxCall.in[3], lastAuxCall.out[0], lastAuxCall.out[1],
+				lastAuxCall.ok);
 			if (gpuMmio) {
 				for (uint32_t i = 0; i < 16; i++)
 					biosScratch[i] = gpuMmio[0x5C9 + i];
@@ -1562,6 +1570,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			__atomic_store_n(&edpWakePowerOn, true, __ATOMIC_RELAXED);
 			__atomic_store_n(&wakeAuxWatch, true, __ATOMIC_RELAXED);
 			__atomic_store_n(&wakeRestorePending, true, __ATOMIC_RELAXED);
+			__atomic_store_n(&wakeAuxLogs, 4, __ATOMIC_RELAXED);
 			if (wakeWatchdogCall) {
 				wakeWakesAtStart = systemWakes;
 				wakeBeatAtStart = watcherBeat;
@@ -6015,6 +6024,11 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	if (aux) {
 		if (!(ok & 1))
 			__atomic_fetch_add(&auxFailures, 1, __ATOMIC_RELAXED);
+		lastAuxCall = entry;
+		if (__atomic_load_n(&wakeAuxLogs, __ATOMIC_RELAXED) && __atomic_fetch_sub(&wakeAuxLogs, 1, __ATOMIC_RELAXED))
+			diskLogEvent("AUX call after wake: in %08x %08x %08x %08x -> out %08x %08x, ok %x; AUX0 SW_STATUS %x "
+				"RX_STATUS %x", entry.in[0], entry.in[1], entry.in[2], entry.in[3], entry.out[0], entry.out[1], entry.ok,
+				gpuMmio ? gpuMmio[0x5C04] : 0, gpuMmio ? gpuMmio[0x5C0D] : 0);
 	} else {
 		ringPushMerged(atomRing, AtomRingSize, atomHead, entry, +[](const AtomCall &a, const AtomCall &b) {
 			return a.table == b.table && a.ok == b.ok && !memcmp(a.in, b.in, sizeof(a.in)) &&
