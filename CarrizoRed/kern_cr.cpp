@@ -6074,8 +6074,51 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 		}
 	}
 	if (aux && edpSeen && !edpPowerOnOff && __atomic_exchange_n(&edpWakePowerOn, false, __ATOMIC_RELAXED)) {
-		uint8_t powered = powerOnEdp();
-		diskLogEvent("eDP power on before the first AUX transaction after wake: ok %u", powered & 1);
+		// Linux's DC (dce110_edp_power_control) powers the panel off at suspend and on at resume, with the panel's own
+		// transmitter parameters (transmitter, eDP connector, 4 lanes, HPD) rather than all zeros, at least 500 ms after it
+		// went off (eDP T12), then waits for HPD (edp_wait_for_hpd_ready). Apple never powers it off, and our all-zero
+		// POWER_ON only drove the DIGON pad in GPIO mode. Wake #18 (log 1793335293): AUX still unanswered with the pads
+		// calibrated as Linux does. So: a clean power cycle with Apple's eDP transmitter parameters, as DC does it.
+		if (edpTransmitterSeen && !checkKernelArgument("-crnowakepowercycle")) {
+			uint8_t power[32];
+			memcpy(power, edpTransmitter, sizeof(power));
+			power[4] = 4;  // LANE_COUNT_FOUR, as DC
+			power[6] = 0;  // ATOM_ENCODER_MODE_DP (eDP)
+			power[3] = 13;  // ATOM_TRANSMITTER_ACTION_POWER_OFF
+			uint8_t off = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
+				AtomTransmitterTable, power, flag);
+			bool sleepOk = ml_get_interrupts_enabled() && !ml_at_interrupt_context();
+			if (sleepOk)
+				IOSleep(500);
+			else
+				IODelay(500000);
+			memcpy(power, edpTransmitter, sizeof(power));
+			power[4] = 4;
+			power[6] = 0;
+			power[3] = 12;  // ATOM_TRANSMITTER_ACTION_POWER_ON
+			uint8_t on = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
+				AtomTransmitterTable, power, flag);
+			// Wait for the panel's HPD (DC_HPD1_INT_STATUS.DC_HPD_SENSE), up to 500 ms, then 50 ms more.
+			uint32_t waited = 0;
+			while (waited < 500 && gpuMmio && !(gpuMmio[0x1898] & 2)) {
+				if (sleepOk)
+					IOSleep(10);
+				else
+					IODelay(10000);
+				waited += 10;
+			}
+			if (sleepOk)
+				IOSleep(50);
+			else
+				IODelay(50000);
+			diskLogEvent("wake: eDP power cycle with the panel's transmitter parameters: off %u, 500 ms, on %u, HPD after "
+				"%u ms (sense %u); PWRSEQ_CNTL %x STATE %x GPIO_PWRSEQ mask %x Y %x", off & 1, on & 1, waited,
+				gpuMmio ? (gpuMmio[0x1898] >> 1) & 1 : 0, gpuMmio ? gpuMmio[0x481B] : 0, gpuMmio ? gpuMmio[0x481C] : 0,
+				gpuMmio ? gpuMmio[0x4890] : 0, gpuMmio ? gpuMmio[0x4893] : 0);
+		} else {
+			uint8_t powered = powerOnEdp();
+			diskLogEvent("eDP power on before the first AUX transaction after wake: ok %u", powered & 1);
+		}
 	}
 	if (aux && __atomic_load_n(&dcAuxOn, __ATOMIC_RELAXED))
 		dcAuxPrepare();
