@@ -6435,13 +6435,20 @@ IOReturn CRDriver::wrapAuxWriteBytes(void *that, uint32_t address, uint32_t leng
 	// -crnotps1restore disables.
 	if (address == 0x102 && length >= 1 && data && (data[0] & 3) == 1 && trainBootValid && gpuMmio &&
 		__atomic_load_n(&dcAuxOn, __ATOMIC_RELAXED) && !checkKernelArgument("-crnotps1restore")) {
-		static const uint32_t regs[] {0x481B, 0x4A00};
+		// Wake #28 (log 1793358173): PWRSEQ_CNTL then matched, but UNIPHYB_LINK_CNTL (Apple's own boot value 0x100100,
+		// not the firmware's), UNIPHY_TMDP_REG3/5 (reset again by the VBIOS swing set-up after our post-ENABLE restore)
+		// and DIG_FE_CNTL still differed at TPS1. Put all the boot TPS1 control registers back here.
+		static const uint32_t regs[] {0x481B, 0x4805, 0x4806, 0x4807, 0x48D1, 0x48D3, 0x4A00};
 		for (auto r : regs)
 			for (size_t i = 0; i < sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0]); i++)
 				if (trainSnapRegs[i] == r && gpuMmio[r] != trainBoot[i]) {
 					gpuMmio[r] = trainBoot[i];
 					trainRestores++;
 				}
+		static uint32_t tps1Logs;
+		if (tps1Logs++ < 3)
+			diskLogEvent("wake: TPS1 state restored (%u writes so far); DIG_FE_CNTL now %x, TMDP_REG3 %x REG5 %x",
+				trainRestores, gpuMmio[0x4A00], gpuMmio[0x48D1], gpuMmio[0x48D3]);
 	}
 	IOReturn ret = write(that, address, length, data, flags);
 	dpcdRecord(address, length, true, data, ret);
