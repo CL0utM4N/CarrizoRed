@@ -5946,6 +5946,14 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			IODelay(300000);
 		return powered;
 	};
+	// Apple's last DIG1TransmitterControl call for the eDP connector (0x14): its PHY, lane count, mode and config, for the
+	// INIT replayed after a wake (below).
+	static uint8_t edpTransmitter[32];
+	static bool edpTransmitterSeen;
+	if (table == AtomTransmitterTable && params && static_cast<uint8_t *>(params)[5] == 0x14) {
+		memcpy(edpTransmitter, params, sizeof(edpTransmitter));
+		edpTransmitterSeen = true;
+	}
 	if (table == AtomTransmitterTable && params && !edpPowerOnOff) {
 		auto *bytes = static_cast<uint8_t *>(params);
 		if (bytes[3] == 1 && bytes[5] == 0x14) {
@@ -5969,6 +5977,20 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	if (aux && __atomic_exchange_n(&wakeRestorePending, false, __ATOMIC_RELAXED)) {
 		uint32_t restored = restoreAfterWake();
 		diskLogEvent("wake: %u display registers restored to their boot values before the first AUX transaction", restored);
+		// Wake #14 (log 1793329705): with 44 registers back (DC_GPIO_DEBUG included) AUX still timed out. Linux's legacy
+		// DCE 11 resume (dce_v11_0_resume -> amdgpu_atombios_encoder_init_dig) runs each DIG transmitter's
+		// ATOM_TRANSMITTER_ACTION_INIT (7) after power loss, which sets the PHY up again; Apple never does. Replay Apple's
+		// own last eDP transmitter call with that action, before the panel power-on and the first AUX transaction.
+		// -crnowakerestore disables this too.
+		if (edpTransmitterSeen && !checkKernelArgument("-crnowakerestore")) {
+			uint8_t init[32];
+			memcpy(init, edpTransmitter, sizeof(init));
+			init[3] = 7;  // ATOM_TRANSMITTER_ACTION_INIT
+			uint8_t inited = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
+				AtomTransmitterTable, init, flag);
+			diskLogEvent("wake: eDP transmitter INIT (phy %u lanes %u mode %u config %02x): ok %u", init[2], init[4], init[6],
+				init[7], inited & 1);
+		}
 	}
 	if (aux && edpSeen && !edpPowerOnOff && __atomic_exchange_n(&edpWakePowerOn, false, __ATOMIC_RELAXED)) {
 		uint8_t powered = powerOnEdp();
