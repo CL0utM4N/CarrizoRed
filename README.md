@@ -240,7 +240,7 @@ and the list of affected machines.
 | `-crnolbfix` | DCE 11.0's line-buffer size (0x6B0) in `LB_MEMORY_CTRL` instead of Apple's |
 | `-crnoedppoweron` | The eDP panel POWER_ON transmitter action before Apple enables the eDP transmitter, and before the first AUX transaction after a wake |
 | `-crnowakerestore` | Don't restore the display registers S3 resets (display reference clock and time bases, DENTIST display clock, AUX pad calibration, panel power pads, UNIPHY0 macro settings, AUX PHY set-up, panel power sequencer delays, backlight PWM) to their boot values after a wake |
-| `-crnoauxhpd` | Don't put the HPD_ID learned from working AUX calls into Apple's VBIOS AUX calls (Apple passes the 8-byte v1 parameters, so the v2 table's HPD_ID byte is whatever is on the stack; after a wake that broke every AUX transfer) |
+| `-crauxhpd` | Experimental: put the HPD_ID learned from working AUX calls into byte 8 of Apple's VBIOS AUX parameters (put back after each call). Off by default: that byte is Apple's own DPCD address, and AUX works at boot whatever it holds |
 | `-crnodpextclk` | Switching the DP PHY to the external reference clock (`DIG1TransmitterControl`) |
 | `-crnolanecap` | Capping DP training at the lane count the firmware used for the eDP link |
 | `-crnobpccap` | Capping the DP colour depth at the firmware's (encoder `ucBitPerColor`, `DP_PIXEL_FORMAT`) |

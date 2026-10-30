@@ -531,7 +531,9 @@ static volatile uint32_t wakeAuxLogs;
 // wake had 0x11, 0, 0 and 0 there, with bytes 9-10 holding the DPCD address (0x111, 0x600): Apple fills in the 8-byte
 // v1 parameters and the v2 table reads its HPD_ID (the hot-plug pin the AUX engine is tied to) from whatever is on the
 // stack, which happened to be usable at boot. Learn the HPD_ID of calls that succeed (reply status 0, three agreeing) and
-// put it in every AUX call. -crnoauxhpd disables.
+// put it in every AUX call. Opt-in (-crauxhpd): byte 8 turned out to be Apple's own DPCD address (its low byte), so
+// overwriting it sent Apple's link training to the wrong DPCD registers (boot with ea18a14: vertical stripes), and AUX
+// works at boot whatever it holds. When on, the byte is put back after the call.
 static uint8_t auxHpdGood = 0xFF;
 static uint32_t auxHpdOk[8], auxHpdForced;
 static int auxHpdOff = -1;
@@ -5904,15 +5906,18 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	__atomic_fetch_add(&atomCalls, 1, __ATOMIC_RELAXED);
 	bool aux = table == AtomAuxTable;
 	uint8_t auxHpdUsed = 0xFF;
+	int16_t auxHpdSaved = -1;  // Apple's byte 8, to put back after the call
 	if (aux && params) {
 		if (auxHpdOff < 0)
-			auxHpdOff = checkKernelArgument("-crnoauxhpd");
+			auxHpdOff = !checkKernelArgument("-crauxhpd");
 		auto *bytes = static_cast<uint8_t *>(params);
+		auxHpdUsed = bytes[8];
 		if (!auxHpdOff && auxHpdGood != 0xFF && bytes[8] != auxHpdGood) {
+			auxHpdSaved = bytes[8];
 			bytes[8] = auxHpdGood;
 			auxHpdForced++;
+			auxHpdUsed = auxHpdGood;
 		}
-		auxHpdUsed = bytes[8];
 	}
 	if (aux)
 		__atomic_fetch_add(&auxCalls, 1, __ATOMIC_RELAXED);
@@ -6045,6 +6050,8 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 		if (!(ok & 1))
 			__atomic_fetch_add(&auxFailures, 1, __ATOMIC_RELAXED);
 		lastAuxCall = entry;
+		if (auxHpdSaved >= 0 && params)
+			static_cast<uint8_t *>(params)[8] = static_cast<uint8_t>(auxHpdSaved);
 		if (params && (ok & 1) && static_cast<uint8_t *>(params)[5] == 0 && auxHpdUsed < arrsize(auxHpdOk) &&
 			++auxHpdOk[auxHpdUsed] >= 3 && auxHpdGood == 0xFF)
 			auxHpdGood = auxHpdUsed;
