@@ -6174,8 +6174,11 @@ static uint32_t restoreAfterWake() {
 	// Wake #12 (log 1793326653): with those back too (39 writes), still 0xA1. Add the DCCG deep-sleep reference DTO
 	// (DCCG_DS_DTO_INCR/MODULO 0, DCCG_DS_CNTL 0 for 0x10201: enable, hardware calibration, XTALIN divider) and
 	// DC_MEM_GLOBAL_PWR_REQ_CNTL, and reset each enabled AUX engine afterwards (below): it ran on the wrong clocks before.
-	static const uint32_t early[] {0x109, 0x130, 0x13B, 0x113, 0x114, 0x115, 0x132, 0x124, 0x131, 0x483A, 0x483B,
-		0x483C, 0x4890, 0x4891, 0x4892};
+	// Wake #13 (log 1793328382): 43 restored, still 0xA1; DIGON (panel VDD) is driven high by the VBIOS power-on, HPD is
+	// sensed. DC_GPIO_DEBUG reads 0x101 for the firmware's 0: DC_GPIO_MACRO_DEBUG = 1 puts the DCIO pad macro in a debug
+	// mode, which can take the AUX pads away from the AUX engine. Clear it first.
+	static const uint32_t early[] {0x4804, 0x109, 0x130, 0x13B, 0x113, 0x114, 0x115, 0x132, 0x124, 0x131, 0x483A,
+		0x483B, 0x483C, 0x4890, 0x4891, 0x4892};
 	uint32_t regs[arrsize(early) + 0x18 + 6 * 4 + 6], n = 0, written = 0;
 	for (auto r : early)
 		regs[n++] = r;
