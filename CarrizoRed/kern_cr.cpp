@@ -6170,6 +6170,25 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			else
 				IODelay(50000);
 			if (!checkKernelArgument("-crnoauxprobe")) {
+				// Wake #21 (log 1793338325): the native read works at boot (DPCD revision 12) but times out here, with the
+				// panel powered and HPD up. At boot the firmware has the eDP transmitter enabled; here it is off. Try the
+				// read with the transmitter on too (VBIOS ENABLE with Apple's recorded parameters), then turn it off again
+				// so Apple's own sequence runs as it would.
+				uint8_t reply2, data2;
+				uint8_t enable[32];
+				memcpy(enable, edpTransmitter, sizeof(enable));
+				enable[3] = 1;  // ATOM_TRANSMITTER_ACTION_ENABLE
+				uint8_t enabled = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
+					AtomTransmitterTable, enable, flag);
+				IODelay(1000);
+				uint32_t status2 = nativeAuxRead(0, &reply2, &data2);
+				memcpy(enable, edpTransmitter, sizeof(enable));
+				enable[3] = 0;  // ATOM_TRANSMITTER_ACTION_DISABLE
+				FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that, AtomTransmitterTable,
+					enable, flag);
+				diskLogEvent("native AUX read of DPCD 0 after wake with the eDP transmitter enabled (ok %u, symclk %x): "
+					"SW_STATUS %x, reply %x, DPCD revision %02x, RX_STATUS %x", enabled & 1,
+					edpTransmitter[0] | edpTransmitter[1] << 8, status2, reply2, data2, gpuMmio ? gpuMmio[0x5C0D] : 0);
 				uint8_t reply, data;
 				uint32_t status = nativeAuxRead(0, &reply, &data);
 				diskLogEvent("native AUX read of DPCD 0 after wake: SW_STATUS %x, reply %x (0 = ACK), DPCD revision %02x, "
@@ -6330,8 +6349,13 @@ static const struct {
 	{0x1898, 0x30},  // DC_HPD1-6 (INT_STATUS, INT_CONTROL, CONTROL, ...)
 	{0x5C00, 0xB0},  // DP_AUX0-5 (AUX_CONTROL, arbitration, DPHY TX/RX set-up)
 	{0x5C9, 0x10},   // BIOS_SCRATCH_0-15 (the VBIOS's display and panel state)
+	{0x1600, 0x20},  // DMCU
+	{0x1700, 0x80},  // pixel PLLs
+	{0x1860, 0x20},  // DCO: clocks, memory power, soft resets
+	{0x4900, 0x100}, // UNIPHY2-8 macro settings
 };
-static constexpr uint32_t DiffRegCount = 0x60 + 0x80 + 0x200 + 0x100 + 0x100 + 0x30 + 0xB0 + 0x10;
+static constexpr uint32_t DiffRegCount = 0x60 + 0x80 + 0x200 + 0x100 + 0x100 + 0x30 + 0xB0 + 0x10 + 0x20 + 0x80 + 0x20 +
+	0x100;
 static uint32_t diffBoot[DiffRegCount];
 static bool diffBootValid;
 
@@ -10075,7 +10099,7 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 		for (auto &block : diffBlocks) {
 			for (uint32_t i = 0; i < block.count; i++, n++) {
 				uint32_t now = gpuMmio[block.start + i];
-				if (now != diffBoot[n] && changed++ < 200)
+				if (now != diffBoot[n] && changed++ < 400)
 					add(" %x=%x/%x", block.start + i, now, diffBoot[n]);
 			}
 		}
