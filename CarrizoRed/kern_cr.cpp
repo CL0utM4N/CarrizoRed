@@ -545,6 +545,7 @@ static void dcAuxPrepare();
 static uint32_t auxHpdOk[8], auxHpdForced;
 static int auxHpdOff = -1;
 static uint32_t restoreAfterWake();
+static bool diffBootValue(uint32_t offset, uint32_t &value);
 
 // eDP block state at the moment Apple starts training pattern 1 (DPCD 0x102 written with TPS1): panel power
 // sequencer, DIG0, DP0, pixel rate, backlight. The black box otherwise only sees the state after Apple gave up.
@@ -6169,6 +6170,21 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 				IOSleep(50);
 			else
 				IODelay(50000);
+			// Wake #22 (log 1793339243, the wider diff): after the VBIOS INIT and power-on, UNIPHY0's TMDP analogue
+			// registers (UNIPHY_TMDP_REG3-5, 0x48D1-0x48D3) read e0001/0/0 against the firmware's 230e0001/9000000/
+			// 48a300aa, and UNIPHY2's TMDP_REG5 (0x4913) lacks bit 28: the restore had put UNIPHY0's back, then the VBIOS
+			// calls reset them. Put the UNIPHY0-8 macro blocks back now, right before AUX.
+			uint32_t uniphy = 0;
+			if (!checkKernelArgument("-crnowakerestore") && gpuMmio) {
+				for (uint32_t r = 0x48C0; r < 0x4A00; r++) {
+					uint32_t boot;
+					if (diffBootValue(r, boot) && gpuMmio[r] != boot) {
+						gpuMmio[r] = boot;
+						uniphy++;
+					}
+				}
+				diskLogEvent("wake: %u UNIPHY macro registers restored after the VBIOS power-on", uniphy);
+			}
 			if (!checkKernelArgument("-crnoauxprobe")) {
 				// Wake #21 (log 1793338325): the native read works at boot (DPCD revision 12) but times out here, with the
 				// panel powered and HPD up. At boot the firmware has the eDP transmitter enabled; here it is off. Try the
