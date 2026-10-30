@@ -620,7 +620,8 @@ static void dcAuxPrepare() {
 		m[0x5C0A] = (m[0x5C0A] & ~0x700U) | (1U << 8);      // AUX_DPHY_RX_CONTROL0.AUX_RX_RECEIVE_WINDOW = 1
 	}
 	// clear_aux_error: AUXN/AUXP_CALOUT_ERROR_AK (0x400) 1 then 0.
-	for (uint32_t reg : {0x483CU, 0x483BU}) {
+	static const uint32_t impcal[] {0x483C, 0x483B};
+	for (auto reg : impcal) {
 		m[reg] = m[reg] | 0x400;
 		m[reg] = m[reg] & ~0x400U;
 	}
