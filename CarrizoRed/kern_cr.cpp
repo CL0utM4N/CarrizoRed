@@ -6171,7 +6171,11 @@ static uint32_t restoreAfterWake() {
 	// setDisplayClock can't set it here: no SetDCEClock table for its parser), the AUX pads' impedance calibration
 	// (period 0, AUXP/AUXN calibration off), the panel power sequencer's GPIO pad mask/output/enable (the pad readback
 	// lost bit 16) and UNIPHY0's macro settings. So, in order: clocks, pads, PHY, then AUX and panel power as before.
-	static const uint32_t early[] {0x109, 0x130, 0x13B, 0x124, 0x131, 0x483A, 0x483B, 0x483C, 0x4890, 0x4891, 0x4892};
+	// Wake #12 (log 1793326653): with those back too (39 writes), still 0xA1. Add the DCCG deep-sleep reference DTO
+	// (DCCG_DS_DTO_INCR/MODULO 0, DCCG_DS_CNTL 0 for 0x10201: enable, hardware calibration, XTALIN divider) and
+	// DC_MEM_GLOBAL_PWR_REQ_CNTL, and reset each enabled AUX engine afterwards (below): it ran on the wrong clocks before.
+	static const uint32_t early[] {0x109, 0x130, 0x13B, 0x113, 0x114, 0x115, 0x132, 0x124, 0x131, 0x483A, 0x483B,
+		0x483C, 0x4890, 0x4891, 0x4892};
 	uint32_t regs[arrsize(early) + 0x18 + 6 * 4 + 6], n = 0, written = 0;
 	for (auto r : early)
 		regs[n++] = r;
@@ -6188,6 +6192,18 @@ static uint32_t restoreAfterWake() {
 			gpuMmio[regs[i]] = boot;
 			written++;
 		}
+	}
+	// AUX_CONTROL (0x5C00 + 0x1C per channel): pulse AUX_RESET (0x10) on each enabled engine (AUX_EN, 0x1) and wait for
+	// AUX_RESET_DONE (0x20), up to 1 ms.
+	for (uint32_t ch = 0; ch < 6; ch++) {
+		volatile uint32_t &control = gpuMmio[0x5C00 + ch * 0x1C];
+		uint32_t value = control;
+		if (!(value & 1))
+			continue;
+		control = value | 0x10;
+		for (uint32_t us = 0; us < 1000 && !(control & 0x20); us += 10)
+			IODelay(10);
+		control = value & ~0x10U;
 	}
 	return written;
 }
