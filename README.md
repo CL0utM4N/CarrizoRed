@@ -242,6 +242,7 @@ and the list of affected machines.
 | `-crnowakerestore` | Don't run the VBIOS EnableDispPowerGating INIT/DISABLE on both pipes after a wake, and don't restore the display registers S3 resets (display PLL bandgap, display reference clock and time bases, DENTIST display clock, AUX pad calibration, panel power pads, UNIPHY0 macro settings, AUX PHY set-up, panel power sequencer delays, backlight PWM) to their boot values after a wake |
 | `-crnoauxprobe` | Skip the diagnostic native AUX read of DPCD 0 (Linux DC's register sequence, bypassing the VBIOS AUX table) at boot and after a wake |
 | `-crnosleeppoweroff` | Don't power the eDP panel off before sleep (VBIOS POWER_OFF with the panel's parameters, right after Apple's DPCD 0x600 = 2), as Linux's DC does at suspend |
+| `-crnotps1restore` | After a wake, don't put LVTMA_PWRSEQ_CNTL and DIG_FE_CNTL back to their values at the boot's link training (TPS1) just before Apple's training starts |
 | `-crnotmdprestore` | After a wake, don't put the UNIPHY analogue (TMDP) registers back to the firmware's values right after Apple's eDP transmitter ENABLE |
 | `-crnowakepowercycle` | After a wake, don't power-cycle the eDP panel the way Linux's DC does (VBIOS POWER_OFF and POWER_ON with the panel's transmitter parameters, 500 ms apart, then wait for HPD); use the all-zero POWER_ON instead |
 | `-crnodcaux` | After a wake, don't prepare each VBIOS AUX transfer the way Linux's DC does (clear the AUX pads' calibration errors, force a recalibration, acknowledge the last transfer; once: receive window 1, LS reads off) |

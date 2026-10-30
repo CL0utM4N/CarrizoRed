@@ -563,6 +563,10 @@ static bool diffBootValue(uint32_t offset, uint32_t &value);
 static const uint32_t trainSnapRegs[] {0x481B, 0x481C, 0x4A00, 0x4A47, 0x4AA0, 0x4AA3, 0x4AA4, 0x4AAF, 0x140, 0x4820,
 	0x4805, 0x4806, 0x4807, 0x48D1, 0x48D3};
 static uint32_t trainSnap[sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0])], trainSnaps;
+// The same registers at the first TPS1 of the boot, where training passes: put back before a wake's training starts.
+static uint32_t trainBoot[sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0])];
+static bool trainBootValid;
+static uint32_t trainRestores;
 static AtomCall atomRing[AtomRingSize];
 static uint32_t atomHead, atomCalls, auxCalls, auxFailures;
 
@@ -602,6 +606,13 @@ static void atomReport(Add &add) {
 		auto &call = atomRing[i % AtomRingSize];
 		add(" %u:%x %x %x %x %x %x -> %x %x x%u\n", i, call.table, call.ok, call.in[0], call.in[1], call.in[2],
 			call.in[3], call.out[0], call.out[1], call.repeat);
+	}
+	if (trainBootValid) {
+		add("at the boot's TPS1:");
+		for (size_t i = 0; i < sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0]); i++)
+			add(" %x=%x", trainSnapRegs[i], trainBoot[i]);
+		add(" (wake TPS1 restores %u)
+", trainRestores);
 	}
 	add("at TPS1 (%u times):", trainSnaps);
 	for (size_t i = 0; i < sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0]); i++)
@@ -6360,6 +6371,10 @@ static void dpcdRecord(uint32_t address, uint32_t length, bool write, const uint
 	if (write && address == 0x102 && length >= 1 && data && (data[0] & 3) == 1 && gpuMmio) {
 		for (size_t i = 0; i < sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0]); i++)
 			trainSnap[i] = gpuMmio[trainSnapRegs[i]];
+		if (!trainBootValid && !systemSleeps) {
+			memcpy(trainBoot, trainSnap, sizeof(trainBoot));
+			trainBootValid = true;
+		}
 		trainSnaps++;
 	}
 	DpcdTx tx {};
@@ -6414,6 +6429,21 @@ IOReturn CRDriver::wrapAuxWriteBytes(void *that, uint32_t address, uint32_t leng
 	auto read = FunctionCast(wrapAuxReadBytes, callback->orgAuxReadBytes);
 	auto write = FunctionCast(wrapAuxWriteBytes, callback->orgAuxWriteBytes);
 	assrProbe(that, flags, read);
+	// Wake #27 (log 1793356172): at the start of training (TPS1) after the wake LVTMA_PWRSEQ_CNTL read 0x11 against the
+	// boot's 0x20211 (SYNCEN_OVRD and DIGON_OVRD; SYNCEN gates the transmitter's data output) and DIG_FE_CNTL 0 against
+	// 0x1000000 (DIG_SYMCLK_FE_ON), and clock recovery failed every time. In a wake session, just before Apple starts
+	// training (DPCD 0x102 = TPS1), put the power sequencer and DIG front end as they were at the boot's TPS1.
+	// -crnotps1restore disables.
+	if (address == 0x102 && length >= 1 && data && (data[0] & 3) == 1 && trainBootValid && gpuMmio &&
+		__atomic_load_n(&dcAuxOn, __ATOMIC_RELAXED) && !checkKernelArgument("-crnotps1restore")) {
+		static const uint32_t regs[] {0x481B, 0x4A00};
+		for (auto r : regs)
+			for (size_t i = 0; i < sizeof(trainSnapRegs) / sizeof(trainSnapRegs[0]); i++)
+				if (trainSnapRegs[i] == r && gpuMmio[r] != trainBoot[i]) {
+					gpuMmio[r] = trainBoot[i];
+					trainRestores++;
+				}
+	}
 	IOReturn ret = write(that, address, length, data, flags);
 	dpcdRecord(address, length, true, data, ret);
 	if (address == 0x600 && length >= 1 && data && data[0] == 2 && ret == kIOReturnSuccess && edpTransmitterSeen &&
