@@ -517,6 +517,11 @@ static volatile bool edpWakePowerOn;  // a full wake is under way: power the eDP
 // to 1 s later and adds the display sections (VBIOS calls, DPCD, the register diff against the firmware's boot state).
 static volatile bool wakeAuxWatch, wakeDisplayDiag;
 static volatile bool wakeRestorePending;  // a full wake is under way: put back the display set-up S3 lost, see below
+// The VBIOS scratch registers (BIOS_SCRATCH_0-15, 0x5C9-0x5D8) as they were at "will sleep": the VBIOS tables keep
+// their view of the connected displays and the panel's state there, and S3 clears them. Linux saves them at suspend and
+// writes them back first thing at resume (amdgpu_atombios_scratch_regs_save / _restore); see restoreAfterWake.
+static uint32_t biosScratch[16];
+static bool biosScratchSaved;
 static uint32_t restoreAfterWake();
 
 // eDP block state at the moment Apple starts training pattern 1 (DPCD 0x102 written with TPS1): panel power
@@ -1538,6 +1543,11 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 	switch (messageType) {
 		case kIOMessageSystemWillSleep:
 			systemSleeps++;
+			if (gpuMmio) {
+				for (uint32_t i = 0; i < 16; i++)
+					biosScratch[i] = gpuMmio[0x5C9 + i];
+				biosScratchSaved = true;
+			}
 			diskLogEvent("system will sleep (%u)", systemSleeps);
 			if (sleepWatchdogCall) {
 				sleepWakesAtStart = systemWakes;
@@ -6117,8 +6127,9 @@ static const struct {
 	{0x4A00, 0x100}, // DIG0 / DP0
 	{0x1898, 0x30},  // DC_HPD1-6 (INT_STATUS, INT_CONTROL, CONTROL, ...)
 	{0x5C00, 0xB0},  // DP_AUX0-5 (AUX_CONTROL, arbitration, DPHY TX/RX set-up)
+	{0x5C9, 0x10},   // BIOS_SCRATCH_0-15 (the VBIOS's display and panel state)
 };
-static constexpr uint32_t DiffRegCount = 0x60 + 0x80 + 0x200 + 0x100 + 0x100 + 0x30 + 0xB0;
+static constexpr uint32_t DiffRegCount = 0x60 + 0x80 + 0x200 + 0x100 + 0x100 + 0x30 + 0xB0 + 0x10;
 static uint32_t diffBoot[DiffRegCount];
 static bool diffBootValid;
 
@@ -6202,6 +6213,14 @@ static uint32_t restoreAfterWake() {
 	static const uint32_t early[] {0x4804, 0x109, 0x130, 0x13B, 0x113, 0x114, 0x115, 0x132, 0x124, 0x131, 0x483A,
 		0x483B, 0x483C, 0x4890, 0x4891, 0x4892};
 	uint32_t regs[arrsize(early) + 0x18 + 6 * 4 + 6], n = 0, written = 0;
+	// Wake #15 (log 1793331595): with the transmitter INIT too, the AUX receiver saw no reply at all (RX_STATUS sync
+	// count 0, 11 at boot). The VBIOS scratch registers first, from "will sleep", as Linux restores them at resume.
+	if (biosScratchSaved)
+		for (uint32_t i = 0; i < 16; i++)
+			if (gpuMmio[0x5C9 + i] != biosScratch[i]) {
+				gpuMmio[0x5C9 + i] = biosScratch[i];
+				written++;
+			}
 	for (auto r : early)
 		regs[n++] = r;
 	for (uint32_t r = 0x48C0; r < 0x48D8; r++)
