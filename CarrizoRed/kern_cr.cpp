@@ -6559,6 +6559,17 @@ IOReturn CRDriver::wrapAuxWriteBytes(void *that, uint32_t address, uint32_t leng
 		dpcdRecord(0x10A, 1, true, &value, r);
 		if (r == kIOReturnSuccess)
 			assrWrites++;
+		// The source side of ASSR: DP_DPHY_INTERNAL_CTRL (DP0 0x4AA7; DC defines it in dce110_resource.c, the register
+		// headers lack it) = 1, DP_PANEL_MODE_EDP, as Linux DC's setup_panel_mode does during link enable. The firmware
+		// leaves it at 1 at boot, which is why the panel-side write alone was enough there; S3 resets it to 0, and with the
+		// panel descrambling with the alternate seed and the source using the normal one, every line came out as stripes
+		// (wake #33, log 1793404035: link trained, clocks right, 4aa7 = 0 against the boot's 1). -crnoassrsource disables.
+		if (r == kIOReturnSuccess && gpuMmio && !checkKernelArgument("-crnoassrsource") && gpuMmio[0x4AA7] != 1) {
+			uint32_t was = gpuMmio[0x4AA7];
+			gpuMmio[0x4AA7] = 1;
+			diskLogEvent("ASSR: source panel mode DP_DPHY_INTERNAL_CTRL %x -> 1 (eDP)%s", was,
+				systemSleeps ? " after a sleep" : "");
+		}
 		if (read(that, 0x10A, 1, &value, flags) == kIOReturnSuccess)
 			assrReadback = value;
 	}

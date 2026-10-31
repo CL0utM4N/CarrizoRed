@@ -239,6 +239,7 @@ and the list of affected machines.
 | `-crnovramtest` | Reporting `ATIController::TestVRAM` as passed (the real result is still logged) |
 | `-crnolbfix` | DCE 11.0's line-buffer size (0x6B0) in `LB_MEMORY_CTRL` instead of Apple's |
 | `-crnoedppoweron` | The eDP panel POWER_ON transmitter action before Apple enables the eDP transmitter, and before the first AUX transaction after a wake |
+| `-crnoassrsource` | When CarrizoRed enables ASSR in the eDP panel, don't also put the GPU's DP encoder in eDP panel mode (DP_DPHY_INTERNAL_CTRL = 1, as Linux DC does). The firmware sets it at boot; after a sleep it's 0 and the picture comes out as stripes |
 | `-crnodispclk` | After a wake, don't set the display engine clock the way Linux's DC does on DCE 11.0 (VBIOS SetPixelClock with the DFS PLL and the VBIOS's default display clock; Apple's SetDCEClock path doesn't exist in these VBIOSes), so DPREFCLK and the DP DTO stay at their reset values |
 | `-crnodppclk` | Don't send Apple's DP/eDP SetPixelClock calls to the VBIOS the way Linux's DC does (ucPpll = ATOM_PPLL_INVALID, no dividers, so the VBIOS programs the DP DTO); Apple passes its Polaris "no PLL" index 6, and after a sleep nothing set the DTO up, so a trained link stayed black |
 | `-crnowakerestore` | Don't run Linux DC's resume steps after a wake: VBIOS EnableDispPowerGating INIT/DISABLE on both pipes, the VBIOS scratch and backlight PWM registers from before sleep, the eDP transmitter INIT with DC's parameters, the AUX engine reset |
