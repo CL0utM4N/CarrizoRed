@@ -1650,6 +1650,9 @@ void CRDriver::wrapSetCrtcToPixelClock(void *that, uint8_t crtc, uint8_t pll, vo
 // System sleep and wake in the disk log: sleep (S3) powers the GPU off, and what CarrizoRed set up once per boot (SMU
 // microcode load, the FB window move, SCLK DPM, RB+, video power) has to be redone on wake. First, see the sequence.
 static void diskLogEvent(const char *fmt, ...);
+static void wakeMarkStart();
+static void wakeMarkWrite(thread_call_param_t, thread_call_param_t);
+static thread_call_t wakeMarkCall;
 static uint32_t systemSleeps, systemWakes;
 // Set on each wake: the watcher writes a full black-box report to the disk log 30 s later (the GPU's state once macOS
 // has brought it back, which the periodic reports miss when the machine dies first).
@@ -1694,6 +1697,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 	switch (messageType) {
 		case kIOMessageSystemWillSleep:
 			systemSleeps++;
+			wakeMarkStart();
 			if (edpSeen && !checkKernelArgument("-crnosleeppoweroff"))
 				__atomic_store_n(&panelOffPending, true, __ATOMIC_RELAXED);
 			if (gpuMmio) {
@@ -1814,6 +1818,8 @@ void CRDriver::startWatcher() {
 		wakeWatchdogCall = thread_call_allocate(wakeWatchdog, nullptr);
 		sleepWatchdogCall = thread_call_allocate(sleepWatchdog, nullptr);
 	}
+	if (!checkKernelArgument("-crnowakemark"))
+		wakeMarkCall = thread_call_allocate(wakeMarkWrite, nullptr);
 	auto *root = IOService::getPMRootDomain();
 	if (!root || !root->registerInterest(gIOGeneralInterest, sleepWakeHandler, this))
 		SYSLOG("cr", "failed to register for sleep/wake");
@@ -2017,7 +2023,82 @@ static uint32_t diskLogRecentNext;
 static uint32_t diskLogEventLen, diskLogEventsDropped;
 static volatile uint32_t diskLogEventLock;
 
+// Wake marks (Sonoma, log 1746429151): the disk log ends while macOS writes its sleep image, the key press only starts
+// the fans, and the panic watchdogs leave nothing, so the log can't say whether the kernel ran again. From "will sleep"
+// until the post-wake report, each event (not the kernel log or draw lines) is also kept, the newest that fit, in the
+// CR-wake NVRAM variable with a forced sync, which does reach the flash (CR-progress in nvram1): "system will power on"
+// there means the kernel resumed. At most 60 writes per boot. -crnowakemark disables it.
+static char wakeMarks[900];
+static uint32_t wakeMarkLen, wakeMarkWrites;
+static bool wakeMarkOpen;
+
+static void wakeMarkAppend(const char *line, size_t n) {
+	if (n > 70)
+		n = 70;
+	if (wakeMarkLen + n + 2 > sizeof(wakeMarks)) {
+		// Keep the header (up to the first ';') and drop the oldest events after it.
+		char *body = static_cast<char *>(memchr(wakeMarks, ';', wakeMarkLen));
+		uint32_t head = body ? static_cast<uint32_t>(body - wakeMarks) + 1 : 0, drop = 0;
+		while (head + drop < wakeMarkLen && wakeMarkLen - drop + n + 2 > sizeof(wakeMarks)) {
+			char *next = static_cast<char *>(memchr(wakeMarks + head + drop, ';', wakeMarkLen - head - drop));
+			drop = next ? static_cast<uint32_t>(next - wakeMarks - head) + 1 : wakeMarkLen - head;
+		}
+		memmove(wakeMarks + head, wakeMarks + head + drop, wakeMarkLen - head - drop);
+		wakeMarkLen -= drop;
+	}
+	memcpy(wakeMarks + wakeMarkLen, line, n);
+	wakeMarkLen += static_cast<uint32_t>(n);
+	wakeMarks[wakeMarkLen++] = ';';
+	wakeMarks[wakeMarkLen] = '\0';
+}
+
+static void wakeMarkWrite(thread_call_param_t, thread_call_param_t) {
+	static IORegistryEntry *options;
+	static char text[sizeof(wakeMarks)];
+	static uint64_t lastMs;
+	if (wakeMarkWrites >= 60 || (!options && !(options = IORegistryEntry::fromPath("/options", gIODTPlane))))
+		return;
+	// Each write is a flash write: events closer than 300 ms go out together.
+	if (uint64_t now = uptimeMs(); lastMs && now - lastMs < 300) {
+		uint64_t deadline = 0;
+		clock_interval_to_deadline(static_cast<uint32_t>(300 - (now - lastMs)), kMillisecondScale, &deadline);
+		thread_call_enter_delayed(wakeMarkCall, deadline);
+		return;
+	}
+	lastMs = uptimeMs();
+	while (__atomic_exchange_n(&diskLogEventLock, 1, __ATOMIC_ACQUIRE))
+		__builtin_ia32_pause();
+	uint32_t len = wakeMarkLen;
+	memcpy(text, wakeMarks, len);
+	__atomic_store_n(&diskLogEventLock, 0, __ATOMIC_RELEASE);
+	auto *data = OSData::withBytes(text, len);
+	if (!data)
+		return;
+	options->setProperty("CR-wake", data);
+	data->release();
+	options->setProperty("IONVRAM-FORCESYNCNOW-PROPERTY", "CR-wake");
+	options->setProperty("IONVRAM-SYNCNOW-PROPERTY", "CR-wake");
+	wakeMarkWrites++;
+}
+
+// From "will sleep": a fresh CR-wake naming this boot's disk log and the sleep.
+static void wakeMarkStart() {
+	if (!wakeMarkCall)
+		return;
+	while (__atomic_exchange_n(&diskLogEventLock, 1, __ATOMIC_ACQUIRE))
+		__builtin_ia32_pause();
+	const char *log = strrchr(diskLogPath, '/');
+	wakeMarkLen = static_cast<uint32_t>(snprintf(wakeMarks, sizeof(wakeMarks), "%s sleep %u;", log ? log + 1 : "nolog",
+		systemSleeps));
+	if (wakeMarkLen >= sizeof(wakeMarks))
+		wakeMarkLen = sizeof(wakeMarks) - 1;
+	wakeMarkOpen = true;
+	wakeMarkWrites = 0;
+	__atomic_store_n(&diskLogEventLock, 0, __ATOMIC_RELEASE);
+}
+
 static void diskLogEvent(const char *fmt, ...) {
+	bool markWake = false;
 	// Bounded: an event from a context that can't wait for the holder (preempted on this CPU) is dropped instead.
 	for (uint32_t spins = 0; __atomic_exchange_n(&diskLogEventLock, 1, __ATOMIC_ACQUIRE); spins++) {
 		if (spins > 200000) {
@@ -2050,11 +2131,27 @@ static void diskLogEvent(const char *fmt, ...) {
 				n = sizeof(slot) - 1;
 			memcpy(slot, line, n);
 			slot[n] = '\0';
+			if (wakeMarkOpen) {
+				// The timestamp in seconds, then the message.
+				const char *text = strchr(line, ']');
+				text = text ? text + 2 : line;
+				if (strncmp(text, "klog:", 5) && strncmp(text, "draw #", 6)) {
+					char mark[96];
+					size_t len = static_cast<size_t>(diskLogEvents + diskLogEventLen - 1 - text);
+					int m = snprintf(mark, sizeof(mark), "%llu %.*s", uptimeMs() / 1000, static_cast<int>(len > 70 ? 70 : len),
+						text);
+					if (m > 0)
+						wakeMarkAppend(mark, static_cast<size_t>(m) < sizeof(mark) ? static_cast<size_t>(m) : sizeof(mark) - 1);
+					markWake = true;
+				}
+			}
 		}
 	} else {
 		diskLogEventsDropped++;
 	}
 	__atomic_store_n(&diskLogEventLock, 0, __ATOMIC_RELEASE);
+	if (markWake && wakeMarkCall)
+		thread_call_enter(wakeMarkCall);
 }
 
 // Append text to the log and force it to disk. False until the data volume is writable.
@@ -2449,6 +2546,8 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			diskLogStarted) {
 			__atomic_store_n(&wakeReportAtMs, 0, __ATOMIC_RELAXED);
 			bool diag = __atomic_load_n(&wakeDisplayDiag, __ATOMIC_RELAXED);
+			if (!diag)
+				wakeMarkOpen = false;  // the wake is through: no more CR-wake writes until the next sleep
 			const char *report = self->composeReport(t, diag ? "" : now);  // the display sections, not the tree
 			__atomic_store_n(&wakeDisplayDiag, false, __ATOMIC_RELAXED);
 			diskLogEvent("black-box report %s after wake %u follows", diag ? "1 s after a failed DPCD transfer" : "30 s",
