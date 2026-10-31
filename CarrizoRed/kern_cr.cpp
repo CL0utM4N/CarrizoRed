@@ -1656,6 +1656,8 @@ static void diskLogEvent(const char *fmt, ...);
 static void wakeMarkStart();
 static void wakeMarkWrite(thread_call_param_t, thread_call_param_t);
 static void wakeMarkFlush(bool now);
+static bool cpuSleepHooked, tracePointHooked;
+static bool wakeMarkOpen;
 static thread_call_t wakeMarkCall;
 static uint32_t systemSleeps, systemWakes;
 // Set on each wake: the watcher writes a full black-box report to the disk log 30 s later (the GPU's state once macOS
@@ -1777,12 +1779,43 @@ static void wrapCpuSleepKernel() {
 		wakeMarkFlush(true);
 }
 
+// The power manager's own sleep and wake phases (nvram4: no "CPU sleeping" either, so the sleep may never reach the
+// CPUs). IOPMrootDomain::tracePoint marks each phase (0x11 applications, 0x14 power plane drivers, 0x17 platform
+// actions, 0x18 CPUs, 0x21 and up the wake), and traceDetail says which drivers of a phase are still going. Phases are
+// written to CR-wake at once while interrupts are on, the details with the next deferred write.
+static mach_vm_address_t orgTracePoint, orgTraceDetail;
+
+static void wrapTracePoint(void *that, uint8_t point) {
+	FunctionCast(wrapTracePoint, orgTracePoint)(that, point);
+	if (!wakeMarkOpen)
+		return;
+	diskLogEvent("PM phase %02x", point);
+	if (wakeMarkCall && ml_get_interrupts_enabled())
+		wakeMarkFlush(true);
+}
+
+static void wrapTraceDetail(void *that, uint32_t msgType, uint32_t msgIndex, uint32_t delay) {
+	FunctionCast(wrapTraceDetail, orgTraceDetail)(that, msgType, msgIndex, delay);
+	if (wakeMarkOpen)
+		diskLogEvent("PM detail %x %x %x", msgType, msgIndex, delay);
+}
+
 static void hookCpuSleep(KernelPatcher &patcher) {
 	if (checkKernelArgument("-crnocpusleepmark"))
 		return;
 	KernelPatcher::RouteRequest request {"__Z16IOCPUSleepKernelv", wrapCpuSleepKernel, orgCpuSleepKernel};
-	if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1)) {
+	cpuSleepHooked = patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1);
+	if (!cpuSleepHooked) {
 		SYSLOG("cr", "failed to hook IOCPUSleepKernel (error %d)", patcher.getError());
+		patcher.clearError();
+	}
+	KernelPatcher::RouteRequest trace[] {
+		{"__ZN14IOPMrootDomain10tracePointEh", wrapTracePoint, orgTracePoint},
+		{"__ZN14IOPMrootDomain11traceDetailEjjj", wrapTraceDetail, orgTraceDetail},
+	};
+	tracePointHooked = patcher.routeMultipleLong(KernelPatcher::KernelID, trace, arrsize(trace));
+	if (!tracePointHooked) {
+		SYSLOG("cr", "failed to hook the power manager's trace points (error %d)", patcher.getError());
 		patcher.clearError();
 	}
 }
@@ -2060,9 +2093,8 @@ static volatile uint32_t diskLogEventLock;
 // until the post-wake report, each event (not the kernel log or draw lines) is also kept, the newest that fit, in the
 // CR-wake NVRAM variable with a forced sync, which does reach the flash (CR-progress in nvram1): "system will power on"
 // there means the kernel resumed. At most 60 writes per boot. -crnowakemark disables it.
-static char wakeMarks[900];
+static char wakeMarks[1400];
 static uint32_t wakeMarkLen, wakeMarkWrites;
-static bool wakeMarkOpen;
 
 static void wakeMarkAppend(const char *line, size_t n) {
 	if (n > 70)
@@ -2089,7 +2121,7 @@ static void wakeMarkFlush(bool now) {
 	static IORegistryEntry *options;
 	static char text[sizeof(wakeMarks)];
 	static uint64_t lastMs;
-	if (wakeMarkWrites >= 60 || (!options && !(options = IORegistryEntry::fromPath("/options", gIODTPlane))))
+	if (wakeMarkWrites >= 100 || (!options && !(options = IORegistryEntry::fromPath("/options", gIODTPlane))))
 		return;
 	// Each write is a flash write: events closer than 300 ms go out together.
 	if (uint64_t ms = uptimeMs(); !now && lastMs && ms - lastMs < 300) {
@@ -2125,8 +2157,8 @@ static void wakeMarkStart() {
 	while (__atomic_exchange_n(&diskLogEventLock, 1, __ATOMIC_ACQUIRE))
 		__builtin_ia32_pause();
 	const char *log = strrchr(diskLogPath, '/');
-	wakeMarkLen = static_cast<uint32_t>(snprintf(wakeMarks, sizeof(wakeMarks), "%s sleep %u;", log ? log + 1 : "nolog",
-		systemSleeps));
+	wakeMarkLen = static_cast<uint32_t>(snprintf(wakeMarks, sizeof(wakeMarks), "%s sleep %u hooks cpu %u pm %u;",
+		log ? log + 1 : "nolog", systemSleeps, cpuSleepHooked, tracePointHooked));
 	if (wakeMarkLen >= sizeof(wakeMarks))
 		wakeMarkLen = sizeof(wakeMarks) - 1;
 	wakeMarkOpen = true;
