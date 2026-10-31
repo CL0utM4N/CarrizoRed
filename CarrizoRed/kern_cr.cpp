@@ -1655,6 +1655,7 @@ void CRDriver::wrapSetCrtcToPixelClock(void *that, uint8_t crtc, uint8_t pll, vo
 static void diskLogEvent(const char *fmt, ...);
 static void wakeMarkStart();
 static void wakeMarkWrite(thread_call_param_t, thread_call_param_t);
+static void wakeMarkFlush(bool now);
 static thread_call_t wakeMarkCall;
 static uint32_t systemSleeps, systemWakes;
 // Set on each wake: the watcher writes a full black-box report to the disk log 30 s later (the GPU's state once macOS
@@ -1767,9 +1768,13 @@ static uint32_t cpuResumes;
 
 static void wrapCpuSleepKernel() {
 	diskLogEvent("CPU sleeping (sleep %u)", systemSleeps);
+	if (wakeMarkCall)
+		wakeMarkFlush(true);
 	FunctionCast(wrapCpuSleepKernel, orgCpuSleepKernel)();
 	cpuResumes++;
 	diskLogEvent("CPU resumed (%u)", cpuResumes);
+	if (wakeMarkCall)
+		wakeMarkFlush(true);
 }
 
 static void hookCpuSleep(KernelPatcher &patcher) {
@@ -2079,16 +2084,17 @@ static void wakeMarkAppend(const char *line, size_t n) {
 	wakeMarks[wakeMarkLen] = '\0';
 }
 
-static void wakeMarkWrite(thread_call_param_t, thread_call_param_t) {
+// now: write at once (the CPU marks, which a deferred write misses: nvram3 had the GPU's sleep but not "CPU sleeping").
+static void wakeMarkFlush(bool now) {
 	static IORegistryEntry *options;
 	static char text[sizeof(wakeMarks)];
 	static uint64_t lastMs;
 	if (wakeMarkWrites >= 60 || (!options && !(options = IORegistryEntry::fromPath("/options", gIODTPlane))))
 		return;
 	// Each write is a flash write: events closer than 300 ms go out together.
-	if (uint64_t now = uptimeMs(); lastMs && now - lastMs < 300) {
+	if (uint64_t ms = uptimeMs(); !now && lastMs && ms - lastMs < 300) {
 		uint64_t deadline = 0;
-		clock_interval_to_deadline(static_cast<uint32_t>(300 - (now - lastMs)), kMillisecondScale, &deadline);
+		clock_interval_to_deadline(static_cast<uint32_t>(300 - (ms - lastMs)), kMillisecondScale, &deadline);
 		thread_call_enter_delayed(wakeMarkCall, deadline);
 		return;
 	}
@@ -2106,6 +2112,10 @@ static void wakeMarkWrite(thread_call_param_t, thread_call_param_t) {
 	options->setProperty("IONVRAM-FORCESYNCNOW-PROPERTY", "CR-wake");
 	options->setProperty("IONVRAM-SYNCNOW-PROPERTY", "CR-wake");
 	wakeMarkWrites++;
+}
+
+static void wakeMarkWrite(thread_call_param_t, thread_call_param_t) {
+	wakeMarkFlush(false);
 }
 
 // From "will sleep": a fresh CR-wake naming this boot's disk log and the sleep.
