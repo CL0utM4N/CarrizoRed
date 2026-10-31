@@ -1,46 +1,26 @@
 # Roadmap
 
-Each phase ends with a concrete, testable milestone. Power/clock gating stays **off** until Phase 4.
+Updated 2026-10-31, at the 0.1.0 pre-release.
 
-## Phase 0 — Environment and research
-See [PHASE0.md](PHASE0.md).
-- [ ] macOS boots on the A12-9800 with OpenCore + AMD_Vanilla (firmware framebuffer, no acceleration)
-- [x] Build pipeline works (GitHub Actions macOS runner)
-- [ ] Reference data collected: ioreg, VBIOS (VFCT), Linux `umr` register dumps
-- [x] Sequoia 15.8.1 AMD kexts extracted from the KDK on Windows: [APPLE_KEXTS.md](APPLE_KEXTS.md)
-- [ ] `AMDRadeonX4000`, `AMDRadeonX4000HWServices` (+ HWLibs), `AMD9500Controller`, `AMDSupport` loaded in Ghidra
-- [ ] Find how CAIL selects its ASIC table, and whether its Carrizo paths are complete
-- [x] Linux Carrizo-vs-Polaris differences catalogued: [CARRIZO_VS_POLARIS.md](CARRIZO_VS_POLARIS.md)
-- [x] DCE 11.0 vs 11.2 register header diff: [DCE11_REGISTER_DIFF.md](DCE11_REGISTER_DIFF.md)
+## Done
+- Lilu plugin, iGPU detection, VBIOS from ACPI VFCT, device-id spoof to Polaris 11 (`0x67EF`)
+- Display: built-in eDP panel through Apple's `AMD9500Controller` (DCE 11.0 pipes, PLLs, DIGs, line buffer, eDP link)
+- Acceleration: `AMDRadeonX4000` with an SMU8 microcode loader, VRAM window at 0, IH ring in VRAM, Stoney caps
+- Metal: shader fix for Stoney's 16-bank LDS (including Metal's SDMA re-uploads), Stoney compiler back end
+- SCLK clock scaling (SMU DPM), on by default
+- macOS Catalina through Sequoia; Tahoe with glitches
+- Sleep and wake on Catalina (D509BA): Linux DC's resume steps ([SLEEP.md](SLEEP.md))
 
-## Phase 1 — Observe (current)
-- [x] Lilu plugin skeleton, iGPU detection by config-space ID
-- [x] Log PCI info, BARs, UMA carve-out size/location, GFX config registers
-- [x] Log when Apple's Polaris kexts load
-- [x] Confirm the above on hardware (D509BA / Stoney, 2026-10-10: family, rev 0xDA, 512 MB carve-out,
-      `GB_ADDR_CONFIG` = `0x22010001` = Linux `STONEY_GB_ADDR_CONFIG_GOLDEN`; VBIOS injection fixed after this run)
-- [ ] Spoof `device-id` to `0x67EF` via OpenCore DeviceProperties and record exactly where
-      `AMD9500Controller` / `AMDRadeonX4000` fail (panic log, last log lines)
+## Next, in the order the project set (2026-10-30)
+1. **Sleep:** Sonoma's wake hang (on hold, next steps in [SLEEP.md](SLEEP.md)); lid sleep; the other machines and
+   macOS versions
+2. **Video encode** (VCE), then decode (UVD needs physical-address translation, [VIDEO.md](VIDEO.md))
+3. **Brightness keys:** the eDP panel as an `AppleBacklightDisplay` (also what lid sleep needs)
+4. **GPU power management:** clock scaling that settles lower when idle, power gating
+5. **Sierra to Mojave** support
+6. **Tahoe graphics memory:** Apple's driver placing more allocations in system memory
 
-## Phase 2 — Display (`AMD9500Controller` + `AMDSupport`)
-- [ ] Make the controller accept the APU: ASIC caps, chip family/revision checks
-- [ ] VBIOS from ACPI VFCT instead of PCI ROM
-- [ ] VRAM info from `CONFIG_MEMSIZE` / `MC_VM_FB_OFFSET` instead of the dGPU memory controller
-- [ ] DCE 11.0 vs 11.2 differences: register offsets, PLL / clock sources, display clock via SMU8
-- [ ] **Milestone:** correct native resolution on HDMI/DVI/DP, hotplug works
-
-## Phase 3 — Acceleration (`AMDRadeonX4000` + HWServices)
-- [ ] GMC v8 APU setup (system aperture, carve-out as VRAM, GART)
-- [ ] Inject Carrizo CP (PFP/ME/CE/MEC/MEC2), RLC and SDMA firmware (linux-firmware `carrizo_*.bin`)
-- [ ] Golden registers + GFX config (SE/SH/CU/RB counts) from `gfx_v8_0.c` / `vi.c`
-- [ ] Ring tests pass (GFX, SDMA)
-- [ ] **Milestone:** Metal device present, WindowServer composites with acceleration
-
-## Phase 4 — Stability and power
-- [ ] SMU8 messages for power/clock gating (`smu8_*`)
-- [ ] Sleep/wake
-- [ ] Hang detection / recovery
-
-## Phase 5 — Extras
-- [ ] UVD 6 decode / VCE 3 encode
-- [ ] Stoney Ridge (single SDMA, fewer CUs, different golden settings)
+## Later
+- Carrizo / Bristol Ridge testing (code paths written, no hardware)
+- External displays (HDMI), HDMI audio
+- GCN 2 APUs ([OLDER_APUS.md](OLDER_APUS.md))

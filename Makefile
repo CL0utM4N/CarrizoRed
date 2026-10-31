@@ -12,7 +12,7 @@
 
 PRODUCT_NAME   := CarrizoRed
 MODULE_NAME    := com.carrizored.$(PRODUCT_NAME)
-MODULE_VERSION := 0.0.1
+MODULE_VERSION := 0.1.0
 MIN_MACOS      := 11.0
 # The commit, in the disk log header (which build wrote a log).
 GIT_COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)

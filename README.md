@@ -7,7 +7,8 @@ used them), so on a hackintosh they've only had the firmware framebuffer.
 
 ## Status
 
-> **Experimental, in active development.** There are no releases yet. Expect kernel panics and black screens, and
+> **Experimental, in active development.** The first pre-release, **0.1.0**, is on the
+> [Releases](https://github.com/CL0utM4N/CarrizoRed/releases) page. Expect kernel panics and black screens, and
 > don't run it on a machine you depend on. Everything below is from a handful of test machines.
 
 **What it does today:** on Stoney Ridge machines, macOS Catalina through Sequoia boots to the desktop and drives
@@ -22,7 +23,7 @@ scales with load (400 MHz idle, up to the chip's top level).
 | Display interrupts (vblank) | **Works** |
 | Acceleration / Metal (`AMDRadeonX4000`) | **Works.** The SMU loads the GPU microcode, the command processor and SDMA run, interrupts work, and WindowServer and apps render with Metal. Apple's shader compiler emits an interpolation pattern Stoney's 16-bank LDS gets wrong; CarrizoRed fixes the compiled pixel shaders before the GPU runs them, including when Metal re-uploads them (see *Metal needed*). Boot with `-crnoaccel` for an unaccelerated desktop |
 | GPU clock scaling (SCLK DPM) | **Works, on by default.** Apple's PowerPlay runs its Dummy back end here, so nothing would start the SMU's clock scaling and the GPU would stay at its lowest clock. CarrizoRed starts it 90 s after boot, from the SMU's own clock table: 400 MHz minimum, up to the top level (900 MHz on an A9-9425, 800 MHz on an A9-9420). `-crnosclkdpm` turns it off |
-| Sleep | **Not working yet.** The machine sleeps (fans off) and wakes on a key press, the GPU comes back, but the panel stays black: S3 resets the display block's AUX, panel-power and backlight settings that the firmware set at boot (a restore is in testing). On the D509BA, the internal USB 2 controller (EHC1) woke it again at once until the `SSDT-GPRW` in its EFI stopped that. A watchdog writes a report to NVRAM when wake fails |
+| Sleep | **Works on Catalina** (D509BA): sleeps, wakes on a key press with a clean picture. CarrizoRed redoes what S3 resets in the display block the way Linux's DC driver does at resume (panel power, display clock and DP DTO, VBIOS scratch and backlight, AUX, ASSR). **Sonoma: the wake hangs** (fans only, no picture; on hold). Lid close doesn't sleep yet (macOS sees desktop mode). Other machines and versions untested. On the D509BA, `SSDT-GPRW` stops the internal USB 2 controller waking it at once. Details: [docs/SLEEP.md](docs/SLEEP.md) |
 | Brightness, external displays (HDMI), HDMI audio | Not done or untested |
 | Video decode/encode (UVD/VCE) | **On hold**: video plays and records in software. UVD powers up and Apple's firmware boots on it, but decoding hangs the GPU: Apple's driver gives UVD GPU virtual addresses, and Stoney's UVD has no VM support (Linux runs it in physical mode and rewrites every buffer address). Making it work means doing that translation in CarrizoRed. Findings and next steps in [docs/VIDEO.md](docs/VIDEO.md) |
 | Carrizo / Bristol Ridge | Same display engine and code paths; the SMU microcode loader, clock scaling and shader-engine fix include Carrizo's differences (second SDMA engine, second MEC), following Linux. **Untested** (no hardware): reports from owners are very welcome |
@@ -112,7 +113,7 @@ And Metal needed:
 | Freezes with clock scaling | Fixed: CarrizoRed's own interrupt-storm breaker was tripping on real interrupt bursts at higher clocks |
 | OpenGL | Expected to work, untested: Apple's AMD GL driver compiles through the same `libSC` CarrizoRed patches for Stoney (its `ATIRadeonX4000SCLib` wraps it), and the shader fix works on every submission whatever the API |
 | Video decode/encode | On hold: software decode and encode. UVD starts with Apple's firmware, but needs CarrizoRed to translate GPU virtual addresses to physical ones before it can decode ([docs/VIDEO.md](docs/VIDEO.md)) |
-| Sleep/wake | Not working yet: sleeps and wakes (D509BA, Catalina, with `SSDT-GPRW`), the GPU re-initialises, the panel stays black after wake (AUX PHY, panel-power and backlight registers reset by S3; restore in testing). A rare `preemption_level` panic after wake is being traced (`-crnopreemptcheck`) |
+| Sleep/wake | Works on Catalina (D509BA, with `SSDT-GPRW`). Sonoma's wake hangs before macOS's wake messages (on hold); lid sleep blocked by desktop mode; see [docs/SLEEP.md](docs/SLEEP.md) |
 | Carrizo / Bristol Ridge | Code paths written (SMU loader, clock scaling, caps), untested: no hardware |
 | Tahoe graphics memory | Open: Tahoe can fill the 512 MB carve-out (see *Graphics memory on Tahoe*) |
 | External displays, brightness, HDMI audio | Not started / untested |
@@ -163,6 +164,9 @@ XHCIProbe diagnostic on a macOS runner, and uploads them with a debug `Lilu.kext
 Development for this project is done entirely on Windows this way.
 
 ## Installing (test machine)
+
+Download `CarrizoRed-<version>-Release.zip` from [Releases](https://github.com/CL0utM4N/CarrizoRed/releases) (or a CI
+build, see *Building*). It needs [Lilu](https://github.com/acidanthera/Lilu/releases) 1.7.2 or later (it is built against Lilu's current SDK).
 
 `scripts/build_efi_d509ba.py` builds the complete OpenCore EFI used for the D509BA. It's a good starting point for
 similar machines. It includes:
@@ -314,7 +318,7 @@ and the list of affected machines.
 | `-crnohwlibsprobe` | Skip the test write into HWLibs' code at `setupCAIL` (used to check whether patches can land) |
 | `-crnotrace` | No bring-up stage tracing |
 | `-crnowatch`, `-crnowatchdog` | No periodic watcher output / no watchdog panic for a traced call that hangs |
-| `-crnobreadcrumb` | Don't write the latest trace progress to the NVRAM variable `CR-progress` during start-up (kept for boots that end in a hard reset, where no panic report is written; it stops once Metal is drawing) |
+| `-crbreadcrumb` | Write the latest trace progress to the NVRAM variable `CR-progress` during start-up (for boots that end in a hard reset, where no panic report is written; it stops once Metal is drawing). Off by default since 0.1.0: each write is a forced flash write |
 | `-crnoreglog`, `-crreglogall`, `-crreglogintsoff` | No register logging / log every access from probe / print interrupts-off lines directly |
 | `-crnoatomlog` | Don't record VBIOS command-table calls for the black box |
 | `-crnommio` | Skip the MMIO register probe |
@@ -335,10 +339,9 @@ and the list of affected machines.
 | `-crnodisklog` | Don't write the per-boot log `/private/var/log/CarrizoRed-<time>.log` (GPU, SMU and clock state every second, SMU messages, draw census, black-box reports; written straight to disk, so it survives a freeze) |
 | `-crnocensus` | Don't record each distinct draw set-up in the disk log |
 | `-crnomodel` | Leave the iGPU's `model` alone (by default it is named from the CPU brand string, e.g. "AMD Radeon R5 Graphics", or a `model` from DeviceProperties is kept) |
-| `-crnocpusleepmark` | Don't log the CPU going to sleep and resuming (IOCPUSleepKernel) or the power manager's sleep and wake phases (IOPMrootDomain::tracePoint) into `CR-wake` |
-| `-crnowakemark` | Don't keep the sleep and wake events in the NVRAM variable `CR-wake` (from "will sleep" until 30 s after the wake, at most 60 writes per sleep; it shows how far a wake got when the disk log stops at the sleep) |
+| `-crwakemark` | Keep the sleep and wake events in the NVRAM variable `CR-wake`, from "will sleep" until 30 s after the wake, with the CPU's sleep and resume (`IOCPUSleepKernel`) and the power manager's phases (`IOPMrootDomain::tracePoint`). For a wake that leaves nothing in the disk log; forced flash writes, at most 100 per sleep. See [docs/SLEEP.md](docs/SLEEP.md) |
 | `-crnowakepanic` | No wake watchdogs (otherwise a wake that doesn't complete panics with the black-box report, so it lands in NVRAM) |
-| `-crnopreemptcheck` | Don't check work loop event sources and the IH handler for leaked preemption disables (otherwise the one that leaks panics by name, instead of a later "thread_invoke: preemption_level" panic with no culprit) |
+| `-crpreemptcheck` | Check work loop event sources, interest handlers and the IH handler for leaked preemption disables, and panic naming the one that leaks (instead of a later "thread_invoke: preemption_level" panic with no culprit). Off by default since 0.1.0 |
 
 ## Layout
 
@@ -355,6 +358,7 @@ tools/XHCIProbe/   Diagnostic kext for that controller (state, interrupts, link 
 docs/
   ROADMAP.md               Phase plan
   TEST_MACHINES.md         Test hardware and the boot-by-boot bring-up log
+  SLEEP.md                 Sleep and wake: what S3 resets, CarrizoRed's resume steps, open issues
   APPLE_KEXTS.md           Getting Apple's AMD kexts from a KDK on Windows, and what's inside them
   CARRIZO_VS_POLARIS.md    Where Linux amdgpu treats Carrizo differently from Polaris
   DCE11_REGISTER_DIFF.md   DCE 11.0 vs 11.2 display register diff (full data in docs/data/)

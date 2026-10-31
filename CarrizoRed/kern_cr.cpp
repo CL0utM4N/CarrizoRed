@@ -1113,7 +1113,7 @@ static int wrapCsValidateRange(void *vnode, void *pager, uint64_t offset, const 
 // held or a _disable_preemption unmatched, and the kernel only notices at the loop's next block, with nothing of the
 // culprit left on the stack. These wrappers compare the CPU's preemption level (cpu_data, gs-relative; the offset is
 // read from _disable_preemption) around each interrupt and timer event source, each run of a work loop's sources and
-// the IH interrupt handler, and panic naming whichever leaked. -crnopreemptcheck turns them off.
+// the IH interrupt handler, and panic naming whichever leaked. Opt-in (-crpreemptcheck) since 0.1.0.
 static int32_t preemptionLevelOff = -1;
 static mach_vm_address_t orgIesCheckForWork, orgTimerCheckForWork, orgRunEventSources, orgMessageClient;
 static mach_vm_address_t kextLookupByAddress, kextIdentifier;  // OSKext::lookupKextWithAddress, getIdentifierCString
@@ -1217,7 +1217,7 @@ static IOReturn wrapMessageClient(IOService *that, UInt32 type, OSObject *client
 static void hookCpuSleep(KernelPatcher &patcher);
 
 static void hookPreemptionCheck(KernelPatcher &patcher) {
-	if (checkKernelArgument("-crnopreemptcheck"))
+	if (!checkKernelArgument("-crpreemptcheck"))
 		return;
 	// _disable_preemption: push rbp; mov rbp, rsp; inc dword gs:[disp32] (65 FF 04 25 disp32).
 	auto *code = reinterpret_cast<const uint8_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "__disable_preemption"));
@@ -1764,7 +1764,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 // The CPU's own sleep and resume (Sonoma, nvram2): CR-wake ended with the GPU's sleep (203 s) and never got "system will
 // power on". IOCPUSleepKernel returns on the boot CPU right after the firmware hands back control, before the platform
 // and the power manager wake anything, so a "CPU resumed" mark without "system will power on" puts the hang between
-// the two, and none at all means the kernel never ran again. -crnocpusleepmark disables the hook.
+// the two, and none at all means the kernel never ran again. Hooked with -crwakemark only.
 static mach_vm_address_t orgCpuSleepKernel;
 static uint32_t cpuResumes;
 
@@ -1801,7 +1801,7 @@ static void wrapTraceDetail(void *that, uint32_t msgType, uint32_t msgIndex, uin
 }
 
 static void hookCpuSleep(KernelPatcher &patcher) {
-	if (checkKernelArgument("-crnocpusleepmark"))
+	if (!checkKernelArgument("-crwakemark"))
 		return;
 	KernelPatcher::RouteRequest request {"__Z16IOCPUSleepKernelv", wrapCpuSleepKernel, orgCpuSleepKernel};
 	cpuSleepHooked = patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1);
@@ -1883,7 +1883,7 @@ void CRDriver::startWatcher() {
 		wakeWatchdogCall = thread_call_allocate(wakeWatchdog, nullptr);
 		sleepWatchdogCall = thread_call_allocate(sleepWatchdog, nullptr);
 	}
-	if (!checkKernelArgument("-crnowakemark"))
+	if (checkKernelArgument("-crwakemark"))
 		wakeMarkCall = thread_call_allocate(wakeMarkWrite, nullptr);
 	auto *root = IOService::getPMRootDomain();
 	if (!root || !root->registerInterest(gIOGeneralInterest, sleepWakeHandler, this))
@@ -1953,7 +1953,7 @@ static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_
 // NVRAM breadcrumb. The black box only reaches NVRAM through a panic; the second accelerated boot (nvram31) ended in a
 // hard reset (no panic text, straight back to the boot menu), which leaves nothing. While trace events keep arriving,
 // write the latest progress to the CR-progress variable (Apple's GUID, 7C436110-...) and force a sync: at most every
-// 500 ms and 160 times per boot. -crnobreadcrumb disables it.
+// 500 ms and 160 times per boot. Opt-in (-crbreadcrumb) since 0.1.0: forced flash writes on every boot.
 static uint32_t breadcrumbWrites, breadcrumbRefused;
 static bool breadcrumbNoOptions;
 static bool desktopRunning();
@@ -2092,7 +2092,7 @@ static volatile uint32_t diskLogEventLock;
 // the fans, and the panic watchdogs leave nothing, so the log can't say whether the kernel ran again. From "will sleep"
 // until the post-wake report, each event (not the kernel log or draw lines) is also kept, the newest that fit, in the
 // CR-wake NVRAM variable with a forced sync, which does reach the flash (CR-progress in nvram1): "system will power on"
-// there means the kernel resumed. At most 60 writes per boot. -crnowakemark disables it.
+// there means the kernel resumed. At most 100 writes per sleep. Opt-in (-crwakemark).
 static char wakeMarks[1400];
 static uint32_t wakeMarkLen, wakeMarkWrites;
 
@@ -2439,7 +2439,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 	bool print = !checkKernelArgument("-crnowatch");
 	bool watchdog = !checkKernelArgument("-crnowatchdog");
 	bool controllerRequested = checkKernelArgument("-crnoloadctl");
-	bool breadcrumb = !checkKernelArgument("-crnobreadcrumb");
+	bool breadcrumb = checkKernelArgument("-crbreadcrumb");
 	// crpanicat=N: panic on purpose at t=N s. Every "freeze" so far happened as the GUI session started (IOConsoleUsers,
 	// hidd), which is also when the kernel's verbose console stops drawing and WindowServer takes the screen; with only
 	// display-less AMD framebuffers, nothing would replace the last console image, and our heartbeat (printed through
