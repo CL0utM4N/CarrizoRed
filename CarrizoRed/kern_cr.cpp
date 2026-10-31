@@ -1214,6 +1214,8 @@ static IOReturn wrapMessageClient(IOService *that, UInt32 type, OSObject *client
 	return ret;
 }
 
+static void hookCpuSleep(KernelPatcher &patcher);
+
 static void hookPreemptionCheck(KernelPatcher &patcher) {
 	if (checkKernelArgument("-crnopreemptcheck"))
 		return;
@@ -1306,6 +1308,7 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 		}
 	}
 	hookPreemptionCheck(patcher);
+	hookCpuSleep(patcher);
 
 	auto *devInfo = DeviceInfo::create();
 	if (!devInfo) {
@@ -1753,6 +1756,30 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			break;
 	}
 	return kIOReturnSuccess;
+}
+
+// The CPU's own sleep and resume (Sonoma, nvram2): CR-wake ended with the GPU's sleep (203 s) and never got "system will
+// power on". IOCPUSleepKernel returns on the boot CPU right after the firmware hands back control, before the platform
+// and the power manager wake anything, so a "CPU resumed" mark without "system will power on" puts the hang between
+// the two, and none at all means the kernel never ran again. -crnocpusleepmark disables the hook.
+static mach_vm_address_t orgCpuSleepKernel;
+static uint32_t cpuResumes;
+
+static void wrapCpuSleepKernel() {
+	diskLogEvent("CPU sleeping (sleep %u)", systemSleeps);
+	FunctionCast(wrapCpuSleepKernel, orgCpuSleepKernel)();
+	cpuResumes++;
+	diskLogEvent("CPU resumed (%u)", cpuResumes);
+}
+
+static void hookCpuSleep(KernelPatcher &patcher) {
+	if (checkKernelArgument("-crnocpusleepmark"))
+		return;
+	KernelPatcher::RouteRequest request {"__Z16IOCPUSleepKernelv", wrapCpuSleepKernel, orgCpuSleepKernel};
+	if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1)) {
+		SYSLOG("cr", "failed to hook IOCPUSleepKernel (error %d)", patcher.getError());
+		patcher.clearError();
+	}
 }
 
 // Kernel log lines about sleep and wake into the disk log (watcher thread). The 15:46 and 21:04 sleeps: "system will

@@ -335,6 +335,7 @@ and the list of affected machines.
 | `-crnodisklog` | Don't write the per-boot log `/private/var/log/CarrizoRed-<time>.log` (GPU, SMU and clock state every second, SMU messages, draw census, black-box reports; written straight to disk, so it survives a freeze) |
 | `-crnocensus` | Don't record each distinct draw set-up in the disk log |
 | `-crnomodel` | Leave the iGPU's `model` alone (by default it is named from the CPU brand string, e.g. "AMD Radeon R5 Graphics", or a `model` from DeviceProperties is kept) |
+| `-crnocpusleepmark` | Don't log the CPU going to sleep and resuming (IOCPUSleepKernel), the first point after a wake that `CR-wake` can show |
 | `-crnowakemark` | Don't keep the sleep and wake events in the NVRAM variable `CR-wake` (from "will sleep" until 30 s after the wake, at most 60 writes per sleep; it shows how far a wake got when the disk log stops at the sleep) |
 | `-crnowakepanic` | No wake watchdogs (otherwise a wake that doesn't complete panics with the black-box report, so it lands in NVRAM) |
 | `-crnopreemptcheck` | Don't check work loop event sources and the IH handler for leaked preemption disables (otherwise the one that leaks panics by name, instead of a later "thread_invoke: preemption_level" panic with no culprit) |
