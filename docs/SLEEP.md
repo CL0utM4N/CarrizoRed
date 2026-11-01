@@ -96,6 +96,36 @@ and display registers every 500 ms through the whole sleep, and on Sonoma the sl
 powered down, a longer window for a read of the powered-off GPU to stall a core. Since this build the watcher's register
 reads pause from "will sleep" until the GPU is powered again (`-crnosleeppause` turns that off). Untested.
 
+**2026-11-02, the watcher pause (4584599) didn't fix it.** pmset still shows "Entering Sleep state" and then the next
+boot.
+
+**Catalina vs Sonoma, Apple's GPU sleep and wake code (Catalina 10.15.7 kexts vs Sonoma 14.8.9; CAIL vs Sequoia
+15.8.1, the same CAIL build as Sonoma with symbols).** Every difference, accounted for:
+
+| Function | Catalina | Sonoma | Effect |
+|---|---|---|---|
+| `AMDGraphicsAccelerator::systemWillSleep` | `stopGfxOff`, `disableHWPerfPollTimer` | Baffin's empty gfx-off slot; the timer stop moved into `powerOff` | none (`stopGfxOff` is empty on Catalina too) |
+| same | `AMDHWMemory::hasAllocation` + `free` | `safeFree` | same |
+| same | – | releases the `reduceVRAM` block (a debug feature) | none normally |
+| same | – | power-event ring entries, flag bits | bookkeeping |
+| `AMDHardware::powerOff` | `disableCmdBufTiming` | removed | none on the GPU |
+| same | `disableTimeStampInterrupts` | `disableInterrupts`: the same, plus `AMDHWVMM::disableInterrupts` | none (empty on VI) |
+| `stopHWEngines`, `powerOffHWEngines` (the five MicroEngineControl halts in the logs) | | same calls, other status bits | bookkeeping |
+| `powerDownCAIL` → `AmdCailServices::powerDown` → `Cail_Powerdown(0x20)` → `Cail_Tahiti_Powerdown` | | call trees identical to depth 4 | none |
+| `setVirtualSpace(nullptr)`, `disableAllocations`, `AMDHWRegisters::disable` | | same, one more status bit | bookkeeping |
+| wake: `systemDidWake`, `internalDidWake`, `willWake`, `powerUpCAIL`, `powerUpHWEngines` | | same, vtable shifts and timestamps | none |
+| wake: `AMDHardware::powerUp` | same steps, plus `infiniteWaitOnPowerUp` on the PM4 channel and cmd-buffer timing | no `infiniteWaitOnPowerUp`, records time since power-up | wake only |
+| wake: `powerUpHW` | `initialize_hardware`, `enableInterruptHubAgp` | `initializeHardwareRegisters` directly; no interrupt hub buffer | wake only |
+| AMD9500Controller, AMDSupport, AMDFramebuffer sleep code | | compiler changes (`memset`, typed allocators); `setPanelPowerState` no longer resets the cached HPD state | wake only |
+
+CarrizoRed's own events during the sleep are identical on both (panel off, the same five halts). CarrizoRed's
+version-specific code in this window, the dyld page patcher (`cs_validate_page` on Sonoma, `cs_validate_range` on
+Catalina), only compares and copies page bytes. The `wifip2pd` 30 s wait is a Sonoma daemon (no Wi-Fi driver is
+loaded) and doesn't hold the sleep. So no difference in the GPU's sleep path explains a hang; what's left is either
+the wake (where `powerUp` and `powerUpHW` did change) or something outside the GPU, and the logs can't tell which,
+because Sonoma leaves no record after the GPU halt. The boot with `-crnoctl -crnoaccel` (no Apple GPU drivers)
+decides it.
+
 Next steps, cheapest first:
 1. On Sonoma after a failed attempt: `pmset -g log | grep -iE "sleep|wake|failure|darkwake" | tail -80` (Apple's own
    record of the failure and its phase), the disk logs of the failed boots (`/private/var/log/CarrizoRed-*.log`), and
