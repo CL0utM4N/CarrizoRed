@@ -1660,6 +1660,13 @@ static bool cpuSleepHooked, tracePointHooked;
 static bool wakeMarkOpen;
 static thread_call_t wakeMarkCall;
 static uint32_t systemSleeps, systemWakes;
+// No GPU register access from the watcher while the GPU sleeps (Sonoma, logs 1746429151-1746593498: the disk log's last
+// line is half a second before Apple's GPU halt, and the sleep never completed). The watcher read GPU, SMU and display
+// registers every 500 ms right through the sleep; once Apple's driver has powered the GPU down, a read can stall the
+// core for good. On Catalina the CPUs sleep about a second after the GPU halt, on Sonoma the sleep image is set up in
+// between. Set at "will sleep"; cleared by the first VBIOS call after "will power on" (Apple's driver calls the VBIOS
+// only with the GPU powered), by "has powered on", or by a cancelled sleep. -crnosleeppause keeps the reads going.
+static volatile bool gpuSleeping, gpuPoweringOn;
 // Set on each wake: the watcher writes a full black-box report to the disk log 30 s later (the GPU's state once macOS
 // has brought it back, which the periodic reports miss when the machine dies first).
 static uint64_t wakeReportAtMs;
@@ -1704,6 +1711,10 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 		case kIOMessageSystemWillSleep:
 			systemSleeps++;
 			wakeMarkStart();
+			if (!checkKernelArgument("-crnosleeppause")) {
+				__atomic_store_n(&gpuPoweringOn, false, __ATOMIC_RELAXED);
+				__atomic_store_n(&gpuSleeping, true, __ATOMIC_RELAXED);
+			}
 			if (edpSeen && !checkKernelArgument("-crnosleeppoweroff"))
 				__atomic_store_n(&panelOffPending, true, __ATOMIC_RELAXED);
 			if (gpuMmio) {
@@ -1733,6 +1744,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			break;
 		case kIOMessageSystemWillPowerOn:
 			diskLogEvent("system will power on");
+			__atomic_store_n(&gpuPoweringOn, true, __ATOMIC_RELAXED);
 			__atomic_store_n(&edpWakePowerOn, true, __ATOMIC_RELAXED);
 			__atomic_store_n(&wakeAuxWatch, true, __ATOMIC_RELAXED);
 			__atomic_store_n(&wakeRestorePending, true, __ATOMIC_RELAXED);
@@ -1750,8 +1762,14 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 				thread_call_enter_delayed(wakeWatchdogCall, deadline);
 			}
 			break;
+		case kIOMessageSystemWillNotSleep:
+			if (__atomic_exchange_n(&gpuSleeping, false, __ATOMIC_RELAXED))
+				diskLogEvent("watcher: sleep cancelled, GPU register reads resume");
+			break;
 		case kIOMessageSystemHasPoweredOn:
 			systemWakes++;
+			if (__atomic_exchange_n(&gpuSleeping, false, __ATOMIC_RELAXED))
+				diskLogEvent("watcher: GPU register reads resume (has powered on)");
 			diskLogEvent("system has powered on (%u)", systemWakes);
 			__atomic_store_n(&wakeReportAtMs, uptimeMs() + 30000, __ATOMIC_RELAXED);
 			break;
@@ -2377,7 +2395,8 @@ static void diskLogTick(uint32_t t, uint32_t stallTicks) {
 			PE_boot_args());
 		cpuCheck();
 	}
-	auto *mmio = gpuMmio;
+	bool asleep = __atomic_load_n(&gpuSleeping, __ATOMIC_RELAXED);
+	auto *mmio = asleep ? nullptr : gpuMmio;
 	if (mmio && smuLoadOk()) {
 		auto smc = [mmio](uint32_t address) {
 			mmio[0x19A] = address;
@@ -2401,7 +2420,7 @@ static void diskLogTick(uint32_t t, uint32_t stallTicks) {
 				mmio[0x3DA4], mmio[0x3DA5], mmio[0x8001], mmio[0x8005], mmio[0x8048], mmio[0x8063], mmio[0x8064]);
 		}
 	} else {
-		add("%llu | t=%u, GPU not up yet\n", ms, t);
+		add(asleep ? "%llu | t=%u, GPU asleep (no register reads)\n" : "%llu | t=%u, GPU not up yet\n", ms, t);
 	}
 	if (cpuInfo.pstates) {
 		uint32_t pstate = 0, mhz = cpuBusyMhz(pstate);
@@ -2458,9 +2477,14 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 	// Tick every 500 ms (a sleep late in a session needs the log too: no end any more).
 	for (uint32_t tick = 0, t = 0;; tick++, t = tick / 2) {
 		watcherBeat++;
+		mirrorKernelLog();
+		if (__atomic_load_n(&gpuSleeping, __ATOMIC_RELAXED)) {
+			diskLogTick(t, stallTicks);  // the status line without registers
+			IOSleep(500);
+			continue;
+		}
 		if (!gpuMmio)
 			self->probeMMIO();  // start-up couldn't map the registers: keep trying
-		mirrorKernelLog();
 		// After each wake: the power manager's sleep/wake properties (wake reason, sleep failure), into the disk log.
 		{
 			static uint32_t wakesLogged = 0xFFFFFFFF;  // also once at boot: the last sleep's failure record
@@ -6224,6 +6248,8 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	atomParser = that;
 	atomFlag = flag;
 	__atomic_fetch_add(&atomCalls, 1, __ATOMIC_RELAXED);
+	if (__atomic_load_n(&gpuPoweringOn, __ATOMIC_RELAXED) && __atomic_exchange_n(&gpuSleeping, false, __ATOMIC_RELAXED))
+		diskLogEvent("watcher: GPU register reads resume (VBIOS table %x after power on)", table);
 	bool aux = table == AtomAuxTable;
 	uint8_t auxHpdUsed = 0xFF;
 	int16_t auxHpdSaved = -1;  // Apple's byte 8, to put back after the call

@@ -89,6 +89,13 @@ the sleep image hangs), or the hook or late NVRAM writes don't work there. The l
 the power manager's own phases (`IOPMrootDomain::tracePoint`: 0x14 drivers, 0x17 platform, 0x18 CPUs, 0x2x wake) and
 records in the `CR-wake` header whether the hooks went in; it hasn't been run yet.
 
+**2026-11-02, first lead:** `pmset -g log` records every attempt as "Entering Sleep state" followed directly by the
+next boot: no wake, no failure record. In every Sonoma log the last line is CarrizoRed's watcher tick about half a
+second before Apple's GPU halt; on Catalina the log runs on through the drivers' power-off. The watcher read GPU, SMU
+and display registers every 500 ms through the whole sleep, and on Sonoma the sleep image is set up after the GPU is
+powered down, a longer window for a read of the powered-off GPU to stall a core. Since this build the watcher's register
+reads pause from "will sleep" until the GPU is powered again (`-crnosleeppause` turns that off). Untested.
+
 Next steps, cheapest first:
 1. On Sonoma after a failed attempt: `pmset -g log | grep -iE "sleep|wake|failure|darkwake" | tail -80` (Apple's own
    record of the failure and its phase), the disk logs of the failed boots (`/private/var/log/CarrizoRed-*.log`), and
