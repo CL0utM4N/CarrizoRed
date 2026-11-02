@@ -126,6 +126,16 @@ the wake (where `powerUp` and `powerUpHW` did change) or something outside the G
 because Sonoma leaves no record after the GPU halt. The boot with `-crnoctl -crnoaccel` (no Apple GPU drivers)
 decides it.
 
+**nvram40/41 (-crwakemark):** the power manager's phases 13, 14, 15, 16 all pass, with every driver powered down,
+the GPU included. The last mark is "> IOHibernateSystemHasSlept". The nvram41 panic (an NX fault in a test hook on
+`IOPlatformExpert::sleepKernel`, reverted in 0c93c67) shows the sleep got past `IOHibernateSystemHasSlept` and
+`evaluateSystemSleepPolicyFinal` into the platform's `sleepKernel`. NVRAM writes after `IOHibernateSystemHasSlept`
+(which does the last NVRAM sync before sleep) don't persist, so the marks can't see further. That makes the missing
+"CPU sleeping" in nvram40 meaningless. What's left: the platform sleep, `IOCPUSleepKernel` → `acpi_sleep_kernel` →
+`hibernate_write_image` (the sleep image, hibernatemode 3, written with polled disk I/O, drawing progress into the
+console framebuffer set up by `IOHibernateSystemHasSlept`), S3 entry, and the resume. A one-off `hibernatemode 0` sleep
+(diagnostic only) tells the sleep image apart from the rest.
+
 Next steps, cheapest first:
 1. On Sonoma after a failed attempt: `pmset -g log | grep -iE "sleep|wake|failure|darkwake" | tail -80` (Apple's own
    record of the failure and its phase), the disk logs of the failed boots (`/private/var/log/CarrizoRed-*.log`), and
