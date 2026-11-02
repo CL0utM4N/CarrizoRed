@@ -12,11 +12,12 @@ Updated 2026-10-31, at the 0.1.0 pre-release.
 - Sleep and wake on Catalina (D509BA): Linux DC's resume steps ([SLEEP.md](SLEEP.md))
 
 ## Next, in the order the project set (2026-10-30)
-1. **Sleep:** Sonoma's wake hang (on hold, next steps in [SLEEP.md](SLEEP.md)); lid sleep; the other machines and
-   macOS versions
+1. **Sleep:** the Monterey 12.3+ / Sonoma wake hang (lead: the CPU wake order, [SLEEP.md](SLEEP.md)); lid sleep;
+   the other machines and macOS versions
 2. **Video encode** (VCE), then decode (UVD needs physical-address translation, [VIDEO.md](VIDEO.md))
 3. **Brightness keys:** the eDP panel as an `AppleBacklightDisplay` (also what lid sleep needs)
-4. **GPU power management:** clock scaling that settles lower when idle, power gating
+4. **GPU power management:** clock scaling that settles lower when idle, power gating; the ~20 s GPU power-up at
+   every boot and wake (2 s waits in Apple's engine-control code, [SLEEP.md](SLEEP.md) *Also open*)
 5. **Sierra to Mojave** support
 6. **Tahoe graphics memory:** Apple's driver placing more allocations in system memory
 

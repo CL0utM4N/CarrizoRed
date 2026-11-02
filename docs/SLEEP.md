@@ -6,6 +6,8 @@ Status as of 0.1.0 (2026-10-31). Work on Sonoma's wake is **on hold**; this page
 |---|---|---|
 | ASUS VivoBook 15 D509BA (A9-9425) | Catalina 10.15.7 | **Works:** sleeps (fans off), wakes on a key press with a clean picture. Needs `SSDT-GPRW` (below) |
 | ASUS VivoBook 15 D509BA | Sonoma 14 | **Wake hangs:** the machine sleeps; a key press only starts the fans, with no picture, no panic and nothing logged after the sleep (see *Open: Sonoma*) |
+| ASUS VivoBook 15 D509BA | Big Sur 11.7 | **Works** (2026-11-02), slow: ~26 s of GPU power-up (see *Also open*) |
+| ASUS VivoBook 15 D509BA | Monterey 12.7 | **Wake hangs** like Sonoma (2026-11-02); lead: the 12.3 CPU wake order (see *Open: Sonoma*) |
 | ASUS VivoBook 15 D509BA | Lid close | **Doesn't sleep:** macOS sees the machine in desktop mode (see *Open: lid*) |
 | Dell Inspiron 3475, other machines, Big Sur–Ventura, Sequoia | | Untested |
 
@@ -136,7 +138,36 @@ the GPU included. The last mark is "> IOHibernateSystemHasSlept". The nvram41 pa
 console framebuffer set up by `IOHibernateSystemHasSlept`), S3 entry, and the resume. A one-off `hibernatemode 0` sleep
 (diagnostic only) tells the sleep image apart from the rest.
 
-Next steps, cheapest first:
+**hibernatemode 0 also hangs**, so the sleep image isn't the cause.
+
+**2026-11-02, which versions wake (same EFI, same kext):** Catalina wakes, Big Sur 11.7 wakes, Monterey 12.7 and
+Sonoma hang. The Catalina and Big Sur–Sequoia EFIs are identical apart from the kext build and `config.plist`, and the
+configs apply equivalent patches on 19.x and 20.x. From 21 (Monterey) the config adds IOPCIFamily "Disable 10 bit
+tags" and the `thread_*` "Remove non-monotonic time panic" patches; the CPU-ID patches only change versions.
+
+**Big Sur's wake (`CarrizoRed-1746611414.log`, `pmset.rtf`)** is a real resume from RAM: the kernel prints
+"regular wake" (pmset's "Wake from Safe Sleep" only reflects hibernatemode 3), then trace point 0x22, the platform
+wake actions (`IOPlatformWakeAction -> AppleRTC, AppleKeyStore, AppleSMC`), 0x23, `IOCPUSleepKernel exit`, and the
+GPU gets "system will power on". The wake feels slow (about a minute) because of the GPU power-up (*Also open*), not
+because of a sleep fault. On Sonoma the GPU never gets "will power on", so the resume stops in the kernel before any
+driver wakes.
+
+**Lead: Monterey 12.3 reordered the CPU wake.** XNU source diff, xnu-7195.141.2 (Big Sur) vs xnu-8020.140.41
+(Monterey); nothing else in the resume path changed beyond kperf timers and cosmetic edits. In `IOCPUSleepKernel`
+(iokit/Kernel/IOCPU.cpp):
+
+| | Big Sur, Monterey 12.0–12.2 (xnu-8019) | Monterey 12.3+ (xnu-8020.101), Sonoma |
+|---|---|---|
+| 1st | trace 0x22, `IOPlatformActionsPostResume` (AppleRTC, AppleKeyStore, AppleSMC = VirtualSMC) | trace 0x23, `processor_start` of the other cores |
+| 2nd | trace 0x23, `processor_start` of the other cores | trace 0x22, `IOPlatformActionsPostResume` |
+
+xnu-8020.140 keeps the old order for iOS only ("temporarily", rdar://88891040). The Sonoma 14.8.9 kernel binary has
+the new order (0x23, `processor_start_reason`, 0x22). Test: `cpus=1` on Monterey 12.3+ or Sonoma (diagnostic only;
+with one core there is nothing to start before the wake actions). If it wakes, the fix is in the kext: hold back the
+second core's start during wake until `IOPlatformActionsPostResume` has run (Big Sur's order), hooking functions large
+enough for Lilu's trampoline (the nvram41 lesson).
+
+Earlier next steps, cheapest first:
 1. On Sonoma after a failed attempt: `pmset -g log | grep -iE "sleep|wake|failure|darkwake" | tail -80` (Apple's own
    record of the failure and its phase), the disk logs of the failed boots (`/private/var/log/CarrizoRed-*.log`), and
    `log show --start … --end …` around the attempt;
@@ -155,6 +186,11 @@ Likely cause: the eDP panel attaches as `AppleDisplay` instead of `AppleBackligh
 
 ## Also open
 
+- **The GPU power-up takes about 20 s at every boot and wake** (all macOS versions, Catalina included; most of the
+  ~26 s `WakeTime` on Big Sur). Apple's engine-control code waits about 2 s at a time: `PP_InitializeEX` 4 s (between
+  `CAILQueryASICInfo` and `PHM_Initialize`), `Cail_Tonga_MicroEngineControlCp` 8 s and 6 s, and
+  `Cail_Tonga_MicroEngineControlSdma` 2 s twice (`pm4.start` 14 s, `sdma.start` 4 s, `hw.powerUp` 20 s). It's an
+  existing delay, not a sleep fault; finding what those waits time out on would save ~20 s per boot and wake.
 - Repeated sleep cycles, wake from a USB keyboard, more than a few minutes awake after a wake (an old `preemption_level`
   panic ~88 s after wake on Catalina; `-crpreemptcheck` names the culprit), the Dell, Big Sur–Sequoia.
 - Harmless-looking leftovers after a wake on Catalina: `DISPOUT_ERROR_COUNT` 0x54, one failed DPCD transfer (likely
