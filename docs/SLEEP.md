@@ -282,6 +282,13 @@ Next, cheapest first:
    `IOCPUSleepKernel` returns (CPUs started, platform wake actions run). No LED: the firmware's resume, or the
    kernel's resume up to the end of `acpi_sleep_kernel`. Stays on: between there and the end of `IOCPUSleepKernel`.
    On 3 s then off: later than thought.
+   **Result (2026-11-03, Monterey): the 1 s blink going to sleep, then nothing after the key press.** The wake never
+   reaches the end of `acpi_sleep_kernel`. Second version: the wake trampoline (physical 0x2000, the FACS waking
+   vector; `AcpiSetFirmwareWakingVector` is called only in `sleepPlatform`, before `acpi_sleep_kernel`) starts with a
+   jump to a real-mode stub at 0x2C00 that sets the LED, then runs the original `cli` and `lgdt` and jumps back. LED
+   on after the key press: the firmware reached macOS, and the hang is in the trampoline, `acpi_wake_prot` or the
+   start of `acpi_sleep_kernel`'s resume. No LED: the firmware's S3 resume never hands over. Three short blinks going
+   to sleep instead of one long one: the trampoline didn't start as expected and wasn't patched.
 2. **Hibernation restore:** `HibernateMode` `NVRAM` in the test EFI, `hibernatemode 25`, power on. If the session
    comes back, macOS's side of the wake works and the firmware's S3 resume is the problem.
 

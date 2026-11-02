@@ -1962,7 +1962,9 @@ static void hookTscSync(KernelPatcher &patcher) {
 // and nothing written after the sleep survives. The LED, set straight through the keyboard controller (i8042: 0xED,
 // then the LED byte, each acknowledged with 0xFA), shows how far the wake got without any driver:
 //  - going to sleep, at the start of acpi_sleep_kernel (every driver already asleep): on for 1 s, then off. Proves the
-//    controller takes the commands;
+//    controller takes the commands. Three short blinks instead: the wake trampoline wasn't patched (below);
+//  - in the wake trampoline, the first macOS code after the firmware: on (2026-11-03: Monterey never got as far as
+//    acpi_sleep_kernel returning, so this splits the firmware from the kernel's first steps);
 //  - when acpi_sleep_kernel returns after the firmware hands back control (LAPIC, timers and the wake trampoline
 //    redone): on, held 3 s;
 //  - when IOCPUSleepKernel returns (the other CPUs started and the platform wake actions run): off.
@@ -2009,10 +2011,57 @@ static void spinMs(uint64_t ms) {
 		__builtin_ia32_pause();
 }
 
+// The earliest point: XNU's real-mode wake trampoline, the first OS code the firmware runs (the FACS waking vector is
+// physical 0x2000; sleepPlatform installs the copy there before acpi_sleep_kernel, and acpi_sleep_kernel puts the CPU
+// start-up copy back at the end of every wake). Its first 3 bytes become a jump to a stub at 0x2C00 in the same
+// reserved page, which sets the LED (16-bit, CS base 0x2000, nothing but port I/O), runs the original cli and LGDT
+// (CS-relative, so they work from there) and jumps back behind them. LED on and staying on after the key press: the
+// firmware reached macOS. Only when the trampoline starts as expected: cli; cs addr32 data32 lgdt.
+static bool patchWakeTrampoline() {
+	if (!physmapBaseVar || !physmapMaxVar || *physmapBaseVar + 0x3000 > *physmapMaxVar)
+		return false;
+	auto *page = reinterpret_cast<uint8_t *>(*physmapBaseVar + 0x2000);
+	static const uint8_t start[] {0xFA, 0x2E, 0x67, 0x66, 0x0F, 0x01, 0x15};
+	if (memcmp(page, start, sizeof(start)))
+		return false;
+	static constexpr uint16_t StubAt = 0xC00, Resume = 11;  // cli (1) + lgdt (10)
+	// mov cx, 0xFFFF; 1: in al, 0x64; test al, mask; loopnz/loopz 1b
+	auto wait = [](uint8_t *p, uint8_t mask, bool untilSet) {
+		const uint8_t code[] {0xB9, 0xFF, 0xFF, 0xE4, 0x64, 0xA8, mask, static_cast<uint8_t>(untilSet ? 0xE1 : 0xE0), 0xFA};
+		memcpy(p, code, sizeof(code));
+		return p + sizeof(code);
+	};
+	auto *p = page + StubAt;
+	*p++ = 0xFA;  // cli
+	p = wait(p, 2, false);
+	*p++ = 0xB0, *p++ = 0xAE, *p++ = 0xE6, *p++ = 0x64;  // enable the keyboard port
+	p = wait(p, 2, false);
+	*p++ = 0xB0, *p++ = 0xED, *p++ = 0xE6, *p++ = 0x60;  // set LEDs
+	p = wait(p, 1, true);
+	*p++ = 0xE4, *p++ = 0x60;  // its 0xFA
+	p = wait(p, 2, false);
+	*p++ = 0xB0, *p++ = 0x04, *p++ = 0xE6, *p++ = 0x60;  // Caps Lock
+	p = wait(p, 1, true);
+	*p++ = 0xE4, *p++ = 0x60;
+	memcpy(p, page, Resume);
+	p += Resume;
+	auto back = static_cast<uint16_t>(Resume - (p + 3 - page));
+	*p++ = 0xE9, *p++ = static_cast<uint8_t>(back), *p++ = static_cast<uint8_t>(back >> 8);
+	auto to = static_cast<uint16_t>(StubAt - 3);
+	page[0] = 0xE9, page[1] = static_cast<uint8_t>(to), page[2] = static_cast<uint8_t>(to >> 8);
+	asm volatile("wbinvd" ::: "memory");
+	return true;
+}
+
 static void wrapAcpiSleepKernel(void *func, void *refcon) {
-	capsLed(true);
-	spinMs(1000);
-	capsLed(false);
+	// One 1 s blink, or three short ones when the trampoline wasn't patched.
+	bool patched = patchWakeTrampoline();
+	for (int i = 0; i < (patched ? 1 : 3); i++) {
+		capsLed(true);
+		spinMs(patched ? 1000 : 300);
+		capsLed(false);
+		spinMs(300);
+	}
 	FunctionCast(wrapAcpiSleepKernel, orgAcpiSleepKernel)(func, refcon);
 	capsLed(true);
 	spinMs(3000);
