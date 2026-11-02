@@ -1215,6 +1215,7 @@ static IOReturn wrapMessageClient(IOService *that, UInt32 type, OSObject *client
 }
 
 static void hookCpuSleep(KernelPatcher &patcher);
+static void hookTscSync(KernelPatcher &patcher);
 
 static void hookPreemptionCheck(KernelPatcher &patcher) {
 	if (!checkKernelArgument("-crpreemptcheck"))
@@ -1309,6 +1310,7 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 	}
 	hookPreemptionCheck(patcher);
 	hookCpuSleep(patcher);
+	hookTscSync(patcher);
 
 	auto *devInfo = DeviceInfo::create();
 	if (!devInfo) {
@@ -1836,6 +1838,114 @@ static void hookCpuSleep(KernelPatcher &patcher) {
 		SYSLOG("cr", "failed to hook the power manager's trace points (error %d)", patcher.getError());
 		patcher.clearError();
 	}
+}
+
+// TSC sync after the wake starts the other CPUs (-crtscsync, test only). Monterey and Sonoma hang on wake where Big Sur
+// doesn't; from 12.3 IOCPUSleepKernel starts the other CPUs (processor_start, Sonoma processor_start_reason) before
+// the platform wake actions, and Monterey wakes on Intel without a TSC sync kext panic there with "Non-monotonic time"
+// (acidanthera bugtracker #1900), a panic the AMD config patches out. S3 resets every core's TSC, and XNU only measures
+// the started CPU's TSC against the starter's (start_cpu, TSC_sync_margin; the result goes to kprintf).
+// All running CPUs read the TSC together in mp_rendezvous's action (between its entry and exit barriers); in the
+// teardown each CPU behind the highest reading moves forward by the difference, so no CPU's time goes backwards.
+// Differences up to 0xFFF ticks (XNU's own margin) are left alone. Also measured once at boot, without moving anything.
+static mach_vm_address_t orgProcessorStart;
+static void (*kernMpRendezvous)(void (*)(void *), void (*)(void *), void (*)(void *), void *);
+static int (*kernCpuNumber)();
+static bool (*kernSetIntrs)(bool);
+static constexpr uint32_t TscMaxCpus = 16;
+static constexpr uint64_t TscMargin = 0xFFF;
+static uint64_t tscSample[TscMaxCpus], tscMoved[TscMaxCpus];
+static bool tscIntrs[TscMaxCpus];
+static volatile uint32_t tscCpus;
+static bool tscAdjust;
+
+static uint64_t readTsc() {
+	uint32_t lo, hi;
+	asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+	return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+
+static void tscSyncSetup(void *) {
+	auto cpu = static_cast<uint32_t>(kernCpuNumber());
+	bool intrs = kernSetIntrs(false);
+	if (cpu < TscMaxCpus)
+		tscIntrs[cpu] = intrs;
+}
+
+static void tscSyncAction(void *) {
+	uint64_t tsc = readTsc();
+	auto cpu = static_cast<uint32_t>(kernCpuNumber());
+	if (cpu < TscMaxCpus) {
+		tscSample[cpu] = tsc;
+		__atomic_fetch_or(&tscCpus, 1U << cpu, __ATOMIC_RELAXED);
+	}
+}
+
+static void tscSyncTeardown(void *) {
+	auto cpu = static_cast<uint32_t>(kernCpuNumber());
+	if (cpu >= TscMaxCpus)
+		return;
+	uint64_t top = 0;
+	for (uint32_t i = 0; i < TscMaxCpus; i++)
+		if ((tscCpus & (1U << i)) && tscSample[i] > top)
+			top = tscSample[i];
+	uint64_t behind = top - tscSample[cpu];
+	tscMoved[cpu] = 0;
+	if (tscAdjust && behind > TscMargin) {
+		uint64_t tsc = readTsc() + behind;
+		asm volatile("wrmsr" : : "c"(0x10), "a"(static_cast<uint32_t>(tsc)), "d"(static_cast<uint32_t>(tsc >> 32)));
+		tscMoved[cpu] = behind;
+	}
+	kernSetIntrs(tscIntrs[cpu]);
+}
+
+static void tscSync(bool adjust, const char *when) {
+	tscCpus = 0;
+	tscAdjust = adjust;
+	kernMpRendezvous(tscSyncSetup, tscSyncAction, tscSyncTeardown, nullptr);
+	char line[300];
+	int len = snprintf(line, sizeof(line), "TSC %s: CPU0 %llx;", when, tscSample[0]);
+	for (uint32_t i = 0; i < TscMaxCpus && len > 0 && static_cast<size_t>(len) < sizeof(line); i++)
+		if (tscCpus & (1U << i))
+			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " CPU%u %s%llx moved %llx", i,
+				tscSample[i] < tscSample[0] ? "-" : "+", tscSample[i] < tscSample[0] ? tscSample[0] - tscSample[i] :
+				tscSample[i] - tscSample[0], tscMoved[i]);
+	diskLogEvent("%s", line);
+	SYSLOG("cr", "%s", line);
+}
+
+static kern_return_t wrapProcessorStart(void *processor, uint32_t reason, uint32_t flags) {
+	kern_return_t ret = FunctionCast(wrapProcessorStart, orgProcessorStart)(processor, reason, flags);
+	if (ret == KERN_SUCCESS)
+		tscSync(true, "after starting a CPU");
+	return ret;
+}
+
+static void hookTscSync(KernelPatcher &patcher) {
+	if (!checkKernelArgument("-crtscsync"))
+		return;
+	kernMpRendezvous = reinterpret_cast<decltype(kernMpRendezvous)>(
+		patcher.solveSymbol(KernelPatcher::KernelID, "_mp_rendezvous"));
+	kernCpuNumber = reinterpret_cast<decltype(kernCpuNumber)>(patcher.solveSymbol(KernelPatcher::KernelID, "_cpu_number"));
+	kernSetIntrs = reinterpret_cast<decltype(kernSetIntrs)>(
+		patcher.solveSymbol(KernelPatcher::KernelID, "_ml_set_interrupts_enabled"));
+	patcher.clearError();
+	if (!kernMpRendezvous || !kernCpuNumber || !kernSetIntrs) {
+		SYSLOG("cr", "TSC sync: kernel functions not found");
+		return;
+	}
+	// Sonoma's processor_start is a 32-byte stub jumping to processor_start_reason, too small for Lilu's trampoline, and
+	// IOCPUSleepKernel calls processor_start_reason directly.
+	KernelPatcher::RouteRequest request {"_processor_start_reason", wrapProcessorStart, orgProcessorStart};
+	if (!patcher.solveSymbol(KernelPatcher::KernelID, request.symbol))
+		request.symbol = "_processor_start";
+	patcher.clearError();
+	if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1)) {
+		SYSLOG("cr", "TSC sync: failed to hook %s (error %d)", request.symbol, patcher.getError());
+		patcher.clearError();
+		return;
+	}
+	tscSync(false, "at boot (measured only)");
 }
 
 // Kernel log lines about sleep and wake into the disk log (watcher thread). The 15:46 and 21:04 sleeps: "system will

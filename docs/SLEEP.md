@@ -7,7 +7,7 @@ Status as of 0.1.0 (2026-10-31). Work on Sonoma's wake is **on hold**; this page
 | ASUS VivoBook 15 D509BA (A9-9425) | Catalina 10.15.7 | **Works:** sleeps (fans off), wakes on a key press with a clean picture. Needs `SSDT-GPRW` (below) |
 | ASUS VivoBook 15 D509BA | Sonoma 14 | **Wake hangs:** the machine sleeps; a key press only starts the fans, with no picture, no panic and nothing logged after the sleep (see *Open: Sonoma*) |
 | ASUS VivoBook 15 D509BA | Big Sur 11.7 | **Works** (2026-11-02), slow: ~26 s of GPU power-up (see *Also open*) |
-| ASUS VivoBook 15 D509BA | Monterey 12.7 | **Wake hangs** like Sonoma (2026-11-02); lead: the 12.3 CPU wake order (see *Open: Sonoma*) |
+| ASUS VivoBook 15 D509BA | Monterey 12.7 | **Wake hangs** like Sonoma (2026-11-02), also with `cpus=1` and without the Monterey-only patches (see *Open: Sonoma*) |
 | ASUS VivoBook 15 D509BA | Lid close | **Doesn't sleep:** macOS sees the machine in desktop mode (see *Open: lid*) |
 | Dell Inspiron 3475, other machines, Big Sur–Ventura, Sequoia | | Untested |
 
@@ -166,6 +166,34 @@ the new order (0x23, `processor_start_reason`, 0x22). Test: `cpus=1` on Monterey
 with one core there is nothing to start before the wake actions). If it wakes, the fix is in the kext: hold back the
 second core's start during wake until `IOPlatformActionsPostResume` has run (Big Sur's order), hooking functions large
 enough for Lilu's trampoline (the nvram41 lesson).
+
+**Results (2026-11-02, Monterey 12.7):** `cpus=1` still hangs (`hw.ncpu` not confirmed). `cpus=1` with the three
+Monterey-only patches also off (both "Remove non-monotonic time panic", "Disable 10 bit tags") still hangs, so the
+config is ruled out, and so is the CPU wake order if `cpus=1` took effect. Next: `-crnoaccel` (display controller only,
+no accelerator or CAIL), then `-crnoctl -crnoaccel` if that hangs too; it splits Apple's GPU drivers from the platform.
+`-crnoaccel` still hangs (2026-11-03). Other projects (2026-11-03 search): no published fix for an AMD APU waking on
+Monterey 12.3+. A Ryzen 1700X desktop had the same split (11.6.4 wakes, 12.3 doesn't) and reported a fix from
+OpenCore 0.8.0, SMBIOS iMac19,2/MacPro7,1 and NVRAM `wake-failure`; this EFI already runs OpenCore 1.0. NootedRed's
+maintainers list missing TSC synchronisation (they recommend ForgedInvariant) as a known wake breaker; this EFI has
+no TSC sync kext. acidanthera bugtracker #1900: Monterey on Intel panics at wake with "Non-monotonic time" inside
+`processor_start` from `IOCPUSleepKernel`; the AMD config's `thread_*` patches remove that panic, which could leave a
+hang instead. No usable kext: ForgedInvariant's license excludes use with AI tools; AmdTscSync only syncs on a timer,
+seconds after the wake; CpuTscSync writes `TSC_ADJUST` (MSR 0x3B, not on Stoney) from Monterey on. So CarrizoRed has
+its own test, `-crtscsync`: after each `processor_start(_reason)` all CPUs read the TSC together inside
+`mp_rendezvous`, and any CPU behind the highest reading moves forward by the difference (never backwards). It also
+measures once at boot. Caveat: with `cpus=1` there is no second CPU to be out of sync, and that still hung (if it
+took effect). Next: no CarrizoRed at all (kext disabled, `device-id` spoof off, the iGPU on
+the firmware framebuffer), with Caps Lock and `pmset -g log` as the signs of life, since nothing redraws the screen.
+
+**AppleACPIPlatform and AppleRTC, Big Sur 11.7.11 vs Monterey 12.5.1** (each kext from the kernel collection,
+compared function by function on normalized disassembly): no change in behaviour. The sleep and resume path is
+identical instruction for instruction: `sleepPlatform`, `handleSleepKernelCallback`, `sleepKernelCallback`,
+`picSleepWake`, `AcpiHwLegacySleep`/`Wake`/`WakePrep`, `AcpiSetFirmwareWakingVector`, `AcpiEnterSleepStatePrep`,
+`AcpiHwExecuteSleepMethod`, `systemDidWakePhase3`/`4`. The rest of the differences are compiler output (register
+allocation, inlining, typed `kalloc`, overflow-checked allocation sizes): `AcpiEnterSleepState`,
+`AcpiLeaveSleepState(Prep)`, `systemWillSleep`, `systemDidWakePhase1`, `AppleACPICPU::initCPU`/`startSerialized`.
+AppleRTC's `rtcRead`/`rtcWrite` dropped an `& 0x7f` on bank 0, where the index is already below 0x80. Monterey's
+12.3 change in the wake path is the kernel's CPU order (above), not Apple's ACPI driver.
 
 Earlier next steps, cheapest first:
 1. On Sonoma after a failed attempt: `pmset -g log | grep -iE "sleep|wake|failure|darkwake" | tail -80` (Apple's own
