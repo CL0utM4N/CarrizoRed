@@ -1786,6 +1786,9 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 // and the power manager wake anything, so a "CPU resumed" mark without "system will power on" puts the hang between
 // the two, and none at all means the kernel never ran again. Hooked with -crwakemark only.
 static mach_vm_address_t orgCpuSleepKernel;
+static bool capsProbe;  // -crcapsprobe, see capsLed
+static void capsLed(bool on);
+static void hookCapsProbe(KernelPatcher &patcher);
 static uint32_t cpuResumes;
 
 static void wrapCpuSleepKernel() {
@@ -1793,6 +1796,8 @@ static void wrapCpuSleepKernel() {
 	if (wakeMarkCall)
 		wakeMarkFlush(true);
 	FunctionCast(wrapCpuSleepKernel, orgCpuSleepKernel)();
+	if (capsProbe)
+		capsLed(false);
 	cpuResumes++;
 	diskLogEvent("CPU resumed (%u)", cpuResumes);
 	if (wakeMarkCall)
@@ -1821,7 +1826,9 @@ static void wrapTraceDetail(void *that, uint32_t msgType, uint32_t msgIndex, uin
 }
 
 static void hookCpuSleep(KernelPatcher &patcher) {
-	if (!checkKernelArgument("-crwakemark"))
+	capsProbe = checkKernelArgument("-crcapsprobe");
+	bool wakeMark = checkKernelArgument("-crwakemark");
+	if (!wakeMark && !capsProbe)
 		return;
 	KernelPatcher::RouteRequest request {"__Z16IOCPUSleepKernelv", wrapCpuSleepKernel, orgCpuSleepKernel};
 	cpuSleepHooked = patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1);
@@ -1829,6 +1836,9 @@ static void hookCpuSleep(KernelPatcher &patcher) {
 		SYSLOG("cr", "failed to hook IOCPUSleepKernel (error %d)", patcher.getError());
 		patcher.clearError();
 	}
+	hookCapsProbe(patcher);
+	if (!wakeMark)
+		return;
 	KernelPatcher::RouteRequest trace[] {
 		{"__ZN14IOPMrootDomain10tracePointEh", wrapTracePoint, orgTracePoint},
 		{"__ZN14IOPMrootDomain11traceDetailEjjj", wrapTraceDetail, orgTraceDetail},
@@ -1946,6 +1956,76 @@ static void hookTscSync(KernelPatcher &patcher) {
 		return;
 	}
 	tscSync(false, "at boot (measured only)");
+}
+
+// Caps Lock probe (-crcapsprobe, test only). Monterey's wake hangs with nothing answering, not even the Caps Lock LED,
+// and nothing written after the sleep survives. The LED, set straight through the keyboard controller (i8042: 0xED,
+// then the LED byte, each acknowledged with 0xFA), shows how far the wake got without any driver:
+//  - going to sleep, at the start of acpi_sleep_kernel (every driver already asleep): on for 1 s, then off. Proves the
+//    controller takes the commands;
+//  - when acpi_sleep_kernel returns after the firmware hands back control (LAPIC, timers and the wake trampoline
+//    redone): on, held 3 s;
+//  - when IOCPUSleepKernel returns (the other CPUs started and the platform wake actions run): off.
+// Never on after the key press: the firmware's resume or the start of the kernel's. On and staying on: stuck between.
+static mach_vm_address_t orgAcpiSleepKernel;
+
+static uint8_t portIn8(uint16_t port) {
+	uint8_t v;
+	asm volatile("inb %1, %0" : "=a"(v) : "Nd"(port));
+	return v;
+}
+
+static void portOut8(uint16_t port, uint8_t v) {
+	asm volatile("outb %0, %1" : : "a"(v), "Nd"(port));
+}
+
+static void kbdSend(uint8_t byte) {
+	for (uint32_t i = 0; i < 100000 && (portIn8(0x64) & 2); i++)  // input buffer full
+		__builtin_ia32_pause();
+	portOut8(0x60, byte);
+	for (uint32_t i = 0; i < 100000; i++) {  // the keyboard's 0xFA
+		if (portIn8(0x64) & 1) {
+			portIn8(0x60);
+			return;
+		}
+		__builtin_ia32_pause();
+	}
+}
+
+static void capsLed(bool on) {
+	for (uint32_t i = 0; i < 16 && (portIn8(0x64) & 1); i++)  // stale bytes
+		portIn8(0x60);
+	// VoodooPS2 may have disabled the keyboard port for sleep; it sets the controller up again at wake.
+	for (uint32_t i = 0; i < 100000 && (portIn8(0x64) & 2); i++)
+		__builtin_ia32_pause();
+	portOut8(0x64, 0xAE);
+	kbdSend(0xED);
+	kbdSend(on ? 4 : 0);
+}
+
+static void spinMs(uint64_t ms) {
+	uint64_t end = mach_absolute_time() + ms * 1000000;  // x86: nanoseconds
+	while (mach_absolute_time() < end)
+		__builtin_ia32_pause();
+}
+
+static void wrapAcpiSleepKernel(void *func, void *refcon) {
+	capsLed(true);
+	spinMs(1000);
+	capsLed(false);
+	FunctionCast(wrapAcpiSleepKernel, orgAcpiSleepKernel)(func, refcon);
+	capsLed(true);
+	spinMs(3000);
+}
+
+static void hookCapsProbe(KernelPatcher &patcher) {
+	if (!capsProbe)
+		return;
+	KernelPatcher::RouteRequest request {"_acpi_sleep_kernel", wrapAcpiSleepKernel, orgAcpiSleepKernel};
+	if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1)) {
+		SYSLOG("cr", "Caps Lock probe: failed to hook acpi_sleep_kernel (error %d)", patcher.getError());
+		patcher.clearError();
+	}
 }
 
 // Kernel log lines about sleep and wake into the disk log (watcher thread). The 15:46 and 21:04 sleeps: "system will

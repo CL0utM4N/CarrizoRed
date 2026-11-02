@@ -177,8 +177,11 @@ Every one still hangs: the key press starts the fans, with no picture, no panic 
 | `-crnoaccel` (display controller only, no accelerator or CAIL) | Apple's accelerator and its wake |
 | `-crtscsync` (below) | the cores' TSCs: at boot they are -0x4f and +0x23 ticks apart, i.e. in sync |
 | Caps Lock during the hang | nothing; but no LED, so nothing in macOS answers. Either the firmware never hands back control, or the kernel stopped with interrupts off |
+| RTCMemoryFixup 1.0.7 with `rtcfx_exclude=00-FF` (no macOS writes to CMOS memory) | a CMOS byte macOS writes at sleep clashing with the firmware's S3 resume |
+| `-crnoaccel` plus CarrizoRed's sleep and wake steps off (`-crnosleeppoweroff -crnowakerestore -crnowakepowercycle -crnodcaux -crnodispclk`) | set up, result not reported |
 
-Not run: no CarrizoRed at all (kext and `device-id` spoof off).
+No CarrizoRed at all (kext and `device-id` spoof off): Monterey doesn't sleep at all (the screen stays on), so this
+split can't be made that way.
 
 **`-crtscsync`** (2ef26df, test only): after each `processor_start(_reason)` all CPUs read the TSC together inside
 `mp_rendezvous`, and any CPU behind the highest reading moves forward by the difference (never backwards). It also
@@ -212,12 +215,50 @@ from its kernel collection), plus the XNU source.
 - **AppleRTC:** `rtcRead`/`rtcWrite` dropped an `& 0x7f` on bank 0, where the index is already below 0x80. No
   change in behaviour.
 
+### Monterey vs Big Sur, PCI and USB power (2026-11-03)
+
+Also compared, Big Sur 11.7.11 vs Monterey 12.5.1 (Boot KCs; IOPCIFamily source 428.120.4 vs 484.140.2):
+- **IOPCIFamily's `_PS0`/`_PS3`:** `IOPCIDevice::attach` (which methods exist) and `setPCIPowerState` (evaluate `_PSx`,
+  then write PMCSR) are the same apart from locks and allocators. `_PS3` runs before the D3 write, so XHC0's and EHC1's
+  `_PS3` see `U_PS`/`E_PS` != 3 and do nothing at sleep on both versions (with `XHCD`/`EHCD` = 1, which is what
+  `SSDT-XOSI` leaves on the D509BA: `FINI` clears them only below Windows 8).
+- **AppleUSBXHCIPCI RTD3:** reworked in Monterey (`setPowerStateGated`, "scheduling/initiating RTD3 entry"), but
+  `pciWakeInitializeForRTD3` only enables it when the controller's ACPI node has `_GPE`; XHC0 has none, on both. 1022:7914
+  gets the generic `AppleUSBXHCIPCI` (`AppleAMDUSBXHCIPCI` matches only 1002:73a4/73a6).
+- **CarrizoRed's kernel hooks:** by default only `cs_validate_page` (dyld page patches), not on the wake path.
+  `acpi_sleep_kernel` and `IOCPUSleepKernel` have plain prologues (pushes, `sub rsp`, `mov r15, rsi`; no RIP-relative
+  operand in the first 14 bytes) on both, so a probe can hook them.
+- **FADT:** day alarm index 0x0D (AMD FCH register D), month 0, century 0x32; RTC0 exposes bank 0 only. Nothing odd.
+
+Unexplained: the nvram41 panic was a kernel NX fault in Lilu's trampoline memory at `IOPlatformExpert::sleepKernel`,
+while the `tracePoint` routes, in the same Lilu buffer, had run earlier in that sleep. Either that route never got a
+real trampoline (Lilu's 4 KB buffer full: see the comment above `routePool` in `kern_cr.cpp`), or the late sleep makes
+that memory non-executable. In the second case, the first Lilu-plugin trampoline to run during the wake (ECEnabler on
+`_WAK`'s EC accesses, NVMeFix, VirtualSMC) faults with interrupts off, which would also hang without a panic. The
+kext bisect below tells these apart.
+
 ### Other projects (2026-11-03)
 
 No published fix for an AMD APU waking on Monterey 12.3+. A Ryzen 1700X desktop had the same split (11.6.4 wakes, 12.3
 doesn't) and reported a fix from OpenCore 0.8.0, SMBIOS iMac19,2 then MacPro7,1, and NVRAM `wake-failure`; this EFI
 already runs OpenCore 1.0, and the SMBIOS part is unproven (several changes at once). NootedRed's reports are mostly
 a black screen with the system running, or a graphics wake-timeout panic; neither matches.
+
+More, 2026-11-03:
+- acidanthera bugtracker #1900 (ASUS UX430AU and other Intel laptops, Big Sur fine, Monterey "black screen, fans
+  spinning"): a "Non-monotonic time" panic in `IOCPUSleepKernel` → `processor_start`, fixed by CpuTscSync 1.0.6 plus
+  `TSC_sync_margin=0`. Here the config's `thread_*` patches remove that panic and `cpus=1` still hangs.
+  `TSC_sync_margin` only matters for the `start_cpu` barrier, which is the same code in xnu-7195 and xnu-8020 and only
+  kprintfs on release kernels.
+- AMD OS X, Ryzen 5800H laptop (Lenovo Legion 5): Monterey panics without `cpus=1` (no TSC_ADJUST); wake from sleep
+  listed as unsolved.
+- AMD OS X, Ryzen 5950X desktop on Monterey 12.6.8: wake needed a CMOS reset; fixed after several changes at once
+  (USB map, `ReleaseUsbOwnership`, own SSDT-EC/USBX). Not isolated.
+- Dortania's RTC page: AppleRTC writes to CMOS areas the firmware uses cause CMOS errors, safe-mode boots and panics
+  on reboot or wake; `DisableRtcChecksum` (0x58–0x59 only), RTCMemoryFixup with `rtcfx_exclude=00-FF` bisected
+  by halves, then `rtc-blacklist`. No report of it causing a silent wake hang. **Tested on Monterey: RTCMemoryFixup
+  doesn't fix it**, so it isn't AppleRTC's CMOS writes.
+- No report found tying `ProtectMemoryRegions` or `UEFI > ReservedMemory` to a Monterey wake.
 
 ### Where it stands
 
@@ -227,12 +268,22 @@ kernel collections and their data sit, against memory the firmware's S3 resume u
 leaves behind at sleep.
 
 Next, cheapest first:
-1. **Caps Lock probe build:** the LED on via the keyboard controller (i8042 0xED) straight after `acpi_sleep_kernel`
-   returns (the first C code after the firmware), off again once `IOCPUSleepKernel` has started the CPUs. No LED: the
-   firmware's resume or the wake trampoline. Stays on: the kernel's early wake. On then off: later than thought.
+0. **No CarrizoRed, then fewer kexts** (no build needed): Monterey with CarrizoRed and the `device-id` spoof off
+   (VESA display), `pmset -g log` as the sign of life. If that wakes, the cause is in the GPU stack. If it still hangs,
+   go down to Lilu, VirtualSMC and VoodooPS2 only, then add the rest back in halves: ECEnabler, SMCBatteryManager,
+   NVMeFix, RestrictEvents (`revpatch`), the VoodooI2C set, FCHXHCIFix with the xHCI reset patch, USBMap. Also free:
+   sleep within a minute of boot. If that wakes and later sleeps don't, firmware memory that macOS reuses is a lead
+   (`ProtectMemoryRegions`, `UEFI > ReservedMemory`).
+   Tried 2026-11-03: without CarrizoRed, Monterey doesn't sleep at all (screen stays on); the kext halves still apply
+   with CarrizoRed kept.
+1. **Caps Lock probe, `-crcapsprobe`:** the LED through the keyboard controller (i8042 0xED, the keyboard port
+   re-enabled with 0xAE first). Going to sleep, at the start of `acpi_sleep_kernel`: on 1 s, then off (proves the
+   controller takes the commands). After the key press: on when `acpi_sleep_kernel` returns, held 3 s; off when
+   `IOCPUSleepKernel` returns (CPUs started, platform wake actions run). No LED: the firmware's resume, or the
+   kernel's resume up to the end of `acpi_sleep_kernel`. Stays on: between there and the end of `IOCPUSleepKernel`.
+   On 3 s then off: later than thought.
 2. **Hibernation restore:** `HibernateMode` `NVRAM` in the test EFI, `hibernatemode 25`, power on. If the session
    comes back, macOS's side of the wake works and the firmware's S3 resume is the problem.
-3. No CarrizoRed at all (kext and `device-id` spoof off), with `pmset -g log` as the sign of life.
 
 Older ideas, superseded: `pmset -g log` and `log show` around a failed attempt (pmset only shows "Entering Sleep
 state" then the next boot); `-crwakemark` phase lists (NVRAM writes stop at `IOHibernateSystemHasSlept`).
@@ -263,6 +314,7 @@ Likely cause: the eDP panel attaches as `AppleDisplay` instead of `AppleBackligh
 | (default) | The disk log `/private/var/log/CarrizoRed-<time>.log`: sleep, wake, every VBIOS call of a wake, a display report 30 s after a wake (or 1 s after a failed DPCD transfer) |
 | `-crwakemark` | `CR-wake` in NVRAM (Apple's GUID 7C436110-…): CarrizoRed's events from "will sleep" to 30 s after the wake, the CPU's sleep and resume, the power manager's phases. Forced flash writes, up to 100 per sleep |
 | (default) | Wake watchdogs: a panic with the black-box report if a wake doesn't complete (45 s after "will power on", or 150 s of awake time after "will sleep" with the watcher stopped). `-crnowakepanic` |
+| `-crcapsprobe` | Test: the Caps Lock LED shows how far a wake gets (*Where it stands*) |
 | `-crtscsync` | Test: syncs the cores' TSCs after the wake starts them; "TSC ..." lines in the disk log, the boot measurement too |
 | `-crpreemptcheck` | Panics naming the event source or interest handler that leaks a preemption disable |
 
