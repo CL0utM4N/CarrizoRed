@@ -1818,81 +1818,9 @@ static void wrapTraceDetail(void *that, uint32_t msgType, uint32_t msgIndex, uin
 		diskLogEvent("PM detail %x %x %x", msgType, msgIndex, delay);
 }
 
-// The steps between the last phase and the CPUs (nvram40, Sonoma: phases 13-16 and no 17 or "CPU sleeping").
-// IOPMrootDomain::powerChangeDone then runs IOHibernateSystemHasSlept, evaluateSystemSleepPolicyFinal, sometimes
-// systemPowerEventOccurred, and the platform's sleepKernel, which reaches IOCPUSleepKernel. Each one is marked on entry
-// and exit, written at once, with IOPolledFilePollersOpen (the sleep image's polled disk I/O). sleepStepHooks: the hooks
-// that went in, bit per step, in the CR-wake header.
-static mach_vm_address_t orgHibernateHasSlept, orgSleepPolicyFinal, orgPowerEventOccurred, orgSleepKernel, orgPollersOpen;
-static uint32_t sleepStepHooks;
-
-static void sleepStepMark(const char *fmt, uint64_t value) {
-	if (!wakeMarkOpen)
-		return;
-	diskLogEvent(fmt, value);
-	if (wakeMarkCall && ml_get_interrupts_enabled())
-		wakeMarkFlush(true);
-}
-
-static IOReturn wrapHibernateHasSlept() {
-	sleepStepMark("> IOHibernateSystemHasSlept", 0);
-	IOReturn r = FunctionCast(wrapHibernateHasSlept, orgHibernateHasSlept)();
-	sleepStepMark("< IOHibernateSystemHasSlept = %llx", r);
-	return r;
-}
-
-static void wrapSleepPolicyFinal(void *that) {
-	sleepStepMark("> evaluateSystemSleepPolicyFinal", 0);
-	FunctionCast(wrapSleepPolicyFinal, orgSleepPolicyFinal)(that);
-	sleepStepMark("< evaluateSystemSleepPolicyFinal", 0);
-}
-
-static IOReturn wrapPowerEventOccurred(void *that, const OSSymbol *event, OSObject *value) {
-	bool mark = wakeMarkOpen && gpuSleeping;
-	if (mark) {
-		diskLogEvent("> systemPowerEventOccurred %s", event ? event->getCStringNoCopy() : "?");
-		if (wakeMarkCall && ml_get_interrupts_enabled())
-			wakeMarkFlush(true);
-	}
-	IOReturn r = FunctionCast(wrapPowerEventOccurred, orgPowerEventOccurred)(that, event, value);
-	if (mark)
-		sleepStepMark("< systemPowerEventOccurred = %llx", r);
-	return r;
-}
-
-static void wrapSleepKernel(void *that) {
-	sleepStepMark("> IOPlatformExpert::sleepKernel", 0);
-	FunctionCast(wrapSleepKernel, orgSleepKernel)(that);
-	sleepStepMark("< IOPlatformExpert::sleepKernel", 0);
-}
-
-static IOReturn wrapPollersOpen(void *vars, uint32_t state, bool abortable) {
-	bool mark = wakeMarkOpen && gpuSleeping;
-	if (mark)
-		sleepStepMark("> IOPolledFilePollersOpen state %llx", state);
-	IOReturn r = FunctionCast(wrapPollersOpen, orgPollersOpen)(vars, state, abortable);
-	if (mark)
-		sleepStepMark("< IOPolledFilePollersOpen = %llx", r);
-	return r;
-}
-
 static void hookCpuSleep(KernelPatcher &patcher) {
 	if (!checkKernelArgument("-crwakemark"))
 		return;
-	KernelPatcher::RouteRequest steps[] {
-		{"_IOHibernateSystemHasSlept", wrapHibernateHasSlept, orgHibernateHasSlept},
-		{"__ZN14IOPMrootDomain30evaluateSystemSleepPolicyFinalEv", wrapSleepPolicyFinal, orgSleepPolicyFinal},
-		{"__ZN14IOPMrootDomain24systemPowerEventOccurredEPK8OSSymbolP8OSObject", wrapPowerEventOccurred,
-			orgPowerEventOccurred},
-		{"__ZN16IOPlatformExpert11sleepKernelEv", wrapSleepKernel, orgSleepKernel},
-		{"_IOPolledFilePollersOpen", wrapPollersOpen, orgPollersOpen},
-	};
-	for (size_t i = 0; i < arrsize(steps); i++) {
-		if (patcher.routeMultipleLong(KernelPatcher::KernelID, &steps[i], 1))
-			sleepStepHooks |= 1U << i;
-		else
-			patcher.clearError();
-	}
 	KernelPatcher::RouteRequest request {"__Z16IOCPUSleepKernelv", wrapCpuSleepKernel, orgCpuSleepKernel};
 	cpuSleepHooked = patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1);
 	if (!cpuSleepHooked) {
@@ -2247,8 +2175,8 @@ static void wakeMarkStart() {
 	while (__atomic_exchange_n(&diskLogEventLock, 1, __ATOMIC_ACQUIRE))
 		__builtin_ia32_pause();
 	const char *log = strrchr(diskLogPath, '/');
-	wakeMarkLen = static_cast<uint32_t>(snprintf(wakeMarks, sizeof(wakeMarks), "%s sleep %u hooks cpu %u pm %u steps %x;",
-		log ? log + 1 : "nolog", systemSleeps, cpuSleepHooked, tracePointHooked, sleepStepHooks));
+	wakeMarkLen = static_cast<uint32_t>(snprintf(wakeMarks, sizeof(wakeMarks), "%s sleep %u hooks cpu %u pm %u;",
+		log ? log + 1 : "nolog", systemSleeps, cpuSleepHooked, tracePointHooked));
 	if (wakeMarkLen >= sizeof(wakeMarks))
 		wakeMarkLen = sizeof(wakeMarks) - 1;
 	wakeMarkOpen = true;
