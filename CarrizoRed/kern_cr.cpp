@@ -1710,10 +1710,13 @@ static void sleepWatchdog(thread_call_param_t, thread_call_param_t) {
 	CRDriver::wakeWatchdogFired("150 s of awake time after kIOMessageSystemWillSleep", true, beats);
 }
 
+static void ehciFind();
+
 static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *, void *, vm_size_t) {
 	switch (messageType) {
 		case kIOMessageSystemWillSleep:
 			systemSleeps++;
+			ehciFind();
 			wakeMarkStart();
 			if (!checkKernelArgument("-crnosleeppause")) {
 				__atomic_store_n(&gpuPoweringOn, false, __ATOMIC_RELAXED);
@@ -1830,8 +1833,10 @@ static void wrapTraceDetail(void *that, uint32_t msgType, uint32_t msgIndex, uin
 static void hookCpuSleep(KernelPatcher &patcher) {
 	capsProbe = checkKernelArgument("-crcapsprobe");
 	bool wakeMark = checkKernelArgument("-crwakemark");
-	if (!wakeMark && !capsProbe)
+	if (!wakeMark && !capsProbe) {
+		hookCapsProbe(patcher);  // only the EHC1 check, with -crehcidiag/-crehcipme
 		return;
+	}
 	KernelPatcher::RouteRequest request {"__Z16IOCPUSleepKernelv", wrapCpuSleepKernel, orgCpuSleepKernel};
 	cpuSleepHooked = patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1);
 	if (!cpuSleepHooked) {
@@ -2245,7 +2250,77 @@ static bool buildWakeStub32() {
 	return true;
 }
 
+// EHC1 (the FCH's EHCI, 1022:7908) at the edges of S3 (-crehcidiag; -crehcipme also clears PME_Status). The Dell
+// Inspiron 3475 is woken by EHC1 0.16 s after every S3 entry, also with the webcam's hub port powered off, and then no
+// port counter on EHC1's hub has moved (FCHXHCIFix log 1793716884). A PME_Status left set when the controller goes to
+// D3 with PME_En raises the wake again as soon as ACPI has cleared the GPE status: IOPCIFamily writes 0x103 to PMCSR
+// (D3, PME_En), which doesn't clear bit 15; Linux clears it before enabling PME. Read straight before acpi_sleep_cpu (every
+// driver asleep, interrupts off) and when acpi_sleep_kernel returns (no driver awake yet): PMCSR through the CF8/CFC
+// config ports (no locks), USBCMD/USBSTS/PORTSC through BAR0 when the controller is in D0. Found and mapped at "will
+// sleep".
+static bool ehciDiag, ehciPmeClear, ehciFound;
+static uint32_t ehciCf8;  // 0x80000000 | bus << 16 | device << 11 | function << 8
+static uint8_t ehciPm;
+static IOMemoryMap *ehciMap;
+
+static uint16_t ehciCfgRead16(uint8_t reg) {
+	asm volatile("outl %0, %1" : : "a"(ehciCf8 | (reg & 0xFCU)), "Nd"(static_cast<uint16_t>(0xCF8)));
+	uint16_t v;
+	asm volatile("inw %1, %0" : "=a"(v) : "Nd"(static_cast<uint16_t>(0xCFC + (reg & 2))));
+	return v;
+}
+
+static void ehciCfgWrite16(uint8_t reg, uint16_t v) {
+	asm volatile("outl %0, %1" : : "a"(ehciCf8 | (reg & 0xFCU)), "Nd"(static_cast<uint16_t>(0xCF8)));
+	asm volatile("outw %0, %1" : : "a"(v), "Nd"(static_cast<uint16_t>(0xCFC + (reg & 2))));
+}
+
+static void ehciFind() {
+	if (ehciFound || !(ehciDiag || ehciPmeClear))
+		return;
+	auto *iter = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
+	while (auto *pci = iter ? OSDynamicCast(IOPCIDevice, iter->getNextObject()) : nullptr) {
+		if (pci->configRead32(0) != 0x79081022)
+			continue;
+		ehciCf8 = 0x80000000U | (static_cast<uint32_t>(pci->getBusNumber()) << 16) |
+			(static_cast<uint32_t>(pci->getDeviceNumber()) << 11) | (static_cast<uint32_t>(pci->getFunctionNumber()) << 8);
+		ehciPm = static_cast<uint8_t>(pci->findPCICapability(kIOPCIPowerManagementCapability));
+		ehciMap = pci->mapDeviceMemoryWithIndex(0);
+		ehciFound = ehciPm != 0;
+		diskLogEvent("EHC1: config %x, PM capability %x, BAR0 %s", ehciCf8, ehciPm, ehciMap ? "mapped" : "not mapped");
+		break;
+	}
+	if (iter)
+		iter->release();
+}
+
+static void ehciSnapshot(const char *when, bool clearPme) {
+	if (!ehciFound)
+		return;
+	uint16_t pmcsr = ehciCfgRead16(ehciPm + 4);
+	uint32_t cmd = ~0U, sts = ~0U, port1 = ~0U, port2 = ~0U;
+	if (ehciMap && (pmcsr & 3) == 0) {
+		auto *base = reinterpret_cast<volatile uint8_t *>(ehciMap->getVirtualAddress());
+		auto *op = reinterpret_cast<volatile uint32_t *>(base + base[0]);  // CAPLENGTH
+		cmd = op[0], sts = op[1], port1 = op[0x44 / 4], port2 = op[0x48 / 4];
+	}
+	uint16_t after = pmcsr;
+	if (clearPme && (pmcsr & 0x8000)) {
+		ehciCfgWrite16(ehciPm + 4, pmcsr);  // PME_Status is write-1-to-clear; D-state and PME_En written back unchanged
+		after = ehciCfgRead16(ehciPm + 4);
+	}
+	diskLogEvent("EHC1 %s: PMCSR %04x%s (PME_Status %u, PME_En %u, D%u), USBCMD %x USBSTS %x PORTSC1 %x PORTSC2 %x", when,
+		pmcsr, after != pmcsr ? " cleared" : "", pmcsr >> 15, (pmcsr >> 8) & 1, pmcsr & 3, cmd, sts, port1, port2);
+}
+
 static void wrapAcpiSleepKernel(void *func, void *refcon) {
+	if (!capsProbe) {
+		ehciSnapshot("before S3", ehciPmeClear);
+		FunctionCast(wrapAcpiSleepKernel, orgAcpiSleepKernel)(func, refcon);
+		ehciSnapshot("after S3", false);
+		return;
+	}
+	ehciSnapshot("before S3", ehciPmeClear);
 	// One 1 s blink, or three short ones when the trampoline wasn't patched.
 	bool patched = patchWakeTrampoline();
 	if (patched && wakeMemCheck) {
@@ -2264,6 +2339,7 @@ static void wrapAcpiSleepKernel(void *func, void *refcon) {
 	capsArmed = true;
 	FunctionCast(wrapAcpiSleepKernel, orgAcpiSleepKernel)(func, refcon);
 	capsArmed = false;
+	ehciSnapshot("after S3", false);
 	capsLed(true);
 	spinMs(3000);
 }
@@ -2397,8 +2473,18 @@ static void patchSleepFlush(KernelPatcher &patcher) {
 }
 
 static void hookCapsProbe(KernelPatcher &patcher) {
-	if (!capsProbe)
+	ehciPmeClear = checkKernelArgument("-crehcipme");
+	ehciDiag = ehciPmeClear || checkKernelArgument("-crehcidiag");
+	if (!capsProbe) {
+		if (!ehciDiag)
+			return;
+		KernelPatcher::RouteRequest request {"_acpi_sleep_kernel", wrapAcpiSleepKernel, orgAcpiSleepKernel};
+		if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1)) {
+			SYSLOG("cr", "EHC1 check: failed to hook acpi_sleep_kernel (error %d)", patcher.getError());
+			patcher.clearError();
+		}
 		return;
+	}
 	uint64_t t0 = readTsc(), m0 = mach_absolute_time();
 	while (mach_absolute_time() - m0 < 20000000)
 		__builtin_ia32_pause();
