@@ -2273,6 +2273,29 @@ static IOMemoryMap *ehciMap;
 // wakes with nothing armed set and GPE 0x01/0x04 status set every time (log 1793787216, wake filter on): which
 // sources do those GPEs carry? Mapped at "will sleep", read with the ACPI snapshot.
 static IOMemoryMap *fchSmiMap;
+// The FCH's GPIO registers (ACPI MMIO 0xFED81500, one dword per pin, 3 banks of 64; Linux pinctrl-amd): bits 13-15 wake
+// in S0i3/S3/S4-S5, bit 28 interrupt status, bit 29 wake status. GEVENT pins wake the machine through these, apart
+// from ACPI's GPE enables (log 1793788759: GPE 0x01/0x04 = GEVENT1/GEVENT4 per SciMap, set after every wake, never
+// armed by ACPI).
+static IOMemoryMap *fchGpioMap;
+
+static void fchGpioLog(const char *when, bool enables) {
+	if (!fchGpioMap)
+		return;
+	auto *gpio = reinterpret_cast<volatile uint32_t *>(fchGpioMap->getVirtualAddress());
+	char line[600];
+	int len = snprintf(line, sizeof(line), "FCH GPIO %s:", when);
+	for (uint32_t pin = 0; pin < 192 && len > 0 && static_cast<size_t>(len) < sizeof(line); pin++) {
+		uint32_t v = gpio[pin];
+		if (v == ~0U)
+			continue;
+		bool show = enables ? (v & 0xE000) != 0 : (v & 0x30000000) != 0;
+		if (show)
+			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %u:%08x", pin, v);
+	}
+	diskLogEvent("%s (%s)", line, enables ? "pins with a wake enable, bits 13-15 S0i3/S3/S4" :
+		"pins with bit 28 interrupt / 29 wake status");
+}
 // Also the FCH's xHCI (1022:7914) PMCSR and the ACPI wake status (log 1793722377: with SSDT-FCHSLEEP EHC1 stays quiet,
 // but the machine still wakes 0.13 s after S3 with "Wake reason: ?"): PM1a status/enable and GPE0 status/enable from
 // the FADT's I/O blocks, read before AppleACPIPlatform's wake handling clears them.
@@ -2376,6 +2399,12 @@ static void ehciFind() {
 			fchSmiMap = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache);
 			mem->release();
 		}
+	if (!fchGpioMap)
+		if (auto *mem = IOMemoryDescriptor::withPhysicalAddress(0xFED81500, 0x300, kIODirectionInOut)) {
+			fchGpioMap = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache);
+			mem->release();
+		}
+	fchGpioLog("wake enables", true);
 	if (fchSmiMap) {
 		// Event sources (SciMap index) per GPE, for every GPE that has one.
 		auto *smi = reinterpret_cast<volatile uint8_t *>(fchSmiMap->getVirtualAddress());
@@ -2424,6 +2453,7 @@ static void ehciSnapshot(const char *when, bool clearPme) {
 		diskLogEvent("FCH %s: EventStatus %08x EventEnable %08x SciTrig %08x SciLevl %08x SmiSciStatus %08x SmiSciEn %08x",
 			when, smi[0], smi[1], smi[2], smi[3], smi[4], smi[5]);
 	}
+	fchGpioLog(when, false);
 }
 
 static void wrapAcpiSleepKernel(void *func, void *refcon) {
@@ -2564,19 +2594,42 @@ static void patchCapsCheckpoints(KernelPatcher &patcher, mach_vm_address_t func)
 // the devices allowed to wake the machine, mostly keyboards and mice. This does the same at the last moment, where
 // pal_machine_sleep runs (after AcpiHwLegacySleep has armed ACPICA's wake GPEs, right before SLP_TYP/SLP_EN): GPE0
 // enables are cut down to the GPEs of the USB controllers (PCI class 0C03, from each one's _PRW, collected at "will
-// sleep"), every GPE0 status bit is cleared, and PCIe WAKE# is disabled (PM1 enable PCIEXP_WAKE_DIS). The power
-// button and the RTC (scheduled maintenance wakes) are PM1 fixed events and stay. Without any USB GPE found, nothing
+// sleep"; also the lid and an ACPI power button device, see wakeFilterPrepare), every GPE0 status bit is cleared, and
+// PCIe WAKE# is disabled (PM1 enable PCIEXP_WAKE_DIS). The fixed power button and the RTC (scheduled maintenance
+// wakes) are PM1 fixed events and stay. Without any USB GPE found, nothing
 // is filtered, so a machine is never left without a wake source. pal_machine_sleep jumps here (patchSleepFlush), so
 // the cache flush happens here too.
 static bool wakeFilterOn;
 static uint8_t wakeAllow[32], wakeEnBefore[32], wakeEnAfter[32];
 static uint32_t wakeAllowGpes, wakeFiltered;
 static uint16_t wakePm1Before;
-static char wakeAllowList[64];
+static char wakeAllowList[160];
 
 static uint8_t portIn8(uint16_t port);
 static void portOut8(uint16_t port, uint8_t v);
 
+// One device's _PRW GPE into the allow list; tag names it in the log.
+static void wakeAllowPrw(IOACPIPlatformDevice *acpi, const char *tag, int &len) {
+	OSObject *prw = nullptr;
+	if (!acpi || acpi->evaluateObject("_PRW", &prw) != kIOReturnSuccess || !prw)
+		return;
+	auto *pkg = OSDynamicCast(OSArray, prw);
+	auto *num = pkg ? OSDynamicCast(OSNumber, pkg->getObject(0)) : nullptr;
+	uint32_t gpe = num ? num->unsigned32BitValue() : ~0U;
+	if (gpe < acpiGpe0Half * 8U && gpe < sizeof(wakeAllow) * 8) {
+		if (!wakeAllowGpes)
+			len = 0;
+		wakeAllow[gpe / 8] |= static_cast<uint8_t>(1U << (gpe % 8));
+		wakeAllowGpes++;
+		if (len >= 0 && static_cast<size_t>(len) < sizeof(wakeAllowList))
+			len += snprintf(wakeAllowList + len, sizeof(wakeAllowList) - static_cast<size_t>(len), "%s%x (%s)",
+				wakeAllowGpes > 1 ? ", " : "", gpe, tag);
+	}
+	prw->release();
+}
+
+// The allow list: the USB controllers (PCI class 0C03: keyboards and mice), the lid (PNP0C0D: opening a laptop) and
+// an ACPI power button device (PNP0C0C), each by its own _PRW.
 static void wakeFilterPrepare() {
 	if (!wakeFilterOn)
 		return;
@@ -2588,28 +2641,21 @@ static void wakeFilterPrepare() {
 	while (auto *pci = iter ? OSDynamicCast(IOPCIDevice, iter->getNextObject()) : nullptr) {
 		if (pci->configRead8(kIOPCIConfigClassCode + 2) != 0x0C || pci->configRead8(kIOPCIConfigClassCode + 1) != 0x03)
 			continue;
-		auto *acpi = OSDynamicCast(IOACPIPlatformDevice, pci->getProperty("acpi-device"));
-		OSObject *prw = nullptr;
-		if (!acpi || acpi->evaluateObject("_PRW", &prw) != kIOReturnSuccess || !prw)
-			continue;
-		auto *pkg = OSDynamicCast(OSArray, prw);
-		auto *num = pkg ? OSDynamicCast(OSNumber, pkg->getObject(0)) : nullptr;
-		uint32_t gpe = num ? num->unsigned32BitValue() : ~0U;
-		if (gpe < acpiGpe0Half * 8U && gpe < sizeof(wakeAllow) * 8) {
-			if (!wakeAllowGpes)
-				len = 0;
-			wakeAllow[gpe / 8] |= static_cast<uint8_t>(1U << (gpe % 8));
-			wakeAllowGpes++;
-			if (len >= 0 && static_cast<size_t>(len) < sizeof(wakeAllowList))
-				len += snprintf(wakeAllowList + len, sizeof(wakeAllowList) - static_cast<size_t>(len), "%s%x (%04x:%04x)",
-					wakeAllowGpes > 1 ? ", " : "", gpe, pci->configRead16(kIOPCIConfigVendorID),
-					pci->configRead16(kIOPCIConfigDeviceID));
-		}
-		prw->release();
+		char tag[12];
+		snprintf(tag, sizeof(tag), "%04x:%04x", pci->configRead16(kIOPCIConfigVendorID), pci->configRead16(kIOPCIConfigDeviceID));
+		wakeAllowPrw(OSDynamicCast(IOACPIPlatformDevice, pci->getProperty("acpi-device")), tag, len);
 	}
 	if (iter)
 		iter->release();
-	diskLogEvent("wake filter: USB wake GPEs allowed: %s; GPE0 %x, PM1a_EVT %x", wakeAllowList, acpiGpe0, acpiPm1Evt);
+	static const char *const ids[] {"PNP0C0D", "PNP0C0C"};
+	for (auto *id : ids) {
+		auto *devices = IOService::getMatchingServices(IOService::nameMatching(id));
+		while (auto *dev = devices ? OSDynamicCast(IOACPIPlatformDevice, devices->getNextObject()) : nullptr)
+			wakeAllowPrw(dev, id, len);
+		if (devices)
+			devices->release();
+	}
+	diskLogEvent("wake filter: wake GPEs allowed: %s; GPE0 %x, PM1a_EVT %x", wakeAllowList, acpiGpe0, acpiPm1Evt);
 }
 
 // pal_machine_sleep(type_a, type_b, bit_position, disable_mask, enable_mask) jumps here; it returns 0 (sleep the usual
