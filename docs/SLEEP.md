@@ -289,6 +289,18 @@ Next, cheapest first:
    on after the key press: the firmware reached macOS, and the hang is in the trampoline, `acpi_wake_prot` or the
    start of `acpi_sleep_kernel`'s resume. No LED: the firmware's S3 resume never hands over. Three short blinks going
    to sleep instead of one long one: the trampoline didn't start as expected and wasn't patched.
+   **Result (2026-11-03, Monterey): the LED comes on after the key press and stays on.** The firmware's S3 resume
+   works and hands over to macOS; the hang is between the trampoline and the end of `acpi_sleep_kernel`: the switch
+   to 64-bit mode (`acpi_wake_prot`), the CPU state restore (`acpi_wake_prot_entry`), then `acpi_sleep_kernel`'s resume
+   steps (`rtc_nanotime_init`, `x86_64_post_sleep`, `cpu_syscall_init`, `mca_cpu_init`, `mtrr_update_cpu`,
+   `ucode_update_wake_and_apply_cpu_was`, `pat_init`, `vmx_resume`, `lapic_configure`, `rtc_decrementer_configure`,
+   `init_fpu`, `IOCPURunPlatformActiveActions`, `pmCPUMarkRunning`, `pmTimerRestore`, `rtc_timer_start`,
+   `install_real_mode_bootstrap`). Code identical to Big Sur's, so the cause is in what it runs on: page tables,
+   descriptor tables and MSRs it restores, or a patch or hook in that path.
+   Third version: checkpoints. The calls `acpi_sleep_kernel` makes after `acpi_sleep_cpu` to those steps go through
+   thunks (call sites redirected; no Lilu trampolines, most of the functions start RIP-relative) that flash the LED off
+   and on (0.25 s each, timed by the TSC) and jump on. The disk log's "Caps Lock checkpoints" line at boot maps flash
+   numbers to steps. No flash: the hang is in `acpi_wake_prot`/`acpi_wake_prot_entry`.
 2. **Hibernation restore:** `HibernateMode` `NVRAM` in the test EFI, `hibernatemode 25`, power on. If the session
    comes back, macOS's side of the wake works and the firmware's S3 resume is the problem.
 

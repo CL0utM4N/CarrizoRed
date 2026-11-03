@@ -2062,14 +2062,125 @@ static void wrapAcpiSleepKernel(void *func, void *refcon) {
 		capsLed(false);
 		spinMs(300);
 	}
+	capsArmed = true;
 	FunctionCast(wrapAcpiSleepKernel, orgAcpiSleepKernel)(func, refcon);
+	capsArmed = false;
 	capsLed(true);
 	spinMs(3000);
+}
+
+// Checkpoints through acpi_sleep_kernel's resume (2026-11-03: the LED comes on in the trampoline and stays on, so the
+// hang is between there and acpi_sleep_kernel's return). The calls it makes after acpi_sleep_cpu (where the firmware's
+// return lands) to the kernel's resume steps are redirected to thunks: each saves the registers, flashes the LED (off
+// 0.25 s, on 0.25 s, timed by the TSC: mach_absolute_time isn't rebased yet) and jumps on to the real function. No
+// Lilu trampolines (most of these functions start with RIP-relative instructions). Count the flashes after the key
+// press; the disk log's "Caps Lock checkpoints" line at boot says which step each one is. Only while armed (from
+// acpi_sleep_kernel's start to its return), so other callers are untouched.
+static constexpr uint32_t CapsMaxCheckpoints = 24;
+extern "C" mach_vm_address_t capsTargets[CapsMaxCheckpoints];
+mach_vm_address_t capsTargets[CapsMaxCheckpoints];
+static volatile bool capsArmed;
+static uint64_t capsTscPerMs;
+
+static void spinTscMs(uint64_t ms) {
+	uint64_t end = readTsc() + ms * capsTscPerMs;
+	while (readTsc() < end)
+		__builtin_ia32_pause();
+}
+
+extern "C" void capsCheckpoint(uint32_t) {
+	if (!capsArmed)
+		return;
+	capsLed(false);
+	spinTscMs(250);
+	capsLed(true);
+	spinTscMs(250);
+}
+
+// Entered by call (or a tail jmp) with rsp = 8 mod 16: ten pushes, 8 more, and the call is aligned.
+#define CAPS_THUNK(n)                                                                                                 \
+	extern "C" __attribute__((naked)) void capsThunk##n() {                                                           \
+		asm volatile("push %rax\n push %rcx\n push %rdx\n push %rsi\n push %rdi\n push %r8\n push %r9\n push %r10\n" \
+					 "push %r11\n pushfq\n sub $8, %rsp\n mov $" #n ", %edi\n call _capsCheckpoint\n add $8, %rsp\n"  \
+					 "popfq\n pop %r11\n pop %r10\n pop %r9\n pop %r8\n pop %rdi\n pop %rsi\n pop %rdx\n pop %rcx\n"   \
+					 "pop %rax\n jmp *_capsTargets+" #n "*8(%rip)\n");                                               \
+	}
+CAPS_THUNK(0) CAPS_THUNK(1) CAPS_THUNK(2) CAPS_THUNK(3) CAPS_THUNK(4) CAPS_THUNK(5) CAPS_THUNK(6) CAPS_THUNK(7)
+CAPS_THUNK(8) CAPS_THUNK(9) CAPS_THUNK(10) CAPS_THUNK(11) CAPS_THUNK(12) CAPS_THUNK(13) CAPS_THUNK(14) CAPS_THUNK(15)
+CAPS_THUNK(16) CAPS_THUNK(17) CAPS_THUNK(18) CAPS_THUNK(19) CAPS_THUNK(20) CAPS_THUNK(21) CAPS_THUNK(22) CAPS_THUNK(23)
+static void (*const capsThunks[CapsMaxCheckpoints])() {capsThunk0, capsThunk1, capsThunk2, capsThunk3, capsThunk4,
+	capsThunk5, capsThunk6, capsThunk7, capsThunk8, capsThunk9, capsThunk10, capsThunk11, capsThunk12, capsThunk13,
+	capsThunk14, capsThunk15, capsThunk16, capsThunk17, capsThunk18, capsThunk19, capsThunk20, capsThunk21, capsThunk22,
+	capsThunk23};
+
+static void patchCapsCheckpoints(KernelPatcher &patcher, mach_vm_address_t func) {
+	// The steps acpi_sleep_kernel calls after acpi_sleep_cpu, unconditionally (mach_absolute_time: its first call only,
+	// acpi_wake_abstime, i.e. back from the firmware and acpi_wake_prot).
+	static const char *const steps[] {"_mach_absolute_time", "_rtc_nanotime_init", "_x86_64_post_sleep",
+		"_cpu_syscall_init", "_mca_cpu_init", "_mtrr_update_cpu", "_ucode_update_wake_and_apply_cpu_was", "_pat_init",
+		"_vmx_resume", "_pmMarkAllCPUsOff", "_lapic_probe", "_lapic_configure", "_rtc_decrementer_configure", "_init_fpu",
+		"_IOCPURunPlatformActiveActions", "_pmCPUMarkRunning", "_pmTimerRestore", "_rtc_timer_start"};
+	mach_vm_address_t addr[arrsize(steps)] {};
+	for (size_t i = 0; i < arrsize(steps); i++)
+		addr[i] = patcher.solveSymbol(KernelPatcher::KernelID, steps[i]);
+	auto sleepCpu = patcher.solveSymbol(KernelPatcher::KernelID, "_acpi_sleep_cpu");
+	patcher.clearError();
+	if (!sleepCpu)
+		return;
+	char line[600];
+	int len = snprintf(line, sizeof(line), "Caps Lock checkpoints after the firmware (flash: step):");
+	uint32_t count = 0;
+	bool afterSleepCpu = false, sawClock = false;
+	for (size_t at = 0; at < 0x800 && count < CapsMaxCheckpoints;) {
+		hde64s hs {};
+		size_t n = Disassembler::hdeDisasm(func + at, &hs);
+		if (!n || (hs.flags & F_ERROR) || hs.opcode == 0xCC)
+			break;
+		if (hs.opcode == 0x0F && hs.opcode2 == 0x09)  // wbinvd: the inlined install_real_mode_bootstrap, the end
+			break;
+		if (hs.opcode == 0xE8 || (hs.opcode == 0xE9 && afterSleepCpu)) {
+			mach_vm_address_t target = func + at + n + static_cast<int32_t>(hs.imm.imm32);
+			if (target == sleepCpu) {
+				afterSleepCpu = true;
+			} else if (afterSleepCpu) {
+				for (size_t i = 0; i < arrsize(steps); i++) {
+					if (target != addr[i] || (i == 0 && sawClock))
+						continue;
+					sawClock |= i == 0;
+					auto thunk = reinterpret_cast<mach_vm_address_t>(capsThunks[count]);
+					int64_t rel = static_cast<int64_t>(thunk) - static_cast<int64_t>(func + at + n);
+					if (rel != static_cast<int32_t>(rel))
+						break;
+					capsTargets[count] = target;
+					auto rel32 = static_cast<int32_t>(rel);
+					if (MachInfo::setKernelWriting(true, nullptr) != KERN_SUCCESS)
+						return;
+					memcpy(reinterpret_cast<void *>(func + at + 1), &rel32, sizeof(rel32));
+					MachInfo::setKernelWriting(false, nullptr);
+					count++;
+					if (len > 0 && static_cast<size_t>(len) < sizeof(line))
+						len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %u %s", count, steps[i] + 1);
+					break;
+				}
+			}
+		}
+		at += n;
+	}
+	diskLogEvent("%s", line);
+	SYSLOG("cr", "%s", line);
 }
 
 static void hookCapsProbe(KernelPatcher &patcher) {
 	if (!capsProbe)
 		return;
+	uint64_t t0 = readTsc(), m0 = mach_absolute_time();
+	while (mach_absolute_time() - m0 < 20000000)
+		__builtin_ia32_pause();
+	capsTscPerMs = (readTsc() - t0) / 20;
+	// Before the route below, which overwrites the function's first bytes.
+	if (auto func = patcher.solveSymbol(KernelPatcher::KernelID, "_acpi_sleep_kernel"))
+		patchCapsCheckpoints(patcher, func);
+	patcher.clearError();
 	KernelPatcher::RouteRequest request {"_acpi_sleep_kernel", wrapAcpiSleepKernel, orgAcpiSleepKernel};
 	if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &request, 1)) {
 		SYSLOG("cr", "Caps Lock probe: failed to hook acpi_sleep_kernel (error %d)", patcher.getError());
