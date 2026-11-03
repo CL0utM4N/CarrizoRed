@@ -136,9 +136,11 @@ Each fix is documented in the code, in [docs/TEST_MACHINES.md](docs/TEST_MACHINE
 | Stoney Ridge | A9-9410/9420/9425, A6-9220/9225, A4-9120, E2-9000/9010 | 1002:98E4 | gfx810 | DCE 11.0, 2 pipes | Display and Metal working (A9-9410, A9-9425, A6-9220, A6-9225, E2-9010) |
 | Carrizo / Bristol Ridge | A12-9800, A10-9700, FX-9800P, A10-8700P, FX-8800P | 1002:9870, 9874–9877 | gfx801 | DCE 11.0, 3 pipes | Untested |
 
-Older GCN 2 APUs (Kaveri, Kabini, Beema/Mullins) may follow later. Sequoia still contains AMD's init code and
-complete GPU firmware for them, but no display or GCN 2 accelerator driver; see
-[docs/OLDER_APUS.md](docs/OLDER_APUS.md).
+Older GCN 2 APUs (Kaveri, Kabini, Beema/Mullins) are planned, in this kext and the same way: Apple's Polaris drivers
+adapted with Lilu, without OpenCore Legacy Patcher or changes to the system. Every macOS release since Monterey still
+has AMD's init code and firmware for these chips and a GFX7 shader compiler. Most of the display and accelerator
+registers are at the same offsets as on Polaris. Nothing is implemented yet; the first step is a test machine that
+boots macOS. See [docs/OLDER_APUS.md](docs/OLDER_APUS.md).
 
 **macOS:** Catalina through Sequoia work (see *macOS versions* above); Tahoe works with glitches and isn't recommended yet
 with 512 MB of graphics memory.
@@ -368,7 +370,7 @@ docs/
   APPLE_KEXTS.md           Getting Apple's AMD kexts from a KDK on Windows, and what's inside them
   CARRIZO_VS_POLARIS.md    Where Linux amdgpu treats Carrizo differently from Polaris
   DCE11_REGISTER_DIFF.md   DCE 11.0 vs 11.2 display register diff (full data in docs/data/)
-  OLDER_APUS.md            What Sequoia still has for GCN 2 APUs (Kaveri, Kabini, Mullins)
+  OLDER_APUS.md            GCN 2 APUs (Kaveri, Kabini, Mullins): the plan and the measurements behind it
   PHASE0.md                Hardware / environment / reverse-engineering checklist
   opencore/                SSDTs and the USB map for the D509BA
 scripts/

@@ -25,4 +25,6 @@ Updated 2026-11-03.
 ## Later
 - Carrizo / Bristol Ridge testing (code paths written, no hardware)
 - External displays (HDMI), HDMI audio
-- GCN 2 APUs ([OLDER_APUS.md](OLDER_APUS.md))
+- GCN 2 APUs (Kaveri, Kabini, Mullins) in CarrizoRed, pure Lilu on the Polaris drivers ([OLDER_APUS.md](OLDER_APUS.md),
+  *Plan*): a test machine that boots macOS first (Kabini's boot freeze, or a Kaveri desktop), then detection, DCE 8
+  register remap, accelerator remaps, Metal's CI path
