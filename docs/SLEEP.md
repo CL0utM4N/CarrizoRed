@@ -11,7 +11,7 @@ where to pick it up.
 | ASUS VivoBook 15 D509BA | Big Sur 11.7 | **Works** (2026-11-02), slow: ~26 s of GPU power-up (see *Also open*) |
 | ASUS VivoBook 15 D509BA | Monterey 12.7 | **Works** (2026-11-03, cache flush before S3): back 27 s after the CPU resumes, 20 s of it the GPU power-up (see *Also open*) |
 | ASUS VivoBook 15 D509BA | Lid close | **Doesn't sleep:** macOS sees the machine in desktop mode (see *Open: lid*) |
-| Dell Inspiron 3475 (A6-9225) | Tahoe | **Sleeps and wakes** with the cache flush (2026-11-03, `CarrizoRed-1793707503.log`), but EHC1 wakes it at once into a dark wake, every sleep, like the ASUS before `SSDT-GPRW`. Its DSDT has the same `GPRW(0x18, …)` for EHC1 (XHC0, with the keyboard and mouse, is 0x19), so the ASUS `SSDT-GPRW` and rename went into its Tahoe EFI; untested |
+| Dell Inspiron 3475 (A6-9225) | Tahoe | **Sleeps and wakes** with the cache flush (2026-11-03, `CarrizoRed-1793707503.log`), but EHC1 wakes it at once into a dark wake, every sleep, like the ASUS before `SSDT-GPRW`. Its DSDT has the same `GPRW(0x18, …)` for EHC1 (XHC0, with the keyboard and mouse, is 0x19), but on the Dell EHC1's root port 1 is an internal USB 2.0 hub (GHUB) feeding external USB 2.0 ports. The ASUS `SSDT-GPRW` stopped the instant wakes, and the USB 2.0 ports stopped working (macOS keeps the idle EHCI controller suspended and needs GPE 0x18 to see a plug-in), so it was taken out again. Next: find which port event fires the wake |
 | Other machines, Big Sur–Ventura, Sequoia | | Untested |
 
 The display-side fix is the same code on every macOS version and machine; it follows what Linux's DC driver does at
