@@ -1970,6 +1970,7 @@ static void hookTscSync(KernelPatcher &patcher) {
 //  - when IOCPUSleepKernel returns (the other CPUs started and the platform wake actions run): off.
 // Never on after the key press: the firmware's resume or the start of the kernel's. On and staying on: stuck between.
 static mach_vm_address_t orgAcpiSleepKernel;
+static volatile bool capsArmed;  // acpi_sleep_kernel running: the checkpoints flash
 
 static uint8_t portIn8(uint16_t port) {
 	uint8_t v;
@@ -2079,7 +2080,6 @@ static void wrapAcpiSleepKernel(void *func, void *refcon) {
 static constexpr uint32_t CapsMaxCheckpoints = 24;
 extern "C" mach_vm_address_t capsTargets[CapsMaxCheckpoints];
 mach_vm_address_t capsTargets[CapsMaxCheckpoints];
-static volatile bool capsArmed;
 static uint64_t capsTscPerMs;
 
 static void spinTscMs(uint64_t ms) {
@@ -2139,7 +2139,8 @@ static void patchCapsCheckpoints(KernelPatcher &patcher, mach_vm_address_t func)
 		if (hs.opcode == 0x0F && hs.opcode2 == 0x09)  // wbinvd: the inlined install_real_mode_bootstrap, the end
 			break;
 		if (hs.opcode == 0xE8 || (hs.opcode == 0xE9 && afterSleepCpu)) {
-			mach_vm_address_t target = func + at + n + static_cast<int32_t>(hs.imm.imm32);
+			auto target = static_cast<mach_vm_address_t>(static_cast<int64_t>(func + at + n) +
+				static_cast<int32_t>(hs.imm.imm32));
 			if (target == sleepCpu) {
 				afterSleepCpu = true;
 			} else if (afterSleepCpu) {
