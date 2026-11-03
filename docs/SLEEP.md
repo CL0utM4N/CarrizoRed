@@ -1,14 +1,15 @@
 # Sleep and wake
 
-Status 2026-11-03. Sleep works on Catalina and Big Sur; Monterey 12.3+ and Sonoma hang on wake (*Open: Monterey and
-Sonoma*). This page is where to pick it up.
+Status 2026-11-03. Sleep works on Catalina, Big Sur and **Monterey 12.7** (fixed: macOS didn't flush the CPU caches
+before S3, see *The fix: cache flush before S3*). Sonoma hung the same way as Monterey and is next to test. This page is
+where to pick it up.
 
 | Machine | macOS | Result |
 |---|---|---|
 | ASUS VivoBook 15 D509BA (A9-9425) | Catalina 10.15.7 | **Works:** sleeps (fans off), wakes on a key press with a clean picture. Needs `SSDT-GPRW` (below) |
-| ASUS VivoBook 15 D509BA | Sonoma 14 | **Wake hangs:** the machine sleeps; a key press only starts the fans, with no picture, no panic and nothing logged after the sleep (see *Open: Monterey and Sonoma*) |
+| ASUS VivoBook 15 D509BA | Sonoma 14 | **Wake hung** like Monterey (no picture, no panic); retest with the cache flush (see *Open: Monterey and Sonoma*) |
 | ASUS VivoBook 15 D509BA | Big Sur 11.7 | **Works** (2026-11-02), slow: ~26 s of GPU power-up (see *Also open*) |
-| ASUS VivoBook 15 D509BA | Monterey 12.7 | **Wake hangs** like Sonoma, no Caps Lock LED; also with `cpus=1`, without the Monterey-only patches, with `-crnoaccel` and with `-crtscsync` (see *Open: Monterey and Sonoma*) |
+| ASUS VivoBook 15 D509BA | Monterey 12.7 | **Works** (2026-11-03, cache flush before S3): back 27 s after the CPU resumes, 20 s of it the GPU power-up (see *Also open*) |
 | ASUS VivoBook 15 D509BA | Lid close | **Doesn't sleep:** macOS sees the machine in desktop mode (see *Open: lid*) |
 | Dell Inspiron 3475, other machines, Big Sur–Ventura, Sequoia | | Untested |
 
@@ -77,7 +78,31 @@ It needs the OpenCore ACPI patch renaming only the method **definition** `GPRW` 
 in the D509BA's EFI folder (CarrizoRed-RE). Other machines need their own check (`pmset -g log`, look for the wake
 reason).
 
-## Open: Monterey and Sonoma wake hang
+## The fix: cache flush before S3
+
+The ACPI specification has the OS write back and invalidate the CPU caches before it sets SLP_EN, and ACPICA's
+`AcpiHwLegacySleep` does so (`ACPI_FLUSH_CPU_CACHE`). Apple's port calls `pal_machine_sleep` at that point instead,
+which on a Mac returns 0 and does nothing else, in every version: Intel hardware flushes on S3 entry by itself. The last
+`wbinvd` before S3 is in `install_real_mode_bootstrap`, before `acpi_sleep_cpu` saves the CPU state. On this AMD APU
+whatever is still only in cache at S3 is lost, the saved CR3, GDT, IDT and stack included, and the wake then dies in
+`acpi_wake_prot`/`Lwake_64` before any driver runs: fans on, no picture, no panic, no Caps Lock. Whether those lines
+reached memory by chance follows each version's memory layout, which is why Catalina and Big Sur woke and Monterey and
+Sonoma didn't.
+
+CarrizoRed turns `pal_machine_sleep`'s 8 bytes into `wbinvd; xor eax, eax; ret` (`patchSleepFlush`). Nothing in the
+kernel calls it; Apple's ACPI driver calls it once, right before writing SLP_TYP and SLP_EN. On by default;
+`-crnosleepflush` turns it off.
+
+Found with the Caps Lock probe (`-crcapsprobe`, below): the trampoline turned the LED on (the firmware hands back),
+no checkpoint in `acpi_sleep_kernel` flashed, and the memory-check build, whose callback happened to run a `wbinvd`
+right before S3, got through the whole resume. Monterey 12.7 with the fix (`CarrizoRed-1746689635.log`): will sleep
+99 s, CPU resumed 126.3 s, GPU power-up 131.0 to 151.3 s, has powered on 153.3 s.
+
+The one wake before that (nvram10, the memory-check build) was cut short by CarrizoRed's 45 s wake watchdog while the
+GPU was still powering up, because the SMU microcode reload timed out (11.6 s) that time. On the fixed wake it took
+31 ms. Still to do: a watchdog that waits while the power-up is making progress, and why the reload can time out.
+
+## Open: Monterey and Sonoma wake hang (solved for Monterey: the cache flush above)
 
 First seen on the D509BA, Sonoma, same EFI and kext as the working Catalina:
 - the disk log ends while macOS writes its sleep image (hibernatemode 3, `sleep params v2, type 2`);
@@ -329,6 +354,13 @@ Next, cheapest first:
    **Fix (default, `-crnosleepflush` turns it off):** `pal_machine_sleep`'s 8 bytes become `wbinvd; xor eax, eax;
    ret`; nothing in the kernel calls it, Apple's ACPI driver calls it once, right before writing SLP_TYP/SLP_EN. The
    memory check is now opt-in (`-crwakememcheck`). Still open: the wake stops after `IOCPUSleepKernel`.
+   **That wake (nvram10, the memory-check build): CarrizoRed's wake watchdog panicked, "wake stuck 45 s after
+   kIOMessageSystemWillPowerOn: system never powered on, watcher ticks 83".** So the kernel was fully back and
+   running (the watcher ticked), the drivers had "will power on", and the GPU was in its power-up: the SMU microcode
+   reload timed out after 11.6 s (`resp b0033 b0034 b0252 b0254...`), one CAIL wait failed (`[ec05]&1!=0`), then
+   `pm4.initializeMicroEngine` took 7.8 s. Big Sur's whole wake took about a minute, so the 45 s watchdog cut a slow
+   wake short. Next: the flush build with `-crnowakepanic`, waiting ~2 minutes; then the watchdog needs to allow for
+   a GPU power-up that is still making progress, and the SMU reload timeout needs a look.
 2. **Hibernation restore:** `HibernateMode` `NVRAM` in the test EFI, `hibernatemode 25`, power on. If the session
    comes back, macOS's side of the wake works and the firmware's S3 resume is the problem.
 
