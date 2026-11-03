@@ -2268,6 +2268,11 @@ static bool ehciDiag, ehciPmeClear, ehciFound;
 static uint32_t ehciCf8;  // 0x80000000 | bus << 16 | device << 11 | function << 8
 static uint8_t ehciPm;
 static IOMemoryMap *ehciMap;
+// The FCH's SMI/SCI block (ACPI MMIO 0xFED80000 + 0x200): EventStatus 0x00, EventEnable 0x04, SciTrig 0x08, SciLevl
+// 0x0C, SmiSciStatus 0x10, SmiSciEn 0x14, SciMap 0x40-0x7F (one byte per event source: the GPE it raises). The Dell
+// wakes with nothing armed set and GPE 0x01/0x04 status set every time (log 1793787216, wake filter on): which
+// sources do those GPEs carry? Mapped at "will sleep", read with the ACPI snapshot.
+static IOMemoryMap *fchSmiMap;
 // Also the FCH's xHCI (1022:7914) PMCSR and the ACPI wake status (log 1793722377: with SSDT-FCHSLEEP EHC1 stays quiet,
 // but the machine still wakes 0.13 s after S3 with "Wake reason: ?"): PM1a status/enable and GPE0 status/enable from
 // the FADT's I/O blocks, read before AppleACPIPlatform's wake handling clears them.
@@ -2366,6 +2371,29 @@ static void ehciFind() {
 		iter->release();
 	diskLogEvent("EHC1: config %x, PM capability %x, BAR0 %s; xHCI config %x PM %x; PM1a_EVT %x, GPE0 %x (+%x)", ehciCf8,
 		ehciPm, ehciMap ? "mapped" : "not mapped", xhciCf8, xhciPm, acpiPm1Evt, acpiGpe0, acpiGpe0Half);
+	if (!fchSmiMap)
+		if (auto *mem = IOMemoryDescriptor::withPhysicalAddress(0xFED80200, 0x100, kIODirectionInOut)) {
+			fchSmiMap = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache);
+			mem->release();
+		}
+	if (fchSmiMap) {
+		// Event sources (SciMap index) per GPE, for every GPE that has one.
+		auto *smi = reinterpret_cast<volatile uint8_t *>(fchSmiMap->getVirtualAddress());
+		char line[400];
+		int len = snprintf(line, sizeof(line), "FCH SciMap (GPE <- sources):");
+		for (uint8_t gpe = 0; gpe < 32; gpe++) {
+			bool any = false;
+			for (uint8_t src = 0; src < 64; src++) {
+				if ((smi[0x40 + src] & 0x1F) != gpe)
+					continue;
+				if (len > 0 && static_cast<size_t>(len) < sizeof(line))
+					len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), any ? ",%u" : " %x<-%u", any ? src : gpe,
+						src);
+				any = true;
+			}
+		}
+		diskLogEvent("%s", line);
+	}
 }
 
 static void ehciSnapshot(const char *when, bool clearPme) {
@@ -2391,6 +2419,11 @@ static void ehciSnapshot(const char *when, bool clearPme) {
 		acpiPm1Evt ? portIn16(acpiPm1Evt) : 0xFFFF, acpiPm1Evt ? portIn16(static_cast<uint16_t>(acpiPm1Evt + 2)) : 0xFFFF,
 		acpiGpe0 ? portIn32(acpiGpe0) : ~0U, acpiGpe0 ? portIn32(static_cast<uint16_t>(acpiGpe0 + acpiGpe0Half)) : ~0U,
 		xhciPm ? cf8Read16(xhciCf8, static_cast<uint8_t>(xhciPm + 4)) : 0xFFFF);
+	if (fchSmiMap) {
+		auto *smi = reinterpret_cast<volatile uint32_t *>(fchSmiMap->getVirtualAddress());
+		diskLogEvent("FCH %s: EventStatus %08x EventEnable %08x SciTrig %08x SciLevl %08x SmiSciStatus %08x SmiSciEn %08x",
+			when, smi[0], smi[1], smi[2], smi[3], smi[4], smi[5]);
+	}
 }
 
 static void wrapAcpiSleepKernel(void *func, void *refcon) {
