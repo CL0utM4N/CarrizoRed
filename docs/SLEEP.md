@@ -317,6 +317,18 @@ Next, cheapest first:
    stack `Lwake_64` returns on (page tables without accessed/dirty bits). At wake, 0x2800 sends the trampoline to a
    32-bit stub at 0x2C80 that sums it all again before `acpi_wake_prot`: all equal, LED off and on to the 64-bit
    switch; a difference, the LED blinks the group number forever (short off-blinks, then 1 s on).
+   **Result (2026-11-03, Monterey): the LED went off (memory intact), then 11 flashes, the 3 s hold, and off: the
+   whole low-level resume ran, `IOCPUSleepKernel` included, for the first time.** What this build changed before S3:
+   the callback ran a `wbinvd` right before `AcpiEnterSleepState`. **Cause: no cache flush before S3.** ACPICA's
+   `AcpiHwLegacySleep` flushes the caches before SLP_EN (`ACPI_FLUSH_CPU_CACHE`, which the ACPI specification
+   requires); Apple's port calls `pal_machine_sleep` there instead, which on a Mac only returns 0 (Big Sur and
+   Monterey alike), and `AcpiHwLegacySleep`, `AcpiEnterSleepState` and `handleSleepKernelCallback` have no `wbinvd`.
+   The last `wbinvd` before S3 is `install_real_mode_bootstrap`'s in `sleepPlatform`, before `acpi_sleep_cpu` saves the
+   CPU state. Intel hardware flushes on S3 entry; on this AMD APU whatever is only in cache is lost, and the wake
+   depends on whether the saved state reached memory by chance, which follows the version's memory layout.
+   **Fix (default, `-crnosleepflush` turns it off):** `pal_machine_sleep`'s 8 bytes become `wbinvd; xor eax, eax;
+   ret`; nothing in the kernel calls it, Apple's ACPI driver calls it once, right before writing SLP_TYP/SLP_EN. The
+   memory check is now opt-in (`-crwakememcheck`). Still open: the wake stops after `IOCPUSleepKernel`.
 2. **Hibernation restore:** `HibernateMode` `NVRAM` in the test EFI, `hibernatemode 25`, power on. If the session
    comes back, macOS's side of the wake works and the firmware's S3 resume is the problem.
 

@@ -1216,6 +1216,7 @@ static IOReturn wrapMessageClient(IOService *that, UInt32 type, OSObject *client
 
 static void hookCpuSleep(KernelPatcher &patcher);
 static void hookTscSync(KernelPatcher &patcher);
+static void patchSleepFlush(KernelPatcher &patcher);
 
 static void hookPreemptionCheck(KernelPatcher &patcher) {
 	if (!checkKernelArgument("-crpreemptcheck"))
@@ -1311,6 +1312,7 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 	hookPreemptionCheck(patcher);
 	hookCpuSleep(patcher);
 	hookTscSync(patcher);
+	patchSleepFlush(patcher);
 
 	auto *devInfo = DeviceInfo::create();
 	if (!devInfo) {
@@ -2069,6 +2071,7 @@ static bool patchWakeTrampoline() {
 // can't be read by the 32-bit stub and is left out.
 static constexpr uint32_t WakeStub32 = 0xC80, WakeOrig = 0xE00, WakeTable = 0xE10, WakeMaxRegions = 24;
 static void (*capsOrgSleepFunc)(void *);
+static bool wakeMemCheck;  // -crwakememcheck, with -crcapsprobe
 static uint32_t wakeRegions;
 static uint8_t *wakePage;  // physmap pointer to physical 0x2000
 
@@ -2153,7 +2156,7 @@ static void capsSleepCallback(void *refcon) {
 	wakeRegionVirt(cr3, gdt.base, gdt.limit + 1U, 6, 5);
 	wakeRegionVirt(cr3, idt.base, idt.limit + 1U, 7, 5);
 	auto *desc = reinterpret_cast<const uint8_t *>(gdt.base + (tr & ~7U));
-	uint64_t tss = desc[2] | (desc[3] << 8) | (desc[4] << 16) | (static_cast<uint64_t>(desc[7]) << 24) |
+	uint64_t tss = static_cast<uint64_t>(desc[2] | (desc[3] << 8) | (desc[4] << 16)) | (static_cast<uint64_t>(desc[7]) << 24) |
 		(static_cast<uint64_t>(*reinterpret_cast<const uint32_t *>(desc + 8)) << 32);
 	wakeRegionVirt(cr3, tss, 104, 8, 5);
 	// From this frame up: the saved rbp and return address, then acpi_sleep_cpu's pushes, which Lwake_64 pops.
@@ -2245,7 +2248,7 @@ static bool buildWakeStub32() {
 static void wrapAcpiSleepKernel(void *func, void *refcon) {
 	// One 1 s blink, or three short ones when the trampoline wasn't patched.
 	bool patched = patchWakeTrampoline();
-	if (patched) {
+	if (patched && wakeMemCheck) {
 		wakePage = reinterpret_cast<uint8_t *>(*physmapBaseVar + 0x2000);
 		if (buildWakeStub32()) {
 			capsOrgSleepFunc = reinterpret_cast<void (*)(void *)>(func);
@@ -2365,6 +2368,34 @@ static void patchCapsCheckpoints(KernelPatcher &patcher, mach_vm_address_t func)
 	SYSLOG("cr", "%s", line);
 }
 
+// Cache flush before S3 (-crnosleepflush turns it off). The ACPI specification has the OS write back and invalidate
+// the CPU caches before setting SLP_EN, and ACPICA's AcpiHwLegacySleep does it there (ACPI_FLUSH_CPU_CACHE). Apple's
+// port calls pal_machine_sleep at that point instead, which on a Mac returns 0 and nothing else (pal_routines.c): Intel
+// hardware flushes on S3 entry itself, AMD's doesn't. Whatever is still only in cache is lost, the CPU state
+// acpi_sleep_cpu has just saved included, so the wake dies in acpi_wake_prot/Lwake_64 whenever those lines didn't
+// reach memory by chance (Monterey 12.7 on the D509BA every time, Big Sur never: 2026-11-03, the Caps Lock probe got
+// through the whole low-level resume once a wbinvd ran right before S3). Nothing in the kernel calls it; its 8 bytes
+// (push rbp; mov rbp, rsp; xor eax, eax; pop rbp; ret) become wbinvd; xor eax, eax; ret.
+static void patchSleepFlush(KernelPatcher &patcher) {
+	if (checkKernelArgument("-crnosleepflush"))
+		return;
+	auto func = patcher.solveSymbol(KernelPatcher::KernelID, "_pal_machine_sleep");
+	patcher.clearError();
+	static const uint8_t expect[] {0x55, 0x48, 0x89, 0xE5, 0x31, 0xC0, 0x5D, 0xC3};
+	static const uint8_t flush[] {0x0F, 0x09, 0x31, 0xC0, 0xC3};
+	if (!func || memcmp(reinterpret_cast<const void *>(func), expect, sizeof(expect))) {
+		SYSLOG("cr", "sleep flush: pal_machine_sleep %s", func ? "not as expected, left alone" : "not found");
+		return;
+	}
+	if (MachInfo::setKernelWriting(true, nullptr) != KERN_SUCCESS) {
+		SYSLOG("cr", "sleep flush: cannot write the kernel");
+		return;
+	}
+	memcpy(reinterpret_cast<void *>(func), flush, sizeof(flush));
+	MachInfo::setKernelWriting(false, nullptr);
+	DBGLOG("cr", "sleep flush: pal_machine_sleep now flushes the caches");
+}
+
 static void hookCapsProbe(KernelPatcher &patcher) {
 	if (!capsProbe)
 		return;
@@ -2372,6 +2403,7 @@ static void hookCapsProbe(KernelPatcher &patcher) {
 	while (mach_absolute_time() - m0 < 20000000)
 		__builtin_ia32_pause();
 	capsTscPerMs = (readTsc() - t0) / 20;
+	wakeMemCheck = checkKernelArgument("-crwakememcheck");
 	wakeProtEntry = patcher.solveSymbol(KernelPatcher::KernelID, "_acpi_wake_prot_entry");
 	wakeSaveArea = patcher.solveSymbol(KernelPatcher::KernelID, "_master_gdtr");
 	wakeBootPML4 = patcher.solveSymbol(KernelPatcher::KernelID, "_BootPML4");
