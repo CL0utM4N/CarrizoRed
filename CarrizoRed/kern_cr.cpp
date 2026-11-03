@@ -23,6 +23,7 @@
 #include <kern/debug.h>
 #include <kern/clock.h>
 #include <IOKit/IOMessage.h>
+#include <IOKit/IOPlatformExpert.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <pexpert/pexpert.h>
 #include <sys/fcntl.h>
