@@ -2262,6 +2262,31 @@ static bool ehciDiag, ehciPmeClear, ehciFound;
 static uint32_t ehciCf8;  // 0x80000000 | bus << 16 | device << 11 | function << 8
 static uint8_t ehciPm;
 static IOMemoryMap *ehciMap;
+// Also the FCH's xHCI (1022:7914) PMCSR and the ACPI wake status (log 1793722377: with SSDT-FCHSLEEP EHC1 stays quiet,
+// but the machine still wakes 0.13 s after S3 with "Wake reason: ?"): PM1a status/enable and GPE0 status/enable from
+// the FADT's I/O blocks, read before AppleACPIPlatform's wake handling clears them.
+static uint32_t xhciCf8;
+static uint8_t xhciPm;
+static uint16_t acpiPm1Evt, acpiGpe0, acpiGpe0Half;
+
+static uint16_t cf8Read16(uint32_t cf8, uint8_t reg) {
+	asm volatile("outl %0, %1" : : "a"(cf8 | (reg & 0xFCU)), "Nd"(static_cast<uint16_t>(0xCF8)));
+	uint16_t v;
+	asm volatile("inw %1, %0" : "=a"(v) : "Nd"(static_cast<uint16_t>(0xCFC + (reg & 2))));
+	return v;
+}
+
+static uint32_t portIn32(uint16_t port) {
+	uint32_t v;
+	asm volatile("inl %1, %0" : "=a"(v) : "Nd"(port));
+	return v;
+}
+
+static uint16_t portIn16(uint16_t port) {
+	uint16_t v;
+	asm volatile("inw %1, %0" : "=a"(v) : "Nd"(port));
+	return v;
+}
 
 static uint16_t ehciCfgRead16(uint8_t reg) {
 	asm volatile("outl %0, %1" : : "a"(ehciCf8 | (reg & 0xFCU)), "Nd"(static_cast<uint16_t>(0xCF8)));
@@ -2278,20 +2303,44 @@ static void ehciCfgWrite16(uint8_t reg, uint16_t v) {
 static void ehciFind() {
 	if (ehciFound || !(ehciDiag || ehciPmeClear))
 		return;
+	// The FADT's PM1a event block (0x38, length at 0x58) and GPE0 block (0x50, length at 0x5C), both I/O ports.
+	if (auto *platform = IOService::getPlatform()) {
+		auto *tables = OSDynamicCast(OSDictionary, platform->getProperty("ACPI Tables"));
+		auto *facp = tables ? OSDynamicCast(OSData, tables->getObject("FACP")) : nullptr;
+		if (facp && facp->getLength() >= 0x60) {
+			auto *f = static_cast<const uint8_t *>(facp->getBytesNoCopy());
+			uint32_t pm1, gpe0;
+			memcpy(&pm1, f + 0x38, 4);
+			memcpy(&gpe0, f + 0x50, 4);
+			if (pm1 && pm1 < 0x10000 && f[0x58] >= 4)
+				acpiPm1Evt = static_cast<uint16_t>(pm1);
+			if (gpe0 && gpe0 < 0x10000 && f[0x5C] >= 8) {
+				acpiGpe0 = static_cast<uint16_t>(gpe0);
+				acpiGpe0Half = f[0x5C] / 2;
+			}
+		}
+	}
 	auto *iter = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
 	while (auto *pci = iter ? OSDynamicCast(IOPCIDevice, iter->getNextObject()) : nullptr) {
-		if (pci->configRead32(0) != 0x79081022)
+		uint32_t id = pci->configRead32(0);
+		if (id == 0x79141022) {
+			xhciCf8 = 0x80000000U | (static_cast<uint32_t>(pci->getBusNumber()) << 16) |
+				(static_cast<uint32_t>(pci->getDeviceNumber()) << 11) | (static_cast<uint32_t>(pci->getFunctionNumber()) << 8);
+			pci->findPCICapability(kIOPCIPowerManagementCapability, &xhciPm);
+			continue;
+		}
+		if (id != 0x79081022 || ehciFound)
 			continue;
 		ehciCf8 = 0x80000000U | (static_cast<uint32_t>(pci->getBusNumber()) << 16) |
 			(static_cast<uint32_t>(pci->getDeviceNumber()) << 11) | (static_cast<uint32_t>(pci->getFunctionNumber()) << 8);
 		pci->findPCICapability(kIOPCIPowerManagementCapability, &ehciPm);  // returns the first dword, offset in &ehciPm
 		ehciMap = pci->mapDeviceMemoryWithIndex(0);
 		ehciFound = ehciPm != 0;
-		diskLogEvent("EHC1: config %x, PM capability %x, BAR0 %s", ehciCf8, ehciPm, ehciMap ? "mapped" : "not mapped");
-		break;
 	}
 	if (iter)
 		iter->release();
+	diskLogEvent("EHC1: config %x, PM capability %x, BAR0 %s; xHCI config %x PM %x; PM1a_EVT %x, GPE0 %x (+%x)", ehciCf8,
+		ehciPm, ehciMap ? "mapped" : "not mapped", xhciCf8, xhciPm, acpiPm1Evt, acpiGpe0, acpiGpe0Half);
 }
 
 static void ehciSnapshot(const char *when, bool clearPme) {
@@ -2312,6 +2361,11 @@ static void ehciSnapshot(const char *when, bool clearPme) {
 	}
 	diskLogEvent("EHC1 %s: PMCSR %04x%s (PME_Status %u, PME_En %u, D%u), USBCMD %x USBSTS %x PORTSC1 %x PORTSC2 %x", when,
 		pmcsr, after != pmcsr ? " cleared" : "", pmcsr >> 15, (pmcsr >> 8) & 1, pmcsr & 3, cmd, sts, port1, port2);
+	// GPE0 status bits: one per wake source (on these FCHs EHC1 0x18, XHC0 0x19, the PCIe ports and LAN 0x08 ...).
+	diskLogEvent("ACPI %s: PM1 status %04x enable %04x, GPE0 status %08x enable %08x, xHCI PMCSR %04x", when,
+		acpiPm1Evt ? portIn16(acpiPm1Evt) : 0xFFFF, acpiPm1Evt ? portIn16(static_cast<uint16_t>(acpiPm1Evt + 2)) : 0xFFFF,
+		acpiGpe0 ? portIn32(acpiGpe0) : ~0U, acpiGpe0 ? portIn32(static_cast<uint16_t>(acpiGpe0 + acpiGpe0Half)) : ~0U,
+		xhciPm ? cf8Read16(xhciCf8, static_cast<uint8_t>(xhciPm + 4)) : 0xFFFF);
 }
 
 static void wrapAcpiSleepKernel(void *func, void *refcon) {
