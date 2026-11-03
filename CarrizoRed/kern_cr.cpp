@@ -2284,7 +2284,7 @@ static void ehciFind() {
 			continue;
 		ehciCf8 = 0x80000000U | (static_cast<uint32_t>(pci->getBusNumber()) << 16) |
 			(static_cast<uint32_t>(pci->getDeviceNumber()) << 11) | (static_cast<uint32_t>(pci->getFunctionNumber()) << 8);
-		ehciPm = static_cast<uint8_t>(pci->findPCICapability(kIOPCIPowerManagementCapability));
+		pci->findPCICapability(kIOPCIPowerManagementCapability, &ehciPm);  // returns the first dword, offset in &ehciPm
 		ehciMap = pci->mapDeviceMemoryWithIndex(0);
 		ehciFound = ehciPm != 0;
 		diskLogEvent("EHC1: config %x, PM capability %x, BAR0 %s", ehciCf8, ehciPm, ehciMap ? "mapped" : "not mapped");
@@ -2305,7 +2305,8 @@ static void ehciSnapshot(const char *when, bool clearPme) {
 		cmd = op[0], sts = op[1], port1 = op[0x44 / 4], port2 = op[0x48 / 4];
 	}
 	uint16_t after = pmcsr;
-	if (clearPme && (pmcsr & 0x8000)) {
+	// All ones: nothing answers (the firmware's _PTS powers EHCI off through FDDC: log 1793718524). Never write then.
+	if (clearPme && pmcsr != 0xFFFF && (pmcsr & 0x8000)) {
 		ehciCfgWrite16(ehciPm + 4, pmcsr);  // PME_Status is write-1-to-clear; D-state and PME_En written back unchanged
 		after = ehciCfgRead16(ehciPm + 4);
 	}
@@ -10848,7 +10849,8 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 	// Early block first: the panic log keeps the start of the report and drops the middle, and a start-up that fails
 	// before the display or the accelerator is up needs these (nvram4/5: registers reading 0 before the SMU load).
 	if (iGPU) {
-		uint16_t pm = iGPU->findPCICapability(kIOPCIPowerManagementCapability);
+		uint8_t pm = 0;  // findPCICapability returns the capability's first dword; the offset comes back in its argument
+		iGPU->findPCICapability(kIOPCIPowerManagementCapability, &pm);
 		add("early: pci %04x:%04x rev %x cmd %x status %x pmcsr %x bar0 %x bar2 %x bar5 %x; mmio phys %llx mapped at %llu ms: "
 			"method %u failures %u memsize %x fbloc %x fboff %x grbm %x\n", iGPU->configRead16(kIOPCIConfigVendorID),
 			iGPU->configRead16(kIOPCIConfigDeviceID), iGPU->configRead8(kIOPCIConfigRevisionID),
