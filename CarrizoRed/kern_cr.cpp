@@ -24,6 +24,7 @@
 #include <kern/clock.h>
 #include <IOKit/IOMessage.h>
 #include <IOKit/IOPlatformExpert.h>
+#include <IOKit/acpi/IOACPIPlatformDevice.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <pexpert/pexpert.h>
 #include <sys/fcntl.h>
@@ -1712,12 +1713,15 @@ static void sleepWatchdog(thread_call_param_t, thread_call_param_t) {
 }
 
 static void ehciFind();
+static void wakeFilterPrepare();
+static void wakeFilterReport();
 
 static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *, void *, vm_size_t) {
 	switch (messageType) {
 		case kIOMessageSystemWillSleep:
 			systemSleeps++;
 			ehciFind();
+			wakeFilterPrepare();
 			wakeMarkStart();
 			if (!checkKernelArgument("-crnosleeppause")) {
 				__atomic_store_n(&gpuPoweringOn, false, __ATOMIC_RELAXED);
@@ -1776,6 +1780,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			break;
 		case kIOMessageSystemHasPoweredOn:
 			systemWakes++;
+			wakeFilterReport();
 			if (__atomic_exchange_n(&gpuSleeping, false, __ATOMIC_RELAXED))
 				diskLogEvent("watcher: GPU register reads resume (has powered on)");
 			diskLogEvent("system has powered on (%u)", systemWakes);
@@ -2301,8 +2306,9 @@ static void ehciCfgWrite16(uint8_t reg, uint16_t v) {
 	asm volatile("outw %0, %1" : : "a"(v), "Nd"(static_cast<uint16_t>(0xCFC + (reg & 2))));
 }
 
-static void ehciFind() {
-	if (ehciFound || !(ehciDiag || ehciPmeClear))
+// The FADT's PM1a event and GPE0 blocks (I/O ports), for the EHC1 check and the wake filter. Once.
+static void acpiBlocksFind() {
+	if (acpiGpe0)
 		return;
 	// The FADT's PM1a event block (0x38, length at 0x58) and GPE0 block (0x50, length at 0x5C), both I/O ports. The table
 	// dictionary is on AppleACPIPlatformExpert; when it isn't found (log 1793784140: the platform expert's own property
@@ -2333,6 +2339,12 @@ static void ehciFind() {
 		acpiPm1Evt = 0x400;
 	if (!acpiGpe0)
 		acpiGpe0 = 0x420, acpiGpe0Half = 4;
+}
+
+static void ehciFind() {
+	if (ehciFound || !(ehciDiag || ehciPmeClear))
+		return;
+	acpiBlocksFind();
 	auto *iter = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
 	while (auto *pci = iter ? OSDynamicCast(IOPCIDevice, iter->getNextObject()) : nullptr) {
 		uint32_t id = pci->configRead32(0);
@@ -2512,6 +2524,104 @@ static void patchCapsCheckpoints(KernelPatcher &patcher, mach_vm_address_t func)
 	SYSLOG("cr", "%s", line);
 }
 
+// Wake filter (-crnowakefilter turns it off). macOS arms every device the firmware gives a _PRW for wake: on these AMD
+// machines every PCIe port (Wi-Fi, Ethernet, slots), both USB controllers and more. One of them signalling as the
+// machine goes down brings it straight back (Dell Inspiron 3475: woken 0.13 s after every S3 entry with "Wake reason:
+// ?", EHC1 quiet, GPE 0x16 (GPP2, the RTL8111's port) already pending before S3; log 1793785537). Windows only arms
+// the devices allowed to wake the machine, mostly keyboards and mice. This does the same at the last moment, where
+// pal_machine_sleep runs (after AcpiHwLegacySleep has armed ACPICA's wake GPEs, right before SLP_TYP/SLP_EN): GPE0
+// enables are cut down to the GPEs of the USB controllers (PCI class 0C03, from each one's _PRW, collected at "will
+// sleep"), every GPE0 status bit is cleared, and PCIe WAKE# is disabled (PM1 enable PCIEXP_WAKE_DIS). The power
+// button and the RTC (scheduled maintenance wakes) are PM1 fixed events and stay. Without any USB GPE found, nothing
+// is filtered, so a machine is never left without a wake source. pal_machine_sleep jumps here (patchSleepFlush), so
+// the cache flush happens here too.
+static bool wakeFilterOn;
+static uint8_t wakeAllow[32], wakeEnBefore[32], wakeEnAfter[32];
+static uint32_t wakeAllowGpes, wakeFiltered;
+static uint16_t wakePm1Before;
+static char wakeAllowList[64];
+
+static uint8_t portIn8(uint16_t port);
+static void portOut8(uint16_t port, uint8_t v);
+
+static void wakeFilterPrepare() {
+	if (!wakeFilterOn)
+		return;
+	acpiBlocksFind();
+	memset(wakeAllow, 0, sizeof(wakeAllow));
+	wakeAllowGpes = 0;
+	int len = snprintf(wakeAllowList, sizeof(wakeAllowList), "none");
+	auto *iter = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
+	while (auto *pci = iter ? OSDynamicCast(IOPCIDevice, iter->getNextObject()) : nullptr) {
+		if (pci->configRead8(kIOPCIConfigClassCode + 2) != 0x0C || pci->configRead8(kIOPCIConfigClassCode + 1) != 0x03)
+			continue;
+		auto *acpi = OSDynamicCast(IOACPIPlatformDevice, pci->getProperty("acpi-device"));
+		OSObject *prw = nullptr;
+		if (!acpi || acpi->evaluateObject("_PRW", &prw) != kIOReturnSuccess || !prw)
+			continue;
+		auto *pkg = OSDynamicCast(OSArray, prw);
+		auto *num = pkg ? OSDynamicCast(OSNumber, pkg->getObject(0)) : nullptr;
+		uint32_t gpe = num ? num->unsigned32BitValue() : ~0U;
+		if (gpe < acpiGpe0Half * 8U && gpe < sizeof(wakeAllow) * 8) {
+			if (!wakeAllowGpes)
+				len = 0;
+			wakeAllow[gpe / 8] |= static_cast<uint8_t>(1U << (gpe % 8));
+			wakeAllowGpes++;
+			if (len >= 0 && static_cast<size_t>(len) < sizeof(wakeAllowList))
+				len += snprintf(wakeAllowList + len, sizeof(wakeAllowList) - static_cast<size_t>(len), "%s%x (%04x:%04x)",
+					wakeAllowGpes > 1 ? ", " : "", gpe, pci->configRead16(kIOPCIConfigVendorID),
+					pci->configRead16(kIOPCIConfigDeviceID));
+		}
+		prw->release();
+	}
+	if (iter)
+		iter->release();
+	diskLogEvent("wake filter: USB wake GPEs allowed: %s; GPE0 %x, PM1a_EVT %x", wakeAllowList, acpiGpe0, acpiPm1Evt);
+}
+
+// pal_machine_sleep(type_a, type_b, bit_position, disable_mask, enable_mask) jumps here; it returns 0 (sleep the usual
+// way). Interrupts are off, only port I/O.
+extern "C" uint32_t wakeFilterPalSleep(uint8_t, uint8_t, uint32_t, uint32_t, uint32_t) {
+	if (wakeFilterOn && wakeAllowGpes && acpiGpe0 && acpiGpe0Half <= sizeof(wakeAllow)) {
+		for (uint16_t i = 0; i < acpiGpe0Half; i++) {
+			auto en = static_cast<uint16_t>(acpiGpe0 + acpiGpe0Half + i);
+			uint8_t v = portIn8(en);
+			wakeEnBefore[i] = v;
+			wakeEnAfter[i] = static_cast<uint8_t>(v & wakeAllow[i]);
+			portOut8(en, wakeEnAfter[i]);
+		}
+		for (uint16_t i = 0; i < acpiGpe0Half; i++) {
+			auto st = static_cast<uint16_t>(acpiGpe0 + i);
+			if (uint8_t v = portIn8(st))
+				portOut8(st, v);  // write-1-to-clear
+		}
+		if (acpiPm1Evt) {
+			auto en = static_cast<uint16_t>(acpiPm1Evt + 2);
+			uint16_t v;
+			asm volatile("inw %1, %0" : "=a"(v) : "Nd"(en));
+			wakePm1Before = v;
+			v |= 0x4000;  // PCIEXP_WAKE_DIS
+			asm volatile("outw %0, %1" : : "a"(v), "Nd"(en));
+		}
+		wakeFiltered++;
+	}
+	asm volatile("wbinvd" ::: "memory");
+	return 0;
+}
+
+static void wakeFilterReport() {
+	if (!wakeFilterOn || !wakeFiltered)
+		return;
+	char before[80] {}, after[80] {};
+	int lb = 0, la = 0;
+	for (uint16_t i = acpiGpe0Half; i-- > 0 && lb >= 0 && la >= 0;) {
+		lb += snprintf(before + lb, sizeof(before) - static_cast<size_t>(lb), "%02x", wakeEnBefore[i]);
+		la += snprintf(after + la, sizeof(after) - static_cast<size_t>(la), "%02x", wakeEnAfter[i]);
+	}
+	diskLogEvent("wake filter: last sleep GPE0 enable %s -> %s (allowed: %s), PM1 enable %04x +PCIEXP_WAKE_DIS; %u sleeps "
+		"filtered", before, after, wakeAllowList, wakePm1Before, wakeFiltered);
+}
+
 // Cache flush before S3 (-crnosleepflush turns it off). The ACPI specification has the OS write back and invalidate
 // the CPU caches before setting SLP_EN, and ACPICA's AcpiHwLegacySleep does it there (ACPI_FLUSH_CPU_CACHE). Apple's
 // port calls pal_machine_sleep at that point instead, which on a Mac returns 0 and nothing else (pal_routines.c): Intel
@@ -2521,8 +2631,11 @@ static void patchCapsCheckpoints(KernelPatcher &patcher, mach_vm_address_t func)
 // through the whole low-level resume once a wbinvd ran right before S3). Nothing in the kernel calls it; its 8 bytes
 // (push rbp; mov rbp, rsp; xor eax, eax; pop rbp; ret) become wbinvd; xor eax, eax; ret.
 static void patchSleepFlush(KernelPatcher &patcher) {
-	if (checkKernelArgument("-crnosleepflush"))
+	wakeFilterOn = !checkKernelArgument("-crnowakefilter");
+	if (checkKernelArgument("-crnosleepflush")) {
+		wakeFilterOn = false;
 		return;
+	}
 	auto func = patcher.solveSymbol(KernelPatcher::KernelID, "_pal_machine_sleep");
 	patcher.clearError();
 	static const uint8_t expect[] {0x55, 0x48, 0x89, 0xE5, 0x31, 0xC0, 0x5D, 0xC3};
@@ -2531,13 +2644,24 @@ static void patchSleepFlush(KernelPatcher &patcher) {
 		SYSLOG("cr", "sleep flush: pal_machine_sleep %s", func ? "not as expected, left alone" : "not found");
 		return;
 	}
+	// With the wake filter: movabs rax, wakeFilterPalSleep; jmp rax (12 bytes) over the function and its 8-byte nop
+	// padding (0F 1F 84 00 00 00 00 00, the same in Big Sur, Monterey, Sonoma and Tahoe), when the padding is there.
+	static const uint8_t pad[] {0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00};
+	uint8_t jump[12] {0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0};
+	auto target = reinterpret_cast<uint64_t>(&wakeFilterPalSleep);
+	memcpy(jump + 2, &target, sizeof(target));
+	bool filter = wakeFilterOn && !memcmp(reinterpret_cast<const uint8_t *>(func) + 8, pad, sizeof(pad));
 	if (MachInfo::setKernelWriting(true, nullptr) != KERN_SUCCESS) {
 		SYSLOG("cr", "sleep flush: cannot write the kernel");
 		return;
 	}
-	memcpy(reinterpret_cast<void *>(func), flush, sizeof(flush));
+	if (filter)
+		memcpy(reinterpret_cast<void *>(func), jump, sizeof(jump));
+	else
+		memcpy(reinterpret_cast<void *>(func), flush, sizeof(flush));
 	MachInfo::setKernelWriting(false, nullptr);
-	DBGLOG("cr", "sleep flush: pal_machine_sleep now flushes the caches");
+	wakeFilterOn = filter;
+	DBGLOG("cr", "sleep flush: pal_machine_sleep now flushes the caches%s", filter ? " and filters the wake sources" : "");
 }
 
 static void hookCapsProbe(KernelPatcher &patcher) {
