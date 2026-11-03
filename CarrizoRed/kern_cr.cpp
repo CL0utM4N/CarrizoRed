@@ -2304,9 +2304,13 @@ static void ehciCfgWrite16(uint8_t reg, uint16_t v) {
 static void ehciFind() {
 	if (ehciFound || !(ehciDiag || ehciPmeClear))
 		return;
-	// The FADT's PM1a event block (0x38, length at 0x58) and GPE0 block (0x50, length at 0x5C), both I/O ports.
-	if (auto *platform = IOService::getPlatform()) {
-		auto *tables = OSDynamicCast(OSDictionary, platform->getProperty("ACPI Tables"));
+	// The FADT's PM1a event block (0x38, length at 0x58) and GPE0 block (0x50, length at 0x5C), both I/O ports. The table
+	// dictionary is on AppleACPIPlatformExpert; when it isn't found (log 1793784140: the platform expert's own property
+	// gave nothing), the AMD FCH's usual blocks (AcpiPm1EvtBlk 0x400, AcpiGpe0Blk 0x420, 8 bytes; the Dell's FADT).
+	IORegistryEntry *expert = IORegistryEntry::fromPath("IOService:/AppleACPIPlatformExpert");
+	auto *tablesObj = expert ? expert->copyProperty("ACPI Tables") : nullptr;
+	{
+		auto *tables = OSDynamicCast(OSDictionary, tablesObj);
 		auto *facp = tables ? OSDynamicCast(OSData, tables->getObject("FACP")) : nullptr;
 		if (facp && facp->getLength() >= 0x60) {
 			auto *f = static_cast<const uint8_t *>(facp->getBytesNoCopy());
@@ -2321,6 +2325,14 @@ static void ehciFind() {
 			}
 		}
 	}
+	if (tablesObj)
+		tablesObj->release();
+	if (expert)
+		expert->release();
+	if (!acpiPm1Evt)
+		acpiPm1Evt = 0x400;
+	if (!acpiGpe0)
+		acpiGpe0 = 0x420, acpiGpe0Half = 4;
 	auto *iter = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
 	while (auto *pci = iter ? OSDynamicCast(IOPCIDevice, iter->getNextObject()) : nullptr) {
 		uint32_t id = pci->configRead32(0);
