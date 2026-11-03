@@ -1971,6 +1971,7 @@ static void hookTscSync(KernelPatcher &patcher) {
 // Never on after the key press: the firmware's resume or the start of the kernel's. On and staying on: stuck between.
 static mach_vm_address_t orgAcpiSleepKernel;
 static volatile bool capsArmed;  // acpi_sleep_kernel running: the checkpoints flash
+static uint64_t capsTscPerMs;  // TSC ticks per ms, measured at boot
 
 static uint8_t portIn8(uint16_t port) {
 	uint8_t v;
@@ -2054,9 +2055,203 @@ static bool patchWakeTrampoline() {
 	return true;
 }
 
+// Memory check before the 64-bit switch (2026-11-03: no checkpoint flashed, so the hang is in acpi_wake_prot or
+// Lwake_64, code that also starts the second CPU at boot without trouble). Lead: the firmware's S3 resume overwriting
+// memory that code uses. Just before S3 (a callback in front of the platform's, run by acpi_sleep_cpu once the CPU
+// state is saved) every piece of memory the early wake relies on is checksummed into a table in the trampoline page;
+// at wake the trampoline goes on to a 32-bit stub (PROT_MODE_START, 0x2800, points there instead of at acpi_wake_prot)
+// that sums it all again before jumping to acpi_wake_prot. Everything the same: LED off. A difference: the LED blinks
+// the group number (short off-blinks, then 1 s on) forever. Groups:
+//  1 acpi_wake_prot (the 32-bit switch)   2 BootPML4 and its tables on the switch's path   3 Lwake_64's code
+//  4 the save area (saved_cr3, saved_gdt, ...)   5 the kernel's page tables (the saved CR3) on the restore's path
+//  6 GDT   7 IDT   8 TSS   9 the stack Lwake_64 returns on
+// Page tables are summed without their accessed and dirty bits (the CPU sets them after the sums). Memory above 4 GB
+// can't be read by the 32-bit stub and is left out.
+static constexpr uint32_t WakeStub32 = 0xC80, WakeOrig = 0xE00, WakeTable = 0xE10, WakeMaxRegions = 24;
+static void (*capsOrgSleepFunc)(void *);
+static uint32_t wakeRegions;
+static uint8_t *wakePage;  // physmap pointer to physical 0x2000
+
+static const uint8_t *physPtr(uint64_t phys) {
+	return reinterpret_cast<const uint8_t *>(*physmapBaseVar + phys);
+}
+
+static void wakeRegion(uint64_t phys, uint32_t bytes, uint32_t group, uint32_t mask) {
+	if (!phys || phys + bytes > 0x100000000ULL || bytes < 4 || wakeRegions >= WakeMaxRegions)
+		return;
+	auto *table = reinterpret_cast<uint32_t *>(wakePage + WakeTable + 4);
+	for (uint32_t i = 0; i < wakeRegions; i++)
+		if (table[i * 5] == phys && table[i * 5 + 1] == bytes / 4)
+			return;
+	auto *p = reinterpret_cast<const uint32_t *>(physPtr(phys));
+	uint32_t sum = 0;
+	for (uint32_t i = 0; i < bytes / 4; i++)
+		sum = ((sum << 1) | (sum >> 31)) + (p[i] & mask);
+	auto *e = table + wakeRegions * 5;
+	e[0] = static_cast<uint32_t>(phys), e[1] = bytes / 4, e[2] = sum, e[3] = mask, e[4] = group;
+	wakeRegions++;
+}
+
+// The page-table walk for va under the PML4 at pml4: each table on the way is a region of the group; returns the
+// physical address, or 0.
+static uint64_t wakeWalk(uint64_t pml4, uint64_t va, uint32_t group) {
+	static constexpr uint64_t AddrMask = 0x000FFFFFFFFFF000ULL;
+	static constexpr uint32_t NoAD = ~0x60U;
+	wakeRegion(pml4, 4096, group, NoAD);
+	uint64_t table = pml4;
+	for (int level = 3; level >= 0; level--) {
+		uint64_t entry = reinterpret_cast<const uint64_t *>(physPtr(table))[(va >> (12 + 9 * level)) & 511];
+		if (!(entry & 1))
+			return 0;
+		if (level == 0 || (level < 3 && (entry & 0x80))) {
+			uint64_t pageMask = (1ULL << (12 + 9 * level)) - 1;
+			return (entry & AddrMask & ~pageMask) | (va & pageMask);
+		}
+		table = entry & AddrMask;
+		wakeRegion(table, 4096, group, NoAD);
+	}
+	return 0;
+}
+
+static void wakeRegionVirt(uint64_t pml4, uint64_t va, uint32_t bytes, uint32_t group, uint32_t ptGroup) {
+	while (bytes) {
+		uint32_t chunk = static_cast<uint32_t>(4096 - (va & 4095));
+		if (chunk > bytes)
+			chunk = bytes & ~3U;
+		if (!chunk)
+			return;
+		wakeRegion(wakeWalk(pml4, va, ptGroup), chunk, group, ~0U);
+		va += chunk;
+		bytes -= chunk;
+	}
+}
+
+static mach_vm_address_t wakeProtEntry, wakeSaveArea, wakeBootPML4;
+
+static void capsSleepCallback(void *refcon) {
+	struct __attribute__((packed)) {
+		uint16_t limit;
+		uint64_t base;
+	} gdt {}, idt {};
+	uint64_t cr3;
+	uint16_t tr;
+	asm volatile("mov %%cr3, %0; sgdt %1; sidt %2; str %3" : "=r"(cr3), "=m"(gdt), "=m"(idt), "=r"(tr));
+	cr3 &= 0x000FFFFFFFFFF000ULL;
+	wakeRegions = 0;
+	uint32_t prot = *reinterpret_cast<uint32_t *>(wakePage + 0x800);
+	wakeRegion(prot, 256, 1, ~0U);
+	if (wakeBootPML4) {
+		uint64_t boot = wakeWalk(cr3, wakeBootPML4, 5);
+		wakeWalk(boot, prot, 2);
+		if (wakeProtEntry)
+			wakeWalk(boot, wakeProtEntry, 2);
+	}
+	if (wakeProtEntry)
+		wakeRegionVirt(cr3, wakeProtEntry, 256, 3, 5);
+	if (wakeSaveArea)
+		wakeRegionVirt(cr3, wakeSaveArea, 128, 4, 5);
+	wakeRegionVirt(cr3, gdt.base, gdt.limit + 1U, 6, 5);
+	wakeRegionVirt(cr3, idt.base, idt.limit + 1U, 7, 5);
+	auto *desc = reinterpret_cast<const uint8_t *>(gdt.base + (tr & ~7U));
+	uint64_t tss = desc[2] | (desc[3] << 8) | (desc[4] << 16) | (static_cast<uint64_t>(desc[7]) << 24) |
+		(static_cast<uint64_t>(*reinterpret_cast<const uint32_t *>(desc + 8)) << 32);
+	wakeRegionVirt(cr3, tss, 104, 8, 5);
+	// From this frame up: the saved rbp and return address, then acpi_sleep_cpu's pushes, which Lwake_64 pops.
+	auto fp = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
+	wakeRegionVirt(cr3, fp, static_cast<uint32_t>(4096 - (fp & 4095)), 9, 5);
+	wakeRegionVirt(cr3, (fp | 4095) + 1, 1024, 9, 5);
+	*reinterpret_cast<uint32_t *>(wakePage + WakeTable) = wakeRegions;
+	*reinterpret_cast<uint32_t *>(wakePage + WakeOrig) = prot;
+	*reinterpret_cast<uint32_t *>(wakePage + 0x800) = *reinterpret_cast<uint32_t *>(wakePage + WakeOrig + 4);
+	asm volatile("wbinvd" ::: "memory");
+	capsOrgSleepFunc(refcon);
+}
+
+// The 32-bit stub at 0x2C80 (flat segments from the trampoline, paging off, no stack: it makes one at 0x2C00).
+static bool buildWakeStub32() {
+	uint8_t *base = wakePage + WakeStub32, *p = base;
+	auto u32 = [&](uint32_t v) { memcpy(p, &v, 4), p += 4; };
+	auto at = [&]() { return 0x2000 + WakeStub32 + static_cast<uint32_t>(p - base); };
+	auto rel8 = [&](uint8_t *from, uint8_t *to) { *from = static_cast<uint8_t>(to - (from + 1)); };
+	auto call = [&](uint8_t *to) {
+		*p++ = 0xE8;
+		auto rel = static_cast<int32_t>(to - (p + 4));
+		memcpy(p, &rel, 4), p += 4;
+	};
+	// Subroutines first, the entry after them (0x2800 points at the entry).
+	auto *waitIbf = p;  // mov ecx, 0x10000; 1: in al, 0x64; test al, 2; loopnz 1b; ret
+	*p++ = 0xB9, u32(0x10000), *p++ = 0xE4, *p++ = 0x64, *p++ = 0xA8, *p++ = 0x02, *p++ = 0xE0, *p++ = 0xFA, *p++ = 0xC3;
+	auto *waitObf = p;
+	*p++ = 0xB9, u32(0x10000), *p++ = 0xE4, *p++ = 0x64, *p++ = 0xA8, *p++ = 0x01, *p++ = 0xE1, *p++ = 0xFA, *p++ = 0xC3;
+	auto *led = p;  // al = LED byte
+	*p++ = 0x88, *p++ = 0xC4;  // mov ah, al
+	call(waitIbf), *p++ = 0xB0, *p++ = 0xED, *p++ = 0xE6, *p++ = 0x60, call(waitObf), *p++ = 0xE4, *p++ = 0x60;
+	call(waitIbf), *p++ = 0x88, *p++ = 0xE0, *p++ = 0xE6, *p++ = 0x60, call(waitObf), *p++ = 0xE4, *p++ = 0x60;
+	*p++ = 0xC3;
+	auto *delay = p;  // edi = TSC ticks: rdtsc; mov esi, eax; 1: rdtsc; sub eax, esi; cmp eax, edi; jb 1b; ret
+	*p++ = 0x0F, *p++ = 0x31, *p++ = 0x89, *p++ = 0xC6;
+	*p++ = 0x0F, *p++ = 0x31, *p++ = 0x29, *p++ = 0xF0, *p++ = 0x39, *p++ = 0xF8, *p++ = 0x72, *p++ = 0xF8, *p++ = 0xC3;
+	uint64_t t300 = 300 * capsTscPerMs, t1000 = 1000 * capsTscPerMs;
+	if (!capsTscPerMs || t1000 > 0xFFFFFFFFULL)
+		return false;
+	// Entry.
+	uint32_t entry = at();
+	*p++ = 0xBC, u32(0x2C00);                        // mov esp, 0x2C00
+	*p++ = 0xBE, u32(0x2000 + WakeTable + 4);        // mov esi, table + 4
+	*p++ = 0x8B, *p++ = 0x1D, u32(0x2000 + WakeTable);  // mov ebx, [table]
+	auto *region = p;
+	*p++ = 0x85, *p++ = 0xDB, *p++ = 0x74;  // test ebx, ebx; jz done
+	auto *jzDone = p++;
+	*p++ = 0x8B, *p++ = 0x3E;                       // mov edi, [esi]
+	*p++ = 0x8B, *p++ = 0x4E, *p++ = 0x04;          // mov ecx, [esi + 4]
+	*p++ = 0x8B, *p++ = 0x6E, *p++ = 0x0C;          // mov ebp, [esi + 12]
+	*p++ = 0x31, *p++ = 0xD2;                       // xor edx, edx
+	auto *sum = p;
+	*p++ = 0xD1, *p++ = 0xC2;                       // rol edx, 1
+	*p++ = 0x8B, *p++ = 0x07;                       // mov eax, [edi]
+	*p++ = 0x21, *p++ = 0xE8;                       // and eax, ebp
+	*p++ = 0x01, *p++ = 0xC2;                       // add edx, eax
+	*p++ = 0x83, *p++ = 0xC7, *p++ = 0x04;          // add edi, 4
+	*p++ = 0x49, *p++ = 0x75;                       // dec ecx; jnz sum
+	rel8(p, sum), p++;
+	*p++ = 0x3B, *p++ = 0x56, *p++ = 0x08, *p++ = 0x75;  // cmp edx, [esi + 8]; jne bad
+	auto *jneBad = p++;
+	*p++ = 0x83, *p++ = 0xC6, *p++ = 0x14;          // add esi, 20
+	*p++ = 0x4B, *p++ = 0xEB;                       // dec ebx; jmp region
+	rel8(p, region), p++;
+	rel8(jzDone, p);                                // done: LED off, jmp [orig]
+	*p++ = 0xB0, *p++ = 0x00, call(led);
+	*p++ = 0xFF, *p++ = 0x25, u32(0x2000 + WakeOrig);
+	rel8(jneBad, p);                                // bad: blink the group forever
+	*p++ = 0x8B, *p++ = 0x6E, *p++ = 0x10;          // mov ebp, [esi + 16]
+	auto *rep = p;
+	*p++ = 0x89, *p++ = 0xEB;                       // mov ebx, ebp
+	auto *blink = p;
+	*p++ = 0xB0, *p++ = 0x00, call(led), *p++ = 0xBF, u32(static_cast<uint32_t>(t300)), call(delay);
+	*p++ = 0xB0, *p++ = 0x04, call(led), *p++ = 0xBF, u32(static_cast<uint32_t>(t300)), call(delay);
+	*p++ = 0x4B, *p++ = 0x75;                       // dec ebx; jnz blink
+	rel8(p, blink), p++;
+	*p++ = 0xBF, u32(static_cast<uint32_t>(t1000)), call(delay);
+	*p++ = 0xEB;
+	rel8(p, rep), p++;
+	if (p > wakePage + WakeOrig)
+		return false;
+	// The trampoline reads its jump target from 0x2800 only at wake; the callback sets it, so a sleep that never
+	// reaches the callback keeps acpi_wake_prot.
+	*reinterpret_cast<uint32_t *>(wakePage + WakeOrig + 4) = entry;
+	return true;
+}
+
 static void wrapAcpiSleepKernel(void *func, void *refcon) {
 	// One 1 s blink, or three short ones when the trampoline wasn't patched.
 	bool patched = patchWakeTrampoline();
+	if (patched) {
+		wakePage = reinterpret_cast<uint8_t *>(*physmapBaseVar + 0x2000);
+		if (buildWakeStub32()) {
+			capsOrgSleepFunc = reinterpret_cast<void (*)(void *)>(func);
+			func = reinterpret_cast<void *>(capsSleepCallback);
+		}
+	}
 	for (int i = 0; i < (patched ? 1 : 3); i++) {
 		capsLed(true);
 		spinMs(patched ? 1000 : 300);
@@ -2080,7 +2275,6 @@ static void wrapAcpiSleepKernel(void *func, void *refcon) {
 static constexpr uint32_t CapsMaxCheckpoints = 24;
 extern "C" mach_vm_address_t capsTargets[CapsMaxCheckpoints];
 mach_vm_address_t capsTargets[CapsMaxCheckpoints];
-static uint64_t capsTscPerMs;
 
 static void spinTscMs(uint64_t ms) {
 	uint64_t end = readTsc() + ms * capsTscPerMs;
@@ -2178,6 +2372,12 @@ static void hookCapsProbe(KernelPatcher &patcher) {
 	while (mach_absolute_time() - m0 < 20000000)
 		__builtin_ia32_pause();
 	capsTscPerMs = (readTsc() - t0) / 20;
+	wakeProtEntry = patcher.solveSymbol(KernelPatcher::KernelID, "_acpi_wake_prot_entry");
+	wakeSaveArea = patcher.solveSymbol(KernelPatcher::KernelID, "_master_gdtr");
+	wakeBootPML4 = patcher.solveSymbol(KernelPatcher::KernelID, "_BootPML4");
+	patcher.clearError();
+	diskLogEvent("wake memory check: TSC %llu/ms, acpi_wake_prot_entry %llx, master_gdtr %llx, BootPML4 %llx",
+		capsTscPerMs, wakeProtEntry, wakeSaveArea, wakeBootPML4);
 	// Before the route below, which overwrites the function's first bytes.
 	if (auto func = patcher.solveSymbol(KernelPatcher::KernelID, "_acpi_sleep_kernel"))
 		patchCapsCheckpoints(patcher, func);

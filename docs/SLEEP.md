@@ -301,6 +301,22 @@ Next, cheapest first:
    thunks (call sites redirected; no Lilu trampolines, most of the functions start RIP-relative) that flash the LED off
    and on (0.25 s each, timed by the TSC) and jump on. The disk log's "Caps Lock checkpoints" line at boot maps flash
    numbers to steps. No flash: the hang is in `acpi_wake_prot`/`acpi_wake_prot_entry`.
+   **Result (2026-11-03, Monterey): no flash, the LED just stays on** (to confirm: the boot log's checkpoint line
+   lists steps, i.e. the call sites were patched on 12.7). If so, the hang is in `acpi_wake_prot` (32-bit, paging
+   off: `SWITCH_TO_64BIT_MODE` with `BootPML4`, stack `low_eintstack`, all in `__HIB`) or `Lwake_64` (restore CR4,
+   EFER.NXE, CR0, CR3, GDT/LDT/IDT, segments, GS bases, TR, then the saved stack and the return into
+   `acpi_sleep_kernel`). The CPU start-up at boot runs the same 32-bit switch and works, so what differs at wake is
+   the state saved before sleep and the memory it all sits in. Lead: the firmware's S3 resume overwriting memory the
+   kernel uses (`__HIB` code and data, `BootPML4`, the save area; Linux reserves low memory for firmware that does
+   this), at addresses that move with the macOS version's layout.
+   Checkpoint line confirmed on 12.7 (all 11 steps listed), so the result stands.
+   Fourth version, memory check: just before S3 (a callback in front of the platform's, which `acpi_sleep_cpu` calls
+   once the CPU state is saved) CarrizoRed checksums what the early wake reads, in groups: 1 `acpi_wake_prot`, 2
+   `BootPML4` and its tables on the switch's path, 3 `Lwake_64`'s code, 4 the save area (`master_gdtr`, `saved_*`;
+   `low_eintstack` ends right below it), 5 the kernel's page tables on the restore's path, 6 GDT, 7 IDT, 8 TSS, 9 the
+   stack `Lwake_64` returns on (page tables without accessed/dirty bits). At wake, 0x2800 sends the trampoline to a
+   32-bit stub at 0x2C80 that sums it all again before `acpi_wake_prot`: all equal, LED off and on to the 64-bit
+   switch; a difference, the LED blinks the group number forever (short off-blinks, then 1 s on).
 2. **Hibernation restore:** `HibernateMode` `NVRAM` in the test EFI, `hibernatemode 25`, power on. If the session
    comes back, macOS's side of the wake works and the firmware's S3 resume is the problem.
 
