@@ -2629,6 +2629,10 @@ static void patchCapsCheckpoints(KernelPatcher &patcher, mach_vm_address_t func)
 // the cache flush happens here too.
 static bool wakeFilterOn;
 static bool wakeAllowNone;  // -crwakeallownone (test): disarm every GPE, USB too (power button and RTC stay)
+// -crwakealternate (test): odd sleeps arm only the xHCI (1022:7914), even sleeps only the EHCI (1022:7908); log
+// 1793794001: with nothing armed the Dell stayed in S3 (2 min, power button), with the USB GPEs armed it is back after
+// about 1 s, so which controller is it?
+static bool wakeAlternate;
 static uint8_t wakeAllow[32], wakeEnBefore[32], wakeEnAfter[32];
 static uint32_t wakeAllowGpes, wakeFiltered;
 static uint16_t wakePm1Before;
@@ -2672,6 +2676,8 @@ static void wakeFilterPrepare() {
 			continue;
 		char tag[12];
 		snprintf(tag, sizeof(tag), "%04x:%04x", pci->configRead16(kIOPCIConfigVendorID), pci->configRead16(kIOPCIConfigDeviceID));
+		if (wakeAlternate && strcmp(tag, (systemSleeps & 1) ? "1022:7914" : "1022:7908"))
+			continue;
 		wakeAllowPrw(OSDynamicCast(IOACPIPlatformDevice, pci->getProperty("acpi-device")), tag, len);
 	}
 	if (iter)
@@ -2688,7 +2694,8 @@ static void wakeFilterPrepare() {
 		memset(wakeAllow, 0, sizeof(wakeAllow));
 		snprintf(wakeAllowList, sizeof(wakeAllowList), "none (-crwakeallownone)");
 	}
-	diskLogEvent("wake filter: wake GPEs allowed: %s; GPE0 %x, PM1a_EVT %x", wakeAllowList, acpiGpe0, acpiPm1Evt);
+	diskLogEvent("wake filter: sleep %u, wake GPEs allowed: %s%s; GPE0 %x, PM1a_EVT %x", systemSleeps, wakeAllowList,
+		wakeAlternate ? " (-crwakealternate)" : "", acpiGpe0, acpiPm1Evt);
 }
 
 // pal_machine_sleep(type_a, type_b, bit_position, disable_mask, enable_mask) jumps here; it returns 0 (sleep the usual
@@ -2745,6 +2752,7 @@ static void wakeFilterReport() {
 static void patchSleepFlush(KernelPatcher &patcher) {
 	wakeFilterOn = !checkKernelArgument("-crnowakefilter");
 	wakeAllowNone = checkKernelArgument("-crwakeallownone");
+	wakeAlternate = checkKernelArgument("-crwakealternate");
 	if (checkKernelArgument("-crnosleepflush")) {
 		wakeFilterOn = false;
 		return;
