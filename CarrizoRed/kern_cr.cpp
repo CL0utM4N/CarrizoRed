@@ -2628,6 +2628,7 @@ static void patchCapsCheckpoints(KernelPatcher &patcher, mach_vm_address_t func)
 // is filtered, so a machine is never left without a wake source. pal_machine_sleep jumps here (patchSleepFlush), so
 // the cache flush happens here too.
 static bool wakeFilterOn;
+static bool wakeAllowNone;  // -crwakeallownone (test): disarm every GPE, USB too (power button and RTC stay)
 static uint8_t wakeAllow[32], wakeEnBefore[32], wakeEnAfter[32];
 static uint32_t wakeAllowGpes, wakeFiltered;
 static uint16_t wakePm1Before;
@@ -2683,13 +2684,17 @@ static void wakeFilterPrepare() {
 		if (devices)
 			devices->release();
 	}
+	if (wakeAllowNone) {
+		memset(wakeAllow, 0, sizeof(wakeAllow));
+		snprintf(wakeAllowList, sizeof(wakeAllowList), "none (-crwakeallownone)");
+	}
 	diskLogEvent("wake filter: wake GPEs allowed: %s; GPE0 %x, PM1a_EVT %x", wakeAllowList, acpiGpe0, acpiPm1Evt);
 }
 
 // pal_machine_sleep(type_a, type_b, bit_position, disable_mask, enable_mask) jumps here; it returns 0 (sleep the usual
 // way). Interrupts are off, only port I/O.
 extern "C" uint32_t wakeFilterPalSleep(uint8_t, uint8_t, uint32_t, uint32_t, uint32_t) {
-	if (wakeFilterOn && wakeAllowGpes && acpiGpe0 && acpiGpe0Half <= sizeof(wakeAllow)) {
+	if (wakeFilterOn && (wakeAllowGpes || wakeAllowNone) && acpiGpe0 && acpiGpe0Half <= sizeof(wakeAllow)) {
 		for (uint16_t i = 0; i < acpiGpe0Half; i++) {
 			auto en = static_cast<uint16_t>(acpiGpe0 + acpiGpe0Half + i);
 			uint8_t v = portIn8(en);
@@ -2739,6 +2744,7 @@ static void wakeFilterReport() {
 // (push rbp; mov rbp, rsp; xor eax, eax; pop rbp; ret) become wbinvd; xor eax, eax; ret.
 static void patchSleepFlush(KernelPatcher &patcher) {
 	wakeFilterOn = !checkKernelArgument("-crnowakefilter");
+	wakeAllowNone = checkKernelArgument("-crwakeallownone");
 	if (checkKernelArgument("-crnosleepflush")) {
 		wakeFilterOn = false;
 		return;
