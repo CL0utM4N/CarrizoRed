@@ -2331,6 +2331,48 @@ static uint16_t ehciCfgRead16(uint8_t reg) {
 	return v;
 }
 
+static uint32_t ehciCfgRead32(uint8_t reg) {
+	asm volatile("outl %0, %1" : : "a"(ehciCf8 | (reg & 0xFCU)), "Nd"(static_cast<uint16_t>(0xCF8)));
+	uint32_t v;
+	asm volatile("inl %1, %0" : "=a"(v) : "Nd"(static_cast<uint16_t>(0xCFC)));
+	return v;
+}
+
+static void ehciCfgWrite32(uint8_t reg, uint32_t v) {
+	asm volatile("outl %0, %1" : : "a"(ehciCf8 | (reg & 0xFCU)), "Nd"(static_cast<uint16_t>(0xCF8)));
+	asm volatile("outl %0, %1" : : "a"(v), "Nd"(static_cast<uint16_t>(0xCFC)));
+}
+
+// The FCH's own USB 2 hub (0438:7900, behind EHCI port 0) and the controller's S-state behaviour are set in EHCI config
+// space (AMD BKDG 55072, Family 15h Models 70h-7Fh, 3.26.4.1.1):
+//   D12F0x84 Hub Config 1 [23:20]: in global suspend the hub resumes its upstream port (and asserts CLK_REQ) on a
+//     downstream connect (23), disconnect (22), over-current (21), device resume (20). A key press is only (20).
+//   D12F0x64 Misc Control 2 [15:8]: "Force Reset in S-state", per port: 01b resets the port on S3/S4/S5 entry when
+//     nothing is connected, 11b always.
+//   D12F0x50 EHCI Misc Control, D12F0x54 EHCI Spare 1: PME level/pulse, D3cold PME, resume PME only out of D0, LS
+//     connect wake. D12F0x9C Hub Status: SpndO (25), RmWkUpEn (24).
+// The Dell still woke ~1 s after every S3 entry with EHC1 suspended the Linux way and every hub port off (logs
+// 1793806578, 1793807654): logged at each S3 edge, and with crehcihubwk=<mask> (bit 0 device resume, 1 over-current,
+// 2 disconnect, 3 connect) those hub wake enables are cleared and with -crehcinoforcereset D12F0x64[15:8] is cleared,
+// straight before S3.
+static uint32_t ehciHubWakeClear;
+static bool ehciNoForceReset;
+
+static void ehciHubConfig(const char *when, bool apply) {
+	uint32_t r84 = ehciCfgRead32(0x84), r64 = ehciCfgRead32(0x64);
+	if (r84 == ~0U)
+		return;
+	uint32_t n84 = r84 & ~((ehciHubWakeClear & 0xF) << 20), n64 = ehciNoForceReset ? (r64 & ~0xFF00U) : r64;
+	if (apply && n84 != r84)
+		ehciCfgWrite32(0x84, n84);
+	if (apply && n64 != r64)
+		ehciCfgWrite32(0x64, n64);
+	diskLogEvent("EHC1 %s config: 50 %08x 54 %08x 64 %08x%s 70 %08x 84 %08x%s 88 %08x 8C %08x 90 %08x 9C %08x", when,
+		ehciCfgRead32(0x50), ehciCfgRead32(0x54), r64, (apply && n64 != r64) ? " (force reset cleared)" : "",
+		ehciCfgRead32(0x70), ehciCfgRead32(0x84), (apply && n84 != r84) ? " (hub wake enables cleared)" : "",
+		ehciCfgRead32(0x88), ehciCfgRead32(0x8C), ehciCfgRead32(0x90), ehciCfgRead32(0x9C));
+}
+
 static void ehciCfgWrite16(uint8_t reg, uint16_t v) {
 	asm volatile("outl %0, %1" : : "a"(ehciCf8 | (reg & 0xFCU)), "Nd"(static_cast<uint16_t>(0xCF8)));
 	asm volatile("outw %0, %1" : : "a"(v), "Nd"(static_cast<uint16_t>(0xCFC + (reg & 2))));
@@ -2471,6 +2513,7 @@ static void ehciSnapshot(const char *when, bool clearPme) {
 	}
 	diskLogEvent("EHC1 %s: PMCSR %04x%s (PME_Status %u, PME_En %u, D%u), USBCMD %x USBSTS %x PORTSC1 %x PORTSC2 %x", when,
 		pmcsr, after != pmcsr ? " cleared" : "", pmcsr >> 15, (pmcsr >> 8) & 1, pmcsr & 3, cmd, sts, port1, port2);
+	ehciHubConfig(when, !strcmp(when, "before S3"));
 	// GPE0 status bits: one per wake source (on these FCHs EHC1 0x18, XHC0 0x19, the PCIe ports and LAN 0x08 ...).
 	diskLogEvent("ACPI %s: PM1 status %04x enable %04x, GPE0 status %08x enable %08x, xHCI PMCSR %04x", when,
 		acpiPm1Evt ? portIn16(acpiPm1Evt) : 0xFFFF, acpiPm1Evt ? portIn16(static_cast<uint16_t>(acpiPm1Evt + 2)) : 0xFFFF,
@@ -2879,7 +2922,10 @@ static void patchSleepFlush(KernelPatcher &patcher) {
 
 static void hookCapsProbe(KernelPatcher &patcher) {
 	ehciPmeClear = checkKernelArgument("-crehcipme");
-	ehciDiag = ehciPmeClear || checkKernelArgument("-crehcidiag");
+	if (!PE_parse_boot_argn("crehcihubwk", &ehciHubWakeClear, sizeof(ehciHubWakeClear)))
+		ehciHubWakeClear = 0;
+	ehciNoForceReset = checkKernelArgument("-crehcinoforcereset");
+	ehciDiag = ehciPmeClear || ehciHubWakeClear || ehciNoForceReset || checkKernelArgument("-crehcidiag");
 	if (!capsProbe) {
 		if (!ehciDiag)
 			return;
