@@ -1715,6 +1715,7 @@ static void sleepWatchdog(thread_call_param_t, thread_call_param_t) {
 static void ehciFind();
 static void wakeFilterPrepare();
 static void wakeFilterReport();
+static void wakeFilterRestore();
 
 static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *, void *, vm_size_t) {
 	switch (messageType) {
@@ -1755,6 +1756,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			}
 			break;
 		case kIOMessageSystemWillPowerOn:
+			wakeFilterRestore();
 			diskLogEvent("system will power on");
 			__atomic_store_n(&gpuPoweringOn, true, __ATOMIC_RELAXED);
 			__atomic_store_n(&edpWakePowerOn, true, __ATOMIC_RELAXED);
@@ -2367,6 +2369,11 @@ static void acpiBlocksFind() {
 		acpiPm1Evt = 0x400;
 	if (!acpiGpe0)
 		acpiGpe0 = 0x420, acpiGpe0Half = 4;
+	if (!fchSmiMap)
+		if (auto *mem = IOMemoryDescriptor::withPhysicalAddress(0xFED80200, 0x100, kIODirectionInOut)) {
+			fchSmiMap = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache);
+			mem->release();
+		}
 }
 
 static void ehciFind() {
@@ -2394,11 +2401,6 @@ static void ehciFind() {
 		iter->release();
 	diskLogEvent("EHC1: config %x, PM capability %x, BAR0 %s; xHCI config %x PM %x; PM1a_EVT %x, GPE0 %x (+%x)", ehciCf8,
 		ehciPm, ehciMap ? "mapped" : "not mapped", xhciCf8, xhciPm, acpiPm1Evt, acpiGpe0, acpiGpe0Half);
-	if (!fchSmiMap)
-		if (auto *mem = IOMemoryDescriptor::withPhysicalAddress(0xFED80200, 0x100, kIODirectionInOut)) {
-			fchSmiMap = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache);
-			mem->release();
-		}
 	if (!fchGpioMap)
 		if (auto *mem = IOMemoryDescriptor::withPhysicalAddress(0xFED81500, 0x300, kIODirectionInOut)) {
 			fchGpioMap = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapInhibitCache);
@@ -2633,6 +2635,16 @@ static bool wakeAllowNone;  // -crwakeallownone (test): disarm every GPE, USB to
 // 1793794001: with nothing armed the Dell stayed in S3 (2 min, power button), with the USB GPEs armed it is back after
 // about 1 s, so which controller is it?
 static bool wakeAlternate;
+// The FCH's USB wake lines share GPEs: SciMap sources 24, 25 and 26 are the wake lines of the USB controllers at PCI
+// devices 0x12, 0x13 and 0x16 (EHCI/OHCI), and the firmware sends all three to one GPE (the Dell: 0x18, EHC1's _PRW).
+// Stoney only has the controller at 0x12, but arming GPE 0x18 for EHC1 also arms the lines of the absent ones, and
+// one of them fires as the machine enters S3: back after ~1 s, with EHC1 itself quiet (no PME, no port resume, no hub
+// counter), while arming only the xHCI's GPE 0x19 let the Dell stay in S3 (log 1793795506, -crwakealternate). So at
+// S3 entry, a USB wake source whose controller isn't present and whose GPE is armed is routed to GPE 0 (never armed),
+// and put back on wake. -crnowakeremap leaves the routing alone.
+static constexpr uint8_t WakeUsbSources[] {24, 25, 26}, WakeUsbDevices[] {0x12, 0x13, 0x16};
+static uint8_t wakeRemapSrc[3], wakeRemapSaved[3], wakeRemapCount;
+static bool wakeRemapApplied, wakeRemapOff;
 static uint8_t wakeAllow[32], wakeEnBefore[32], wakeEnAfter[32];
 static uint32_t wakeAllowGpes, wakeFiltered;
 static uint16_t wakePm1Before;
@@ -2690,6 +2702,32 @@ static void wakeFilterPrepare() {
 		if (devices)
 			devices->release();
 	}
+	wakeRemapCount = 0;
+	if (fchSmiMap && !wakeRemapOff) {
+		auto *sciMap = reinterpret_cast<volatile uint8_t *>(fchSmiMap->getVirtualAddress()) + 0x40;
+		char line[120];
+		int rl = snprintf(line, sizeof(line), "none");
+		for (size_t i = 0; i < sizeof(WakeUsbSources); i++) {
+			uint8_t gpe = sciMap[WakeUsbSources[i]] & 0x1F;
+			if (!gpe || !(wakeAllow[gpe / 8] & (1U << (gpe % 8))))
+				continue;
+			bool present = false;
+			auto *pcis = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
+			while (auto *pci = pcis ? OSDynamicCast(IOPCIDevice, pcis->getNextObject()) : nullptr)
+				present |= pci->getBusNumber() == 0 && pci->getDeviceNumber() == WakeUsbDevices[i] && pci->getFunctionNumber() == 0;
+			if (pcis)
+				pcis->release();
+			if (present)
+				continue;
+			if (!wakeRemapCount)
+				rl = 0;
+			wakeRemapSrc[wakeRemapCount++] = WakeUsbSources[i];
+			if (rl >= 0 && static_cast<size_t>(rl) < sizeof(line))
+				rl += snprintf(line + rl, sizeof(line) - static_cast<size_t>(rl), "%ssource %u (GPE %x, no device 0x%x)",
+					wakeRemapCount > 1 ? ", " : "", WakeUsbSources[i], gpe, WakeUsbDevices[i]);
+		}
+		diskLogEvent("wake filter: USB wake lines of absent controllers re-routed at S3 entry: %s", line);
+	}
 	if (wakeAllowNone) {
 		memset(wakeAllow, 0, sizeof(wakeAllow));
 		snprintf(wakeAllowList, sizeof(wakeAllowList), "none (-crwakeallownone)");
@@ -2701,6 +2739,14 @@ static void wakeFilterPrepare() {
 // pal_machine_sleep(type_a, type_b, bit_position, disable_mask, enable_mask) jumps here; it returns 0 (sleep the usual
 // way). Interrupts are off, only port I/O.
 extern "C" uint32_t wakeFilterPalSleep(uint8_t, uint8_t, uint32_t, uint32_t, uint32_t) {
+	if (wakeFilterOn && wakeRemapCount && fchSmiMap) {
+		auto *sciMap = reinterpret_cast<volatile uint8_t *>(fchSmiMap->getVirtualAddress()) + 0x40;
+		for (uint8_t i = 0; i < wakeRemapCount; i++) {
+			wakeRemapSaved[i] = sciMap[wakeRemapSrc[i]];
+			sciMap[wakeRemapSrc[i]] = static_cast<uint8_t>(wakeRemapSaved[i] & ~0x1F);  // GPE 0
+		}
+		wakeRemapApplied = true;
+	}
 	if (wakeFilterOn && (wakeAllowGpes || wakeAllowNone) && acpiGpe0 && acpiGpe0Half <= sizeof(wakeAllow)) {
 		for (uint16_t i = 0; i < acpiGpe0Half; i++) {
 			auto en = static_cast<uint16_t>(acpiGpe0 + acpiGpe0Half + i);
@@ -2728,6 +2774,15 @@ extern "C" uint32_t wakeFilterPalSleep(uint8_t, uint8_t, uint32_t, uint32_t, uin
 	return 0;
 }
 
+static void wakeFilterRestore() {
+	if (!wakeRemapApplied || !fchSmiMap)
+		return;
+	auto *sciMap = reinterpret_cast<volatile uint8_t *>(fchSmiMap->getVirtualAddress()) + 0x40;
+	for (uint8_t i = 0; i < wakeRemapCount; i++)
+		sciMap[wakeRemapSrc[i]] = wakeRemapSaved[i];
+	wakeRemapApplied = false;
+}
+
 static void wakeFilterReport() {
 	if (!wakeFilterOn || !wakeFiltered)
 		return;
@@ -2753,6 +2808,7 @@ static void patchSleepFlush(KernelPatcher &patcher) {
 	wakeFilterOn = !checkKernelArgument("-crnowakefilter");
 	wakeAllowNone = checkKernelArgument("-crwakeallownone");
 	wakeAlternate = checkKernelArgument("-crwakealternate");
+	wakeRemapOff = checkKernelArgument("-crnowakeremap");
 	if (checkKernelArgument("-crnosleepflush")) {
 		wakeFilterOn = false;
 		return;
