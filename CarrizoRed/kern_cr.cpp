@@ -2425,6 +2425,32 @@ static void ehciFind() {
 	}
 }
 
+// Did the machine really go into S3? The TSC restarts from near 0 when the CPU loses power, and the CMOS clock keeps
+// wall time (macOS's clock stops across sleep). Log 1793791485: no armed GPE, no GPIO wake, no power button or RTC, yet
+// WAK_STS on every return 0.13 s of awake time later; if the TSC keeps counting, the firmware never entered S3 (an SMI
+// on SLP_EN can abort and return).
+static uint64_t sleepTscBefore;
+static uint8_t sleepRtcBefore[3];
+
+static uint8_t cmosRead(uint8_t reg) {
+	portOut8(0x70, reg);  // bit 7 (NMI mask) left clear, as AppleRTC does for bank 0
+	return portIn8(0x71);
+}
+
+static void sleepClockSnapshot(bool after) {
+	uint8_t s = cmosRead(0), m = cmosRead(2), h = cmosRead(4);
+	uint64_t tsc = readTsc();
+	if (!after) {
+		sleepTscBefore = tsc;
+		sleepRtcBefore[0] = h, sleepRtcBefore[1] = m, sleepRtcBefore[2] = s;
+		return;
+	}
+	diskLogEvent("S3 check: TSC %llx before, %llx after (%s); CMOS clock %02x:%02x:%02x before, %02x:%02x:%02x after",
+		sleepTscBefore, tsc, tsc < sleepTscBefore ? "reset: the CPU was powered off, a real S3" :
+		"still counting: the CPU stayed powered, S3 never happened", sleepRtcBefore[0], sleepRtcBefore[1],
+		sleepRtcBefore[2], h, m, s);
+}
+
 static void ehciSnapshot(const char *when, bool clearPme) {
 	if (!ehciFound)
 		return;
@@ -2459,7 +2485,9 @@ static void ehciSnapshot(const char *when, bool clearPme) {
 static void wrapAcpiSleepKernel(void *func, void *refcon) {
 	if (!capsProbe) {
 		ehciSnapshot("before S3", ehciPmeClear);
+		sleepClockSnapshot(false);
 		FunctionCast(wrapAcpiSleepKernel, orgAcpiSleepKernel)(func, refcon);
+		sleepClockSnapshot(true);
 		ehciSnapshot("after S3", false);
 		return;
 	}
