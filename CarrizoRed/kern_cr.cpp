@@ -2649,6 +2649,14 @@ static bool wakeRemapApplied, wakeRemapOff;
 // whether the Dell's wake at S3 entry comes through EHC1's own wake line (keyboards on USB 2 can't wake it then).
 static bool wakeRemapAll;
 static uint8_t wakeRemapRead[3];
+// AMD's FCH EHCI doesn't signal PME# properly from D3 (AMD 42413, appendix A2; Linux keeps it out of D3 for wake,
+// commit 0bf3730b "x86/PCI: Avoid AMD SB7xx EHCI USB wakeup defect", where it works from D2). On the Dell, EHC1's own
+// wake line fired as it entered S3 with EHC1 in D3 (back after ~1 s, no PME_Status), and with that line re-routed it
+// stayed asleep (log 1793797951, -crwakeremapall). So at sleep an AMD EHCI that has PME from D2 sleeps in D2:
+// IOPCIDevice writes sleepControlBits to PMCSR when it powers the device off. -crnoehcid2 leaves D3;
+// -crxhcid2 (test) does the same for the AMD xHCI.
+static bool wakeEhciD2Off, wakeXhciD2;
+static char wakeD2List[96];
 static uint8_t wakeAllow[32], wakeEnBefore[32], wakeEnAfter[32];
 static uint32_t wakeAllowGpes, wakeFiltered;
 static uint16_t wakePm1Before;
@@ -2686,6 +2694,8 @@ static void wakeFilterPrepare() {
 	memset(wakeAllow, 0, sizeof(wakeAllow));
 	wakeAllowGpes = 0;
 	int len = snprintf(wakeAllowList, sizeof(wakeAllowList), "none");
+	int d2Len = 0;
+	wakeD2List[0] = '\0';
 	auto *iter = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
 	while (auto *pci = iter ? OSDynamicCast(IOPCIDevice, iter->getNextObject()) : nullptr) {
 		if (pci->configRead8(kIOPCIConfigClassCode + 2) != 0x0C || pci->configRead8(kIOPCIConfigClassCode + 1) != 0x03)
@@ -2695,9 +2705,24 @@ static void wakeFilterPrepare() {
 		if (wakeAlternate && strcmp(tag, (systemSleeps & 1) ? "1022:7914" : "1022:7908"))
 			continue;
 		wakeAllowPrw(OSDynamicCast(IOACPIPlatformDevice, pci->getProperty("acpi-device")), tag, len);
+		uint8_t progIf = pci->configRead8(kIOPCIConfigClassCode);
+		bool d2Wanted = pci->configRead16(kIOPCIConfigVendorID) == 0x1022 &&
+			((progIf == 0x20 && !wakeEhciD2Off) || (progIf == 0x30 && wakeXhciD2));
+		uint8_t pmOff = 0;
+		if (d2Wanted && pci->findPCICapability(kIOPCIPowerManagementCapability, &pmOff) && pmOff) {
+			uint16_t pmc = pci->configRead16(pmOff + 2);
+			IOReturn r = kIOReturnUnsupported;
+			if ((pmc & kPCIPMCD2Support) && (pmc & kPCIPMCPMESupportFromD2) && pci->hasPCIPowerManagement(kPCIPMCPMESupportFromD2))
+				r = pci->enablePCIPowerManagement(kPCIPMCSPowerStateD2);
+			if (d2Len >= 0 && static_cast<size_t>(d2Len) < sizeof(wakeD2List))
+				d2Len += snprintf(wakeD2List + d2Len, sizeof(wakeD2List) - static_cast<size_t>(d2Len), "%s%s PMC %04x %x",
+					d2Len ? ", " : "", tag, pmc, r);
+		}
 	}
 	if (iter)
 		iter->release();
+	if (d2Len)
+		diskLogEvent("wake filter: sleep in D2 (AMD EHCI PME from D3 erratum): %s", wakeD2List);
 	static const char *const ids[] {"PNP0C0D", "PNP0C0C"};
 	for (auto *id : ids) {
 		auto *devices = IOService::getMatchingServices(IOService::nameMatching(id));
@@ -2818,6 +2843,8 @@ static void patchSleepFlush(KernelPatcher &patcher) {
 	wakeAlternate = checkKernelArgument("-crwakealternate");
 	wakeRemapOff = checkKernelArgument("-crnowakeremap");
 	wakeRemapAll = checkKernelArgument("-crwakeremapall");
+	wakeEhciD2Off = checkKernelArgument("-crnoehcid2");
+	wakeXhciD2 = checkKernelArgument("-crxhcid2");
 	if (checkKernelArgument("-crnosleepflush")) {
 		wakeFilterOn = false;
 		return;
