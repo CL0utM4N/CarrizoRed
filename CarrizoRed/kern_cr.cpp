@@ -2645,6 +2645,10 @@ static bool wakeAlternate;
 static constexpr uint8_t WakeUsbSources[] {24, 25, 26}, WakeUsbDevices[] {0x12, 0x13, 0x16};
 static uint8_t wakeRemapSrc[3], wakeRemapSaved[3], wakeRemapCount;
 static bool wakeRemapApplied, wakeRemapOff;
+// -crwakeremapall (test): also re-route the lines of controllers that are present (EHC1's own, source 24), to see
+// whether the Dell's wake at S3 entry comes through EHC1's own wake line (keyboards on USB 2 can't wake it then).
+static bool wakeRemapAll;
+static uint8_t wakeRemapRead[3];
 static uint8_t wakeAllow[32], wakeEnBefore[32], wakeEnAfter[32];
 static uint32_t wakeAllowGpes, wakeFiltered;
 static uint16_t wakePm1Before;
@@ -2717,7 +2721,7 @@ static void wakeFilterPrepare() {
 				present |= pci->getBusNumber() == 0 && pci->getDeviceNumber() == WakeUsbDevices[i] && pci->getFunctionNumber() == 0;
 			if (pcis)
 				pcis->release();
-			if (present)
+			if (present && !wakeRemapAll)
 				continue;
 			if (!wakeRemapCount)
 				rl = 0;
@@ -2744,6 +2748,7 @@ extern "C" uint32_t wakeFilterPalSleep(uint8_t, uint8_t, uint32_t, uint32_t, uin
 		for (uint8_t i = 0; i < wakeRemapCount; i++) {
 			wakeRemapSaved[i] = sciMap[wakeRemapSrc[i]];
 			sciMap[wakeRemapSrc[i]] = static_cast<uint8_t>(wakeRemapSaved[i] & ~0x1F);  // GPE 0
+			wakeRemapRead[i] = sciMap[wakeRemapSrc[i]];
 		}
 		wakeRemapApplied = true;
 	}
@@ -2794,6 +2799,9 @@ static void wakeFilterReport() {
 	}
 	diskLogEvent("wake filter: last sleep GPE0 enable %s -> %s (allowed: %s), PM1 enable %04x +PCIEXP_WAKE_DIS; %u sleeps "
 		"filtered", before, after, wakeAllowList, wakePm1Before, wakeFiltered);
+	for (uint8_t i = 0; i < wakeRemapCount; i++)
+		diskLogEvent("wake filter: SciMap source %u was %02x, wrote GPE 0, read back %02x", wakeRemapSrc[i],
+			wakeRemapSaved[i], wakeRemapRead[i]);
 }
 
 // Cache flush before S3 (-crnosleepflush turns it off). The ACPI specification has the OS write back and invalidate
@@ -2809,6 +2817,7 @@ static void patchSleepFlush(KernelPatcher &patcher) {
 	wakeAllowNone = checkKernelArgument("-crwakeallownone");
 	wakeAlternate = checkKernelArgument("-crwakealternate");
 	wakeRemapOff = checkKernelArgument("-crnowakeremap");
+	wakeRemapAll = checkKernelArgument("-crwakeremapall");
 	if (checkKernelArgument("-crnosleepflush")) {
 		wakeFilterOn = false;
 		return;
