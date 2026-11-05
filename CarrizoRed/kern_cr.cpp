@@ -855,6 +855,33 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 // +0xe8/+0xf0 panel table/count, +0xf2 entries.
 static mach_vm_address_t orgPanelSetDisplay, orgPanelASetDisplay;
 
+// HDMI EDID: AtiBiosParser1 (the ATOM object table rev 1.x these APU VBIOSes have) sets each connector's sense id
+// (ConnectorInfo +0x13) to its DDC line + 1, without the hardware-engine bit 0x10; BaffinHwI2cProxy::isSupported takes
+// only 0x10 | line (1-6), so every EDID read on the D509BA's HDMI port (VBIOS I2C id 0x91: line 1, hardware engine 1)
+// returned kIOReturnUnsupported and no display attached (log 1746879597). Polaris VBIOSes have rev 2 tables, whose
+// parser sets the bit. Add it for the connectors read over DDC (HDMI 0x800, DVI 0x4/0x200, VGA 0x10), not eDP/DP (AUX).
+// -crnoddcfix leaves the sense ids alone.
+static mach_vm_address_t orgParser1GetConnectorInfo;
+
+static uint32_t wrapParser1GetConnectorInfo(void *that, uint8_t *info, uint8_t &count) {
+	uint32_t ret = FunctionCast(wrapParser1GetConnectorInfo, orgParser1GetConnectorInfo)(that, info, count);
+	if (ret || !info || checkKernelArgument("-crnoddcfix"))
+		return ret;
+	for (uint8_t i = 0; i < count && i < 8; i++) {
+		auto *c = info + 0x18 * i;
+		uint32_t type;
+		memcpy(&type, c, sizeof(type));
+		uint8_t sense = c[0x13];
+		bool ddc = type == 0x800 || type == 0x4 || type == 0x200 || type == 0x10;
+		if (ddc && sense >= 1 && sense <= 6) {
+			c[0x13] = static_cast<uint8_t>(sense | 0x10);
+			diskLogEvent("hdmi: connector %u (type %x, hotplug %u): DDC sense id %x -> %x (hardware I2C engine)", i, type,
+				c[0x12], sense, c[0x13]);
+		}
+	}
+	return ret;
+}
+
 static void panelState(const char *what, void *that, bool ret) {
 	auto *b = static_cast<uint8_t *>(that);
 	auto u16 = [&](size_t off) { return *reinterpret_cast<uint16_t *>(b + off); };
@@ -1598,6 +1625,12 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 				}
 		}
 		else if (i == KextSupport) {
+			KernelPatcher::RouteRequest ddc {"__ZN14AtiBiosParser116getConnectorInfoEP13ConnectorInfoRh",
+				wrapParser1GetConnectorInfo, orgParser1GetConnectorInfo};
+			if (!routeChecked(patcher, index, ddc, slide, size)) {
+				SYSLOG("cr", "hdmi: failed to route AtiBiosParser1::getConnectorInfo (error %d)", patcher.getError());
+				patcher.clearError();
+			}
 			patchSupport(patcher, index, slide, size);
 			patchPlls(patcher, index, slide, size);
 			patchPolicy(patcher, index, slide, size);
