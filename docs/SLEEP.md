@@ -13,7 +13,7 @@ stops it (see *Open: lid*). Sonoma hung the same way as Monterey and is untested
 | ASUS VivoBook 15 D509BA | Sonoma 14 | **Wake hung** like Monterey (no picture, no panic); retest with the cache flush (see *Open: Monterey and Sonoma*) |
 | ASUS VivoBook 15 D509BA | Big Sur 11.7 | **Works** (2026-11-02), slow: ~26 s of GPU power-up (see *Also open*) |
 | ASUS VivoBook 15 D509BA | Monterey 12.7 | **Works** (2026-11-03, cache flush before S3): back 27 s after the CPU resumes, 20 s of it the GPU power-up (see *Also open*) |
-| ASUS VivoBook 15 D509BA | Lid close | **Sleeps on battery; not on AC:** macOS sees the machine in desktop mode (see *Open: lid*) |
+| ASUS VivoBook 15 D509BA | Lid close | **Works** with `SSDT-PNLF` (the panel is then macOS's built-in display, so no desktop mode); without it, only on battery |
 | Dell Inspiron 3475 (A6-9225) | Tahoe | **Works** (2026-11-05): real S3 every time, stays asleep, wakes from a USB keyboard on a USB 2 port (EHC1) or a USB 3 port (XHC0), USB 2 and USB 3 working after the wake, 5+ sleeps in a row (logs `CarrizoRed-1793870741.log`, `CarrizoRed-1793879112.log`). Needs the setup in *USB wake on the AMD FCH* |
 | Other machines, Big Sur–Ventura, Sequoia | | Untested |
 
@@ -403,14 +403,15 @@ Next, cheapest first:
 Older ideas, superseded: `pmset -g log` and `log show` around a failed attempt (pmset only shows "Entering Sleep
 state" then the next boot); `-crwakemark` phase lists (NVRAM writes stop at `IOHibernateSystemHasSlept`).
 
-## Open: lid
+## Lid (fixed with SSDT-PNLF)
 
 Closing the lid sleeps the machine on battery but not on AC (D509BA, 2026-11-05). The lid itself works (the EC's
 `_Q80` notifies `LID`, and macOS sleeps on it on battery); the kernel log shows `desktopMode 1, ac 1`. macOS treats the
 machine as a desktop with an external display (sleep factors include `ExternalDisplay`) and, like a MacBook in
 clamshell mode, doesn't sleep on lid close while on AC. Likely cause: the eDP panel attaches as `AppleDisplay` instead
 of `AppleBacklightDisplay` (check with `ioreg -lw0 -r -c AppleBacklightDisplay`). Belongs with the brightness-keys
-work, which needs the same thing.
+work, which needs the same thing. Fixed (2026-11-05): with `SSDT-PNLF` the panel attaches as `AppleBacklightDisplay`
+and the log shows `desktopMode 0`; see *Brightness* in the README.
 
 ## Also open
 

@@ -8065,7 +8065,9 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			for (waited = 0; waited < 100 && (gpuMmio[0x4823] & 0x100); waited++)
 				IODelay(100);
 		}
-		diskLogEvent("backlight: VBIOS level %u (scratch); BL_PWM cntl/cntl2/period/lock before %x %x %x %x, after VBIOS "
+		static uint32_t blLogged;
+		if (blLogged++ < 20)
+			diskLogEvent("backlight: VBIOS level %u (scratch); BL_PWM cntl/cntl2/period/lock before %x %x %x %x, after VBIOS "
 			"%x %x %x %x, after lock cycle %x %x %x %x (pending wait %d x 100 us)", level, blBefore[0], blBefore[1],
 			blBefore[2], blBefore[3], mid[0], mid[1], mid[2], mid[3], gpuMmio[0x4820], gpuMmio[0x4821], gpuMmio[0x4822],
 			gpuMmio[0x4823], waited);
