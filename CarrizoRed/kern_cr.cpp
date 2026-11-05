@@ -3145,21 +3145,31 @@ static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_
 		if (!strcmp(cls, "AtiFbStub")) {
 			IORegistryEntry *framebuffer = nullptr;
 			bool display = false;
+			// The display driver on the connection: AppleBacklightDisplay (built-in panel: brightness, clamshell) or
+			// AppleDisplay (taken for an external one: desktop mode, no lid sleep on AC).
+			const char *displayClass = "-";
 			if (auto *it = child->getChildIterator(gIOServicePlane)) {
 				while (auto *grandchild = OSDynamicCast(IORegistryEntry, it->getNextObject())) {
 					if (!framebuffer)
 						framebuffer = grandchild;
 					if (auto *it2 = grandchild->getChildIterator(gIOServicePlane)) {
-						while (auto *leaf = OSDynamicCast(IORegistryEntry, it2->getNextObject()))
-							if (!strcmp(leaf->getMetaClass()->getClassName(), "IODisplayConnect"))
-								display = true;
+						while (auto *leaf = OSDynamicCast(IORegistryEntry, it2->getNextObject())) {
+							if (strcmp(leaf->getMetaClass()->getClassName(), "IODisplayConnect"))
+								continue;
+							display = true;
+							if (auto *it3 = leaf->getChildIterator(gIOServicePlane)) {
+								if (auto *disp = OSDynamicCast(IORegistryEntry, it3->getNextObject()))
+									displayClass = disp->getMetaClass()->getClassName();
+								it3->release();
+							}
+						}
 						it2->release();
 					}
 				}
 				it->release();
 			}
-			snprintf(buf + len, size - len, "%*sfb%d conn=0x%x display=%s px=%u clk=%u\n", depth * 2, "", fb++,
-				numberProperty(child, "connector-type"), display ? "YES" : "no",
+			snprintf(buf + len, size - len, "%*sfb%d conn=0x%x display=%s (%s) px=%u clk=%u\n", depth * 2, "", fb++,
+				numberProperty(child, "connector-type"), display ? "YES" : "no", displayClass,
 				framebuffer ? numberProperty(framebuffer, "IOFBCurrentPixelCount") : 0,
 				framebuffer ? numberProperty(framebuffer, "IOFBCurrentPixelClock") : 0);
 			continue;
