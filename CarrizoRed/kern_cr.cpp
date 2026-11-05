@@ -3355,6 +3355,36 @@ static void backlightPanelsInject() {
 	iter->release();
 }
 
+// HDMI: the six HPD pins (DCE 11 HPD0-5 at 0x1898 + 8n: INT_STATUS bit 1 SENSE, bit 4 SENSE_DELAYED; INT_CONTROL bit
+// 16 INT_EN; CONTROL bit 28 HPD_EN) and DC_GPIO_HPD MASK/A/EN/Y (0x488c-0x488f), logged when they change (at most 60
+// times), so a plug, the pin it lands on and whether the pin is enabled show up whatever Apple's driver does.
+static uint32_t hpdLast[22];
+static uint32_t hpdLogged;
+
+static void hpdPoll() {
+	if (!gpuMmio || hpdLogged >= 60)
+		return;
+	uint32_t now[22];
+	for (uint32_t n = 0; n < 6; n++) {
+		now[n * 3] = gpuMmio[0x1898 + 8 * n];
+		now[n * 3 + 1] = gpuMmio[0x1899 + 8 * n];
+		now[n * 3 + 2] = gpuMmio[0x189A + 8 * n];
+	}
+	for (uint32_t i = 0; i < 4; i++)
+		now[18 + i] = gpuMmio[0x488C + i];
+	if (!memcmp(now, hpdLast, sizeof(now)))
+		return;
+	memcpy(hpdLast, now, sizeof(now));
+	hpdLogged++;
+	char line[400];
+	int len = snprintf(line, sizeof(line), "hpd:");
+	for (uint32_t n = 0; n < 6 && len > 0 && static_cast<size_t>(len) < sizeof(line); n++)
+		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %u[sense %u en %u int %u: %x %x %x]", n,
+			(now[n * 3] >> 1) & 1, (now[n * 3 + 2] >> 28) & 1, (now[n * 3 + 1] >> 16) & 1, now[n * 3], now[n * 3 + 1],
+			now[n * 3 + 2]);
+	diskLogEvent("%s; GPIO_HPD mask %x a %x en %x y %x", line, now[18], now[19], now[20], now[21]);
+}
+
 // One line per framebuffer: connector type, whether a display is attached (an IODisplayConnect child), and the
 // current mode's pixel count and clock. Other children: class (name), two levels deep.
 static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_t size) {
@@ -4153,6 +4183,9 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				backlightPanelsInject();
 		}
 
+		if (!__atomic_load_n(&gpuSleeping, __ATOMIC_RELAXED))
+			hpdPoll();
+
 		// The registry walk below: every second during start-up, every 10 s once Metal is drawing.
 		if (tick % 2 || (desktopRunning() && tick % 20)) {
 			IOSleep(500);
@@ -4434,6 +4467,14 @@ namespace {
 		{"__ZN13AtomBiosProxy16selectCrtcSourceEPK19ActiveConnectorInfo", "atom.selectCrtcSource", InSupport, false, false, 0},
 		{"__ZN27BaffinDisplayPortConnection13eDPPanelPowerEb", "eDPPanelPower", InController, false, false, 0, 1},
 		{"__ZN27BaffinBiosDigitalConnection12setBacklightEh", "setBacklight", InController, false, false, 0, 1},
+		// HDMI (D509BA, log 1746878243: monitor plugged in at boot and hot-plugged, fb1 conn 0x800 never got a display,
+		// no EDID read): how Apple senses each connector and whether the hot-plug interrupt arrives.
+		{"__ZN13ATIController8hpdSenseEh", "hpdSense", InSupport, false, false, 0, 1},
+		{"__ZN12ATIConnector11isConnectedEh", "conn.isConnected", InSupport, false, false, 0, 1},
+		{"__ZN13ATIController13handleHotPlugEhb", "handleHotPlug", InSupport, true, false, 0, 3},
+		{"__ZN22BaffinHotPlugInterrupt6handleEPv", "hpdIrq", InController, true, false, 0},
+		{"__ZN22BaffinHotPlugInterrupt13enableCircuitEv", "hpdEnableCircuit", InController, true, false, 0},
+		{"__ZN14AMDFramebuffer11isConnectedEv", "fb.isConnected", InFramebuffer, false, false, 0},
 		{"__ZN17AMD9500Controller11turnOnDigonEb", "turnOnDigon", InController, false, false, 0, 1},
 		// Acceleration (Phase 3): HWServices loads the HWLibs plug-in (CAIL, which has its own Stoney support: device
 		// table row 0x98E4 -> STONEY_A0, Cail_Stoney_InitFunctionPointer), then the AMDRadeonX4000 accelerator brings up
@@ -4685,6 +4726,13 @@ namespace {
 		if (!strcmp(stages[N].name, "initializeProjectDependentResources"))
 			controllerReady = true;
 		traceEvent(stages[N].name, true, static_cast<uint32_t>(ret));
+		// HDMI detection: the frequent sense calls, argument and result, the first 60 into the disk log.
+		if (!strcmp(stages[N].name, "hpdSense") || !strcmp(stages[N].name, "conn.isConnected") ||
+			!strcmp(stages[N].name, "fb.isConnected")) {
+			static uint32_t senseLogged;
+			if (__atomic_fetch_add(&senseLogged, 1, __ATOMIC_RELAXED) < 60)
+				diskLogEvent("hdmi: %s(%x) = %x", stages[N].name, arg, static_cast<uint32_t>(ret));
+		}
 		// Mode 5: d points at a status buffer the call fills (DP training: per-lane status read from the DPCD).
 		if (stages[N].arg == 5 && d)
 			traceEvent("  status", true, *static_cast<uint32_t *>(d));
@@ -4698,7 +4746,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 180, "one wrapper per stage");
+		static_assert(arrsize(stages) == 186, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -4723,7 +4771,8 @@ namespace {
 			CR_WRAP(153), CR_WRAP(154), CR_WRAP(155), CR_WRAP(156), CR_WRAP(157), CR_WRAP(158), CR_WRAP(159), CR_WRAP(160),
 			CR_WRAP(161), CR_WRAP(162), CR_WRAP(163), CR_WRAP(164), CR_WRAP(165), CR_WRAP(166), CR_WRAP(167), CR_WRAP(168),
 			CR_WRAP(169), CR_WRAP(170), CR_WRAP(171), CR_WRAP(172), CR_WRAP(173), CR_WRAP(174), CR_WRAP(175), CR_WRAP(176),
-			CR_WRAP(177), CR_WRAP(178), CR_WRAP(179),
+			CR_WRAP(177), CR_WRAP(178), CR_WRAP(179), CR_WRAP(180), CR_WRAP(181), CR_WRAP(182), CR_WRAP(183), CR_WRAP(184),
+			CR_WRAP(185),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
