@@ -867,9 +867,35 @@ static void panelState(const char *what, void *that, bool ret) {
 		static_cast<IOService *>(that)->getProperty("ApplePanel") ? "yes" : "no");
 }
 
+// Monterey's AppleIntelPanel::setDisplay, with the panel matched to the "Default" entry (no F<uid>P<product> entry for
+// this panel), loads the entry, removes "ApplePanels" and then fails storing the match as "ApplePanel" (D509BA log
+// 1746873460: -> 0 with the default table loaded, points 0 740 af7 fffe, neither property left), so AppleIntelPanelA
+// gives up and the panel gets no "brightness". Only that bookkeeping failed: store {"Default": entry} ourselves and
+// report success. Any other failure is left alone. -crnobacklight turns it off.
+static bool backlightFixOff;
+
 static bool wrapPanelSetDisplay(void *that, void *display) {
+	auto *panel = static_cast<IOService *>(that);
+	OSObject *defaultEntry = nullptr;
+	if (auto *panels = OSDynamicCast(OSDictionary, panel->getProperty("ApplePanels")))
+		if ((defaultEntry = panels->getObject("Default")))
+			defaultEntry->retain();
 	bool ret = FunctionCast(wrapPanelSetDisplay, orgPanelSetDisplay)(that, display);
 	panelState("AppleIntelPanel::setDisplay", that, ret);
+	auto *b = static_cast<uint8_t *>(that);
+	if (!ret && !backlightFixOff && defaultEntry && b[0x114] && !panel->getProperty("ApplePanels") &&
+		!panel->getProperty("ApplePanel")) {
+		if (auto *dict = OSDictionary::withCapacity(1)) {
+			if (dict->setObject("Default", defaultEntry)) {
+				panel->setProperty("ApplePanel", dict);
+				ret = true;
+				diskLogEvent("backlight: AppleIntelPanel::setDisplay failed only storing its Default match: stored it, "
+					"reporting success");
+			}
+			dict->release();
+		}
+	}
+	OSSafeReleaseNULL(defaultEntry);
 	return ret;
 }
 
@@ -4104,8 +4130,10 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		// Before the panel's IODisplay starts: AppleIntelPanelA matches early in boot, the panel ~70 s later.
 		{
 			static int backlightOff = -1;
-			if (backlightOff < 0)
+			if (backlightOff < 0) {
 				backlightOff = checkKernelArgument("-crnobacklight") ? 1 : 0;
+				backlightFixOff = backlightOff;
+			}
 			if (!backlightOff)
 				backlightPanelsInject();
 		}
