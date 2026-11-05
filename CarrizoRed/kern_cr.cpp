@@ -3145,7 +3145,19 @@ static void backlightCheck() {
 	};
 	if (auto *iter = IOService::getMatchingServices(IOService::nameMatching("backlight"))) {
 		while (auto *dev = OSDynamicCast(IOService, iter->getNextObject())) {
-			add(" device %s [", safeString(dev->getName()));
+			// AppleIntelPanelA::setDisplay writes AppleBacklightAtBoot / AppleRestoreBacklight here once it has built
+			// its brightness table (after that only getMinUsableRawBacklightValue != 0 and buildDisplayParams remain).
+			add(" device %s {", safeString(dev->getName()));
+			if (auto *props = dev->dictionaryWithProperties()) {
+				if (auto *keys = OSCollectionIterator::withCollection(props)) {
+					while (auto *key = OSDynamicCast(OSSymbol, keys->getNextObject()))
+						if (auto *num = OSDynamicCast(OSNumber, props->getObject(key)))
+							add(" %s=%llx", key->getCStringNoCopy(), num->unsigned64BitValue());
+					keys->release();
+				}
+				props->release();
+			}
+			add(" } [");
 			if (auto *kids = dev->getChildIterator(gIOServicePlane)) {
 				// The panel handler's own properties (how far its setDisplay got): names, and numbers with their value.
 				while (auto *kid = OSDynamicCast(IORegistryEntry, kids->getNextObject())) {
@@ -3158,7 +3170,9 @@ static void backlightCheck() {
 									add(" %s=%llx", key->getCStringNoCopy(), num->unsigned64BitValue());
 								else if (auto *b = OSDynamicCast(OSBoolean, obj))
 									add(" %s=%s", key->getCStringNoCopy(), b->isTrue() ? "yes" : "no");
-								else if (!OSDynamicCast(OSDictionary, obj))
+								else if (auto *dict = OSDynamicCast(OSDictionary, obj))
+									add(" %s(%u)", key->getCStringNoCopy(), dict->getCount());
+								else
 									add(" %s", key->getCStringNoCopy());
 							}
 							keys->release();
