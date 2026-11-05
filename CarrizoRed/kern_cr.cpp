@@ -1428,6 +1428,21 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 		return;
 	}
 
+	// Lilu's shared DeviceInfo (built by Lilu before any plugin's patcher callback, and what every later
+	// DeviceInfo::create() returns) recognises an AMD iGPU only by its device-id property, which the Polaris spoof
+	// changes; so it has no built-in GPU, and plugins that look for the built-in panel through it find nothing:
+	// BrightnessKeys ("unable to register any interests for GFX notifications", D509BA) never sees the Fn keys'
+	// Notify (VGA.LCD, 0x86/0x87). Record the iGPU as videoBuiltin when Lilu left it empty. -crnodevinfo leaves it.
+	if (!checkKernelArgument("-crnodevinfo")) {
+		if (auto *shared = DeviceInfo::create()) {
+			if (!shared->videoBuiltin) {
+				shared->videoBuiltin = iGPU;
+				SYSLOG("cr", "DeviceInfo: iGPU %s recorded as the built-in GPU", safeString(iGPU->getName()));
+			}
+			DeviceInfo::deleter(shared);
+		}
+	}
+
 	gpuBus = iGPU->getBusNumber();
 	gpuDevice = iGPU->getDeviceNumber();
 	// The libSC patch selects AMD's Stoney back end (SCGfx81Info); libSC gives Carrizo (CZ revisions 1-0x20) the
