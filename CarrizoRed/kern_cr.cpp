@@ -25,7 +25,7 @@
 #include <IOKit/IOMessage.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
-#include <IOKit/graphics/IODisplay.h>
+
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <pexpert/pexpert.h>
@@ -3157,14 +3157,18 @@ static void backlightCheck() {
 	} else {
 		add(" no \"backlight\" device;");
 	}
+	// No IOGraphicsFamily symbols here (CarrizoRed doesn't link against it: an unbound import of IODisplay's metaclass
+	// panicked the watcher at boot, nvram50): classes by name, display -> IODisplayConnect -> framebuffer through the
+	// registry, and only a virtual call on the framebuffer (connection 0, the panel's).
 	if (auto *iter = IOService::getMatchingServices(IOService::serviceMatching("IODisplay"))) {
-		while (auto *disp = OSDynamicCast(IODisplay, iter->getNextObject())) {
+		while (auto *disp = OSDynamicCast(IOService, iter->getNextObject())) {
 			add(" display %s", disp->getMetaClass()->getClassName());
-			auto *conn = disp->getConnection();
-			auto *fb = conn ? conn->getFramebuffer() : nullptr;
-			if (fb) {
+			auto *conn = disp->getProvider();
+			auto *fbService = conn ? conn->getProvider() : nullptr;
+			if (fbService && fbService->metaCast("IOFramebuffer")) {
+				auto *fb = static_cast<IOFramebuffer *>(fbService);
 				uintptr_t v[4] {};
-				IOReturn r = fb->getAttributeForConnection(conn->getConnection(), 'bklt', v);
+				IOReturn r = fb->getAttributeForConnection(0, 'bklt', v);
 				add(" on %s: bklt %x (%lu, %lu-%lu)", fb->getMetaClass()->getClassName(), r, static_cast<unsigned long>(v[0]),
 					static_cast<unsigned long>(v[1]), static_cast<unsigned long>(v[2]));
 			}
