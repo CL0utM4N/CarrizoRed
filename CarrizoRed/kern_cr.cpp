@@ -4050,7 +4050,9 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 
 		// Before the panel's IODisplay starts: AppleIntelPanelA matches early in boot, the panel ~70 s later.
 		{
-			static bool backlightOff = checkKernelArgument("-crnobacklight");
+			static int backlightOff = -1;
+			if (backlightOff < 0)
+				backlightOff = checkKernelArgument("-crnobacklight") ? 1 : 0;
 			if (!backlightOff)
 				backlightPanelsInject();
 		}
