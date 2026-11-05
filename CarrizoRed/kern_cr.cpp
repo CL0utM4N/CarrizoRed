@@ -4515,6 +4515,14 @@ namespace {
 		{"__ZN16BaffinHwI2cProxy11isSupportedEh", "i2c.isSupported", InController, true, false, 0, 1},
 		{"__ZN12ATIConnector20findEdidForConnectorEjP4Edidh", "conn.findEdid", InSupport, true, false, 0, 1},
 		{"__ZN12ATIConnector19checkDDCConnectionsEjjP4Edidh", "conn.checkDDC", InSupport, true, false, 0, 3},
+		// After the EDID reads (log 1746941326: doReadEDID 0 at boot and on a replug, still no display on fb1): the
+		// framebuffer's connection change and probe, and the controller's connected-connector mask.
+		{"__ZN14AMDFramebuffer17connectionChangedEv", "fb.connectionChanged", InFramebuffer, false, false, 0},
+		{"__ZN14AMDFramebuffer12requestProbeEj", "fb.requestProbe", InFramebuffer, false, false, 0, 1},
+		{"__ZN14AMDFramebuffer22canDetectNewConnectionEv", "fb.canDetect", InFramebuffer, false, false, 0},
+		{"__ZN14AMDFramebuffer19updateConnectorInfoEv", "fb.updateConnectorInfo", InFramebuffer, false, false, 0},
+		{"__ZN13ATIController18doConnectionsProbeEv", "ctl.doConnectionsProbe", InSupport, false, false, 0},
+		{"__ZN13ATIController17getConnectedFlagsEv", "ctl.connectedFlags", InSupport, false, false, 0},
 		{"__ZN17AMD9500Controller11turnOnDigonEb", "turnOnDigon", InController, false, false, 0, 1},
 		// Acceleration (Phase 3): HWServices loads the HWLibs plug-in (CAIL, which has its own Stoney support: device
 		// table row 0x98E4 -> STONEY_A0, Cail_Stoney_InitFunctionPointer), then the AMDRadeonX4000 accelerator brings up
@@ -4828,10 +4836,11 @@ namespace {
 		traceEvent(stages[N].name, true, static_cast<uint32_t>(ret));
 		// HDMI detection: the frequent sense calls, argument and result, the first 60 into the disk log.
 		if (!strcmp(stages[N].name, "hpdSense") || !strcmp(stages[N].name, "conn.isConnected") ||
-			!strcmp(stages[N].name, "fb.isConnected")) {
+			!strncmp(stages[N].name, "fb.", 3) || !strncmp(stages[N].name, "ctl.", 4)) {
 			static uint32_t senseLogged;
-			if (__atomic_fetch_add(&senseLogged, 1, __ATOMIC_RELAXED) < 60)
-				diskLogEvent("hdmi: %s(%x) = %x", stages[N].name, arg, static_cast<uint32_t>(ret));
+			if (__atomic_fetch_add(&senseLogged, 1, __ATOMIC_RELAXED) < 150)
+				diskLogEvent("hdmi: %s(this %llx, %x) = %x", stages[N].name, reinterpret_cast<uint64_t>(a) & 0xFFFFFF, arg,
+					static_cast<uint32_t>(ret));
 		}
 		// Mode 5: d points at a status buffer the call fills (DP training: per-lane status read from the DPCD).
 		if (stages[N].arg == 5 && d)
@@ -4846,7 +4855,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 191, "one wrapper per stage");
+		static_assert(arrsize(stages) == 197, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -4872,7 +4881,8 @@ namespace {
 			CR_WRAP(161), CR_WRAP(162), CR_WRAP(163), CR_WRAP(164), CR_WRAP(165), CR_WRAP(166), CR_WRAP(167), CR_WRAP(168),
 			CR_WRAP(169), CR_WRAP(170), CR_WRAP(171), CR_WRAP(172), CR_WRAP(173), CR_WRAP(174), CR_WRAP(175), CR_WRAP(176),
 			CR_WRAP(177), CR_WRAP(178), CR_WRAP(179), CR_WRAP(180), CR_WRAP(181), CR_WRAP(182), CR_WRAP(183), CR_WRAP(184),
-			CR_WRAP(185), CR_WRAP(186), CR_WRAP(187), CR_WRAP(188), CR_WRAP(189), CR_WRAP(190),
+			CR_WRAP(185), CR_WRAP(186), CR_WRAP(187), CR_WRAP(188), CR_WRAP(189), CR_WRAP(190), CR_WRAP(191), CR_WRAP(192),
+			CR_WRAP(193), CR_WRAP(194), CR_WRAP(195), CR_WRAP(196),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
