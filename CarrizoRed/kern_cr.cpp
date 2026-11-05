@@ -3224,6 +3224,43 @@ static void backlightCheck() {
 	diskLogEvent("%s", line);
 }
 
+// Brightness: AppleBacklight.kext's AppleIntelPanelA (on SSDT-PNLF's "backlight" device) is what gives the built-in
+// panel its "brightness" display parameter (slider, keys). Its setDisplay looks the panel up in its own "ApplePanels"
+// property (keys F<uid>P<product>, ..., then "Default") and returns false without one; Catalina's personality carries
+// 194 entries, Monterey's has none (D509BA log 1746870993: only IODisplayParameters), so the panel never got the
+// parameter. With a "Default" entry and a framebuffer that answers kConnectionRawBacklight ('bklt', AMD's does: 0-255),
+// it builds its brightness curve from the framebuffer's range (0, max/4, 3max/4, max*1021/1024) and drives the
+// backlight through 'bklt'; the entry's own four big-endian points are then not used. So CarrizoRed gives it one,
+// with its own points, before the panel's IODisplay starts (that's when the display collects its parameter handlers).
+// -crnobacklight leaves it alone.
+static bool backlightPanelsDone;
+
+static void backlightPanelsInject() {
+	if (backlightPanelsDone)
+		return;
+	auto *iter = IOService::getMatchingServices(IOService::serviceMatching("AppleIntelPanelA"));
+	if (!iter)
+		return;
+	while (auto *panel = OSDynamicCast(IOService, iter->getNextObject())) {
+		backlightPanelsDone = true;
+		if (panel->getProperty("ApplePanels") || panel->getProperty("ApplePanel")) {
+			diskLogEvent("backlight: AppleIntelPanelA already has a panel table, left alone");
+			continue;
+		}
+		static const uint8_t points[8] {0x00, 0x00, 0x40, 0x00, 0xC0, 0x00, 0xFF, 0xFE};
+		auto *dict = OSDictionary::withCapacity(1);
+		auto *data = OSData::withBytes(points, sizeof(points));
+		if (dict && data) {
+			dict->setObject("Default", data);
+			panel->setProperty("ApplePanels", dict);
+			diskLogEvent("backlight: gave AppleIntelPanelA a Default panel entry (Monterey and later have none)");
+		}
+		OSSafeReleaseNULL(data);
+		OSSafeReleaseNULL(dict);
+	}
+	iter->release();
+}
+
 // One line per framebuffer: connector type, whether a display is attached (an IODisplayConnect child), and the
 // current mode's pixel count and clock. Other children: class (name), two levels deep.
 static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_t size) {
@@ -4009,6 +4046,13 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 							stageNames[i], ms - stageEnterMs[i]));
 				self->panicReport(t, now, reason);
 			}
+		}
+
+		// Before the panel's IODisplay starts: AppleIntelPanelA matches early in boot, the panel ~70 s later.
+		{
+			static bool backlightOff = checkKernelArgument("-crnobacklight");
+			if (!backlightOff)
+				backlightPanelsInject();
 		}
 
 		// The registry walk below: every second during start-up, every 10 s once Metal is drawing.
