@@ -288,7 +288,7 @@ struct TraceEvent {
 	bool exit;
 };
 
-static constexpr size_t TraceRingSize = 512, MaxTraceStages = 192;
+static constexpr size_t TraceRingSize = 512, MaxTraceStages = 224;
 // Catalina's GPU power-up runs ~40 s longer than Sonoma's (slow CAIL waits) but completes, so it gets more room.
 static constexpr uint64_t WatchdogMs = 60000, WatchdogMsCatalina = 180000;
 static TraceEvent traceRing[TraceRingSize];
