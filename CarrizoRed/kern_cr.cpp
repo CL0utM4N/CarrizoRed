@@ -8017,9 +8017,44 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	}
 	if (aux && __atomic_load_n(&dcAuxOn, __ATOMIC_RELAXED))
 		dcAuxPrepare();
+	uint32_t blBefore[4] {};
+	bool blCall = table == AtomTransmitterTable && params && static_cast<uint8_t *>(params)[3] == 4 && gpuMmio;
+	if (blCall)
+		for (int i = 0; i < 4; i++)
+			blBefore[i] = gpuMmio[0x4820 + i];
 	uint8_t ok = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that, table, params,
 		flag);
 	call->ok = static_cast<uint8_t>((ok & 1) | patched);
+	// Brightness: AppleBacklight sets a level through the framebuffer ('bklt'), and Apple's BaffinBiosDigitalConnection::
+	// setBacklight puts it in BIOS_SCRATCH_2 and runs this table with ATOM_TRANSMITTER_ACTION_BL_BRIGHTNESS_CONTROL (4).
+	// On the D509BA BL_PWM_CNTL's duty then follows the level (c000fa00 -> c0009f2e for 162 of 255, log 1746874764) but
+	// the screen doesn't change. On DCE 11 the backlight PWM registers are double-buffered behind BL_PWM_GRP1_REG_LOCK
+	// (0x4823), and Linux DC's driver_set_backlight (dce_panel_cntl.c) writes the duty inside a lock: IGNORE_MASTER_LOCK_EN
+	// (bit 31) + REG_LOCK (bit 0), the BL_PWM_CNTL write, REG_LOCK cleared, then a wait for REG_UPDATE_PENDING (bit 8) to
+	// clear. Do that with the duty the VBIOS just set, and log BL_PWM_CNTL/CNTL2/PERIOD_CNTL/GRP1_REG_LOCK around it.
+	// -crnoblupdate skips the lock cycle (log only).
+	if (blCall) {
+		uint32_t level = static_cast<uint32_t>(gpuMmio[0x5CB] >> 8) & 0xFF;  // BIOS_SCRATCH_2: ATOM_S2_CURRENT_BL_LEVEL
+		uint32_t mid[4];
+		for (int i = 0; i < 4; i++)
+			mid[i] = gpuMmio[0x4820 + i];
+		int waited = -1;
+		static int blUpdateOff = -1;
+		if (blUpdateOff < 0)
+			blUpdateOff = checkKernelArgument("-crnoblupdate") ? 1 : 0;
+		if (!blUpdateOff) {
+			uint32_t lock = gpuMmio[0x4823];
+			gpuMmio[0x4823] = lock | 0x80000001U;
+			gpuMmio[0x4820] = mid[0];
+			gpuMmio[0x4823] = (lock | 0x80000000U) & ~1U;
+			for (waited = 0; waited < 100 && (gpuMmio[0x4823] & 0x100); waited++)
+				IODelay(100);
+		}
+		diskLogEvent("backlight: VBIOS level %u (scratch); BL_PWM cntl/cntl2/period/lock before %x %x %x %x, after VBIOS "
+			"%x %x %x %x, after lock cycle %x %x %x %x (pending wait %d x 100 us)", level, blBefore[0], blBefore[1],
+			blBefore[2], blBefore[3], mid[0], mid[1], mid[2], mid[3], gpuMmio[0x4820], gpuMmio[0x4821], gpuMmio[0x4822],
+			gpuMmio[0x4823], waited);
+	}
 	// Wake #25 (log 1793354410): AUX works and the backlight comes on, but Apple's link training fails clock recovery at
 	// every swing. At boot, Apple's VBIOS ENABLE runs with the UNIPHY analogue registers still holding the firmware's
 	// values (UNIPHY_TMDP_REG3-5 230e0001/9000000/48a300aa) and training passes; after S3 they read reset values
