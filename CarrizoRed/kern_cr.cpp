@@ -3061,7 +3061,7 @@ static void mirrorKernelLog() {
 		return;
 	}
 	static const char *const keys[] {"PM ", "PMRD", "leep", "ake", "imeout", "ibernat", "IOPCI", "Radeon", "AMD", "ATI",
-		"GPU", "isplay", "AGDC", "AGDP", "ccelerator", "Failed to"};
+		"GPU", "isplay", "AGDC", "AGDP", "ccelerator", "Failed to", "Panel", "acklight", "rightness"};
 	// IOGraphicsAccelerator2::start reports why it gave up through os_log, which reaches the message buffer but not
 	// the verbose screen (Catalina installer: accel.start = 0 after hw.init = 1, and the installer's /var/log is lost).
 	// Echo those lines to the screen too, a few dozen at most.
@@ -3243,8 +3243,12 @@ static void backlightPanelsInject() {
 		return;
 	while (auto *panel = OSDynamicCast(IOService, iter->getNextObject())) {
 		backlightPanelsDone = true;
-		if (panel->getProperty("ApplePanels") || panel->getProperty("ApplePanel")) {
-			diskLogEvent("backlight: AppleIntelPanelA already has a panel table, left alone");
+		auto *panels = OSDynamicCast(OSDictionary, panel->getProperty("ApplePanels"));
+		auto *single = panel->getProperty("ApplePanel");
+		if (panels || single) {
+			diskLogEvent("backlight: AppleIntelPanelA %llx already has %s (%u entries, Default %s), left alone",
+				panel->getRegistryEntryID(), panels ? "ApplePanels" : "ApplePanel", panels ? panels->getCount() : 1,
+				panels && panels->getObject("Default") ? "yes" : "no");
 			continue;
 		}
 		static const uint8_t points[8] {0x00, 0x00, 0x40, 0x00, 0xC0, 0x00, 0xFF, 0xFE};
