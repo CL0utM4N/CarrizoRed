@@ -1,17 +1,19 @@
 # Sleep and wake
 
-Status 2026-11-05. Sleep works on Catalina, Big Sur and **Monterey 12.7** (fixed: macOS didn't flush the CPU caches
-before S3, see *The fix: cache flush before S3*), and on **Tahoe** on the Dell Inspiron 3475, where USB keyboards on
-both the USB 2 and the USB 3 ports wake it and nothing else does (see *USB wake on the AMD FCH*). Sonoma hung the same
-way as Monterey and is next to test. This page is where to pick it up.
+Status 2026-11-05: **sleep is done** on both test machines. It works on Catalina, Big Sur and **Monterey 12.7** (fixed:
+macOS didn't flush the CPU caches before S3, see *The fix: cache flush before S3*), and with the USB wake setup (see
+*USB wake on the AMD FCH*) on the Dell Inspiron 3475 (Tahoe) and the ASUS VivoBook 15 D509BA: real S3, no wakes of its
+own, and USB keyboards on the USB 2 and USB 3 ports wake it. Lid close sleeps on battery; on AC macOS's desktop mode
+stops it (see *Open: lid*). Sonoma hung the same way as Monterey and is untested since the cache flush.
 
 | Machine | macOS | Result |
 |---|---|---|
-| ASUS VivoBook 15 D509BA (A9-9425) | Catalina 10.15.7 | **Works:** sleeps (fans off), wakes on a key press with a clean picture. Tested with the old `SSDT-GPRW` workaround (below); retest with the USB wake setup |
+| ASUS VivoBook 15 D509BA (A9-9425) | Big Sur–Sequoia test EFI | **Works** (2026-11-05) with the USB wake setup (`SSDT-GPRW` removed): sleeps and stays asleep, wakes from USB keyboards, everything working after the wake |
+| ASUS VivoBook 15 D509BA (A9-9425) | Catalina 10.15.7 | **Works:** sleeps (fans off), wakes on a key press with a clean picture. Tested with the old `SSDT-GPRW` workaround (below) |
 | ASUS VivoBook 15 D509BA | Sonoma 14 | **Wake hung** like Monterey (no picture, no panic); retest with the cache flush (see *Open: Monterey and Sonoma*) |
 | ASUS VivoBook 15 D509BA | Big Sur 11.7 | **Works** (2026-11-02), slow: ~26 s of GPU power-up (see *Also open*) |
 | ASUS VivoBook 15 D509BA | Monterey 12.7 | **Works** (2026-11-03, cache flush before S3): back 27 s after the CPU resumes, 20 s of it the GPU power-up (see *Also open*) |
-| ASUS VivoBook 15 D509BA | Lid close | **Doesn't sleep:** macOS sees the machine in desktop mode (see *Open: lid*) |
+| ASUS VivoBook 15 D509BA | Lid close | **Sleeps on battery; not on AC:** macOS sees the machine in desktop mode (see *Open: lid*) |
 | Dell Inspiron 3475 (A6-9225) | Tahoe | **Works** (2026-11-05): real S3 every time, stays asleep, wakes from a USB keyboard on a USB 2 port (EHC1) or a USB 3 port (XHC0), USB 2 and USB 3 working after the wake, 5+ sleeps in a row (logs `CarrizoRed-1793870741.log`, `CarrizoRed-1793879112.log`). Needs the setup in *USB wake on the AMD FCH* |
 | Other machines, Big Sur–Ventura, Sequoia | | Untested |
 
@@ -403,10 +405,12 @@ state" then the next boot); `-crwakemark` phase lists (NVRAM writes stop at `IOH
 
 ## Open: lid
 
-Closing the lid doesn't sleep. The kernel log shows `clamshell closed 1, disabled 0, desktopMode 1`: macOS treats the
-machine as a desktop with an external display (sleep factors include `ExternalDisplay`), which disables clamshell sleep.
-Likely cause: the eDP panel attaches as `AppleDisplay` instead of `AppleBacklightDisplay` (check with
-`ioreg -lw0 -r -c AppleBacklightDisplay`). Belongs with the brightness-keys work, which needs the same thing.
+Closing the lid sleeps the machine on battery but not on AC (D509BA, 2026-11-05). The lid itself works (the EC's
+`_Q80` notifies `LID`, and macOS sleeps on it on battery); the kernel log shows `desktopMode 1, ac 1`. macOS treats the
+machine as a desktop with an external display (sleep factors include `ExternalDisplay`) and, like a MacBook in
+clamshell mode, doesn't sleep on lid close while on AC. Likely cause: the eDP panel attaches as `AppleDisplay` instead
+of `AppleBacklightDisplay` (check with `ioreg -lw0 -r -c AppleBacklightDisplay`). Belongs with the brightness-keys
+work, which needs the same thing.
 
 ## Also open
 
