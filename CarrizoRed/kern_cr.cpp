@@ -3137,7 +3137,7 @@ static uint32_t numberProperty(IORegistryEntry *entry, const char *key) {
 // connector's feature bit 0x8 (backlight) is set. Logs each link: the display class, what is attached to the
 // backlight device, the display's parameters, and the framebuffer's 'bklt' answer.
 static void backlightCheck() {
-	char line[480];
+	static char line[1536];
 	int len = snprintf(line, sizeof(line), "backlight check:");
 	auto add = [&](const char *fmt, auto... args) {
 		if (len >= 0 && static_cast<size_t>(len) < sizeof(line))
@@ -3147,8 +3147,26 @@ static void backlightCheck() {
 		while (auto *dev = OSDynamicCast(IOService, iter->getNextObject())) {
 			add(" device %s [", safeString(dev->getName()));
 			if (auto *kids = dev->getChildIterator(gIOServicePlane)) {
-				while (auto *kid = OSDynamicCast(IORegistryEntry, kids->getNextObject()))
-					add(" %s", kid->getMetaClass()->getClassName());
+				// The panel handler's own properties (how far its setDisplay got): names, and numbers with their value.
+				while (auto *kid = OSDynamicCast(IORegistryEntry, kids->getNextObject())) {
+					add(" %s {", kid->getMetaClass()->getClassName());
+					if (auto *props = kid->dictionaryWithProperties()) {
+						if (auto *keys = OSCollectionIterator::withCollection(props)) {
+							while (auto *key = OSDynamicCast(OSSymbol, keys->getNextObject())) {
+								auto *obj = props->getObject(key);
+								if (auto *num = OSDynamicCast(OSNumber, obj))
+									add(" %s=%llx", key->getCStringNoCopy(), num->unsigned64BitValue());
+								else if (auto *b = OSDynamicCast(OSBoolean, obj))
+									add(" %s=%s", key->getCStringNoCopy(), b->isTrue() ? "yes" : "no");
+								else if (!OSDynamicCast(OSDictionary, obj))
+									add(" %s", key->getCStringNoCopy());
+							}
+							keys->release();
+						}
+						props->release();
+					}
+					add(" }");
+				}
 				kids->release();
 			}
 			add(" ];");
@@ -3162,7 +3180,9 @@ static void backlightCheck() {
 	// registry, and only a virtual call on the framebuffer (connection 0, the panel's).
 	if (auto *iter = IOService::getMatchingServices(IOService::serviceMatching("IODisplay"))) {
 		while (auto *disp = OSDynamicCast(IOService, iter->getNextObject())) {
-			add(" display %s", disp->getMetaClass()->getClassName());
+			// AppleIntelPanelA skips a panel whose product ID is 0xBxxx (isMCCSEnabledBuiltInPanel: MCCS-controlled).
+			add(" display %s vendor %x product %x", disp->getMetaClass()->getClassName(),
+				numberProperty(disp, "DisplayVendorID"), numberProperty(disp, "DisplayProductID"));
 			auto *conn = disp->getProvider();
 			auto *fbService = conn ? conn->getProvider() : nullptr;
 			if (fbService && fbService->metaCast("IOFramebuffer")) {
