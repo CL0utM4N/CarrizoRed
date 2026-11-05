@@ -802,6 +802,7 @@ static const char *pathAgdp[] {"/System/Library/Extensions/AppleGraphicsControl.
 // Catalina's IOPCIFamily still has the flat bundle layout.
 static const char *pathPci[] {"/System/Library/Extensions/IOPCIFamily.kext/Contents/MacOS/IOPCIFamily",
 	"/System/Library/Extensions/IOPCIFamily.kext/IOPCIFamily"};
+static const char *pathBacklight[] {"/System/Library/Extensions/AppleBacklight.kext/Contents/MacOS/AppleBacklight"};
 
 enum KextIndex : size_t {
 	KextRadeonX4000,
@@ -813,6 +814,7 @@ enum KextIndex : size_t {
 	KextAgpm,
 	KextAgdp,
 	KextPci,
+	KextBacklight,
 	KextCount,
 };
 
@@ -840,7 +842,43 @@ static KernelPatcher::KextInfo kexts[KextCount] {
 		KernelPatcher::KextInfo::Unloaded},
 	// Already loaded (boot KC) by the time Lilu runs.
 	[KextPci] = {"com.apple.iokit.IOPCIFamily", pathPci, arrsize(pathPci), {true}, {}, KernelPatcher::KextInfo::Unloaded},
+	// OSBundleRequired Safe Boot: in the boot KC, loaded before Lilu runs.
+	[KextBacklight] = {"com.apple.driver.AppleBacklight", pathBacklight, arrsize(pathBacklight), {true}, {},
+		KernelPatcher::KextInfo::Unloaded},
 };
+
+// Brightness (test): AppleIntelPanelA on SSDT-PNLF is attached and the framebuffer answers 'bklt', but the panel gets
+// no "brightness" parameter: AppleIntelPanelA::setDisplay returns false somewhere (Monterey, D509BA logs 1746871830,
+// 1746872607: its ApplePanels table consumed, no AppleBacklightAtBoot, nothing in the kernel log). Log both setDisplay
+// results with the fields they decide on (offsets as in Catalina's and Monterey's AppleBacklight): +0x108 _UID,
+// +0x114 Default table used, +0x115, +0x120 Intel framebuffer, +0x128 'bklt' framebuffer, +0x144 raw maximum,
+// +0xe8/+0xf0 panel table/count, +0xf2 entries.
+static mach_vm_address_t orgPanelSetDisplay, orgPanelASetDisplay;
+
+static void panelState(const char *what, void *that, bool ret) {
+	auto *b = static_cast<uint8_t *>(that);
+	auto u16 = [&](size_t off) { return *reinterpret_cast<uint16_t *>(b + off); };
+	auto u32 = [&](size_t off) { return *reinterpret_cast<uint32_t *>(b + off); };
+	auto ptr = [&](size_t off) { return *reinterpret_cast<uint64_t *>(b + off); };
+	diskLogEvent("backlight: %s -> %d; uid %u, default table %u, 115 %u, intel fb %d, bklt fb %d, max %u, table %d/%u, "
+		"entries %u, points %x %x %x %x, ApplePanels %s, ApplePanel %s", what, ret, u32(0x108), b[0x114], b[0x115],
+		ptr(0x120) != 0, ptr(0x128) != 0, u32(0x144), ptr(0xe8) != 0, u16(0xf0), u16(0xf2), u16(0x10c), u16(0x10e),
+		u16(0x110), u16(0x112), static_cast<IOService *>(that)->getProperty("ApplePanels") ? "yes" : "no",
+		static_cast<IOService *>(that)->getProperty("ApplePanel") ? "yes" : "no");
+}
+
+static bool wrapPanelSetDisplay(void *that, void *display) {
+	bool ret = FunctionCast(wrapPanelSetDisplay, orgPanelSetDisplay)(that, display);
+	panelState("AppleIntelPanel::setDisplay", that, ret);
+	return ret;
+}
+
+static bool wrapPanelASetDisplay(void *that, void *display) {
+	bool ret = FunctionCast(wrapPanelASetDisplay, orgPanelASetDisplay)(that, display);
+	panelState("AppleIntelPanelA::setDisplay", that, ret);
+	return ret;
+}
+
 
 CRDriver *CRDriver::callback = nullptr;
 
@@ -1507,6 +1545,17 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 		}
 		else if (i == KextPci)
 			patchPci(patcher, index, slide, size);
+		else if (i == KextBacklight) {
+			KernelPatcher::RouteRequest requests[] {
+				{"__ZN15AppleIntelPanel10setDisplayEP9IODisplay", wrapPanelSetDisplay, orgPanelSetDisplay},
+				{"__ZN16AppleIntelPanelA10setDisplayEP9IODisplay", wrapPanelASetDisplay, orgPanelASetDisplay},
+			};
+			for (auto &request : requests)
+				if (!routeChecked(patcher, index, request, slide, size)) {
+					SYSLOG("cr", "backlight: failed to route %s (error %d)", request.symbol, patcher.getError());
+					patcher.clearError();
+				}
+		}
 		else if (i == KextSupport) {
 			patchSupport(patcher, index, slide, size);
 			patchPlls(patcher, index, slide, size);
