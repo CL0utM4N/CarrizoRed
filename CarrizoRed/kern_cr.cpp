@@ -4772,6 +4772,47 @@ namespace {
 		if (i2cSnap)
 			for (size_t r = 0; r < arrsize(i2cRegs); r++)
 				i2cBefore[r] = gpuMmio[i2cRegs[r]];
+		// DDC line set-up before Apple's EDID read. BaffinHwI2cProxy writes only DC_I2C_CONTROL/ARBITRATION/SW_STATUS/
+		// TRANSACTIONn/DATA and relies on the firmware having prepared every DDC line, as a Mac's does. The D509BA's
+		// firmware left DDC2 (its HDMI port) with the pads in GPIO mode (DC_GPIO_DDC2_MASK clock/data mask bits set),
+		// no prescale (DC_I2C_DDC2_SPEED 2) and the line disabled (DC_I2C_DDC2_SETUP 0), so every read timed out (log
+		// 1746940180). Do what Linux DC does for the line (hw_gpio GPIO_MODE_HARDWARE, dce_i2c_hw set_speed and
+		// setup_engine): pads to hardware, PRESCALE = (reference / XTAL_REF_DIV) / 100 kHz with THRESHOLD 2, and
+		// ENABLE with TIME_LIMIT 255. Apple passes the 0-based line. -crnoddcprep leaves the lines alone.
+		if (gpuMmio && !strcmp(stages[N].name, "i2c.doReadEDID") && (arg & 0xFF) < 6) {
+			static int ddcPrepOff = -1;
+			if (ddcPrepOff < 0)
+				ddcPrepOff = checkKernelArgument("-crnoddcprep") ? 1 : 0;
+			uint32_t line = arg & 0xFF;
+			uint16_t speedReg = static_cast<uint16_t>(0x16DE + 2 * line), setupReg = static_cast<uint16_t>(speedReg + 1),
+				maskReg = static_cast<uint16_t>(0x4868 + 4 * line);
+			if (!ddcPrepOff) {
+				uint32_t mask = gpuMmio[maskReg], speed = gpuMmio[speedReg], setup = gpuMmio[setupReg];
+				uint32_t newMask = mask & ~0x101U, newSpeed = speed, newSetup = setup;
+				if (!(speed >> 16)) {
+					uint32_t tb = gpuMmio[0x13B];
+					uint32_t refBaseDiv = tb & 0x7F, xtalRefDiv = (tb >> 8) & 0x7F;
+					if (!xtalRefDiv)
+						xtalRefDiv = 2;
+					uint32_t refKhz = refBaseDiv ? refBaseDiv * 1000 : 48000;  // Stoney's crystal: 48 MHz
+					uint32_t prescale = refKhz / xtalRefDiv / 100;
+					newSpeed = (prescale << 16) | (2U << 8) | 2;
+				}
+				if (!(setup & 0x40))
+					newSetup = (setup & 0x00FFFFFFU) | (255U << 24) | 0x40;
+				if (newMask != mask)
+					gpuMmio[maskReg] = newMask;
+				if (newSpeed != speed)
+					gpuMmio[speedReg] = newSpeed;
+				if (newSetup != setup)
+					gpuMmio[setupReg] = newSetup;
+				static uint32_t prepLogged;
+				if ((newMask != mask || newSpeed != speed || newSetup != setup) && prepLogged++ < 8)
+					diskLogEvent("hdmi: DDC%u set up for the hardware I2C engine: pad mask %x -> %x, speed %x -> %x, setup %x -> %x "
+						"(time base %x)", line + 1, mask, gpuMmio[maskReg], speed, gpuMmio[speedReg], setup, gpuMmio[setupReg],
+						gpuMmio[0x13B]);
+			}
+		}
 		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(a, b, c, d, e, f);
 		if (i2cSnap) {
 			char line[600];
