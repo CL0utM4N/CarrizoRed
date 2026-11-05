@@ -1,17 +1,18 @@
 # Sleep and wake
 
-Status 2026-11-03. Sleep works on Catalina, Big Sur and **Monterey 12.7** (fixed: macOS didn't flush the CPU caches
-before S3, see *The fix: cache flush before S3*). Sonoma hung the same way as Monterey and is next to test. This page is
-where to pick it up.
+Status 2026-11-05. Sleep works on Catalina, Big Sur and **Monterey 12.7** (fixed: macOS didn't flush the CPU caches
+before S3, see *The fix: cache flush before S3*), and on **Tahoe** on the Dell Inspiron 3475, where USB keyboards on
+both the USB 2 and the USB 3 ports wake it and nothing else does (see *USB wake on the AMD FCH*). Sonoma hung the same
+way as Monterey and is next to test. This page is where to pick it up.
 
 | Machine | macOS | Result |
 |---|---|---|
-| ASUS VivoBook 15 D509BA (A9-9425) | Catalina 10.15.7 | **Works:** sleeps (fans off), wakes on a key press with a clean picture. Needs `SSDT-GPRW` (below) |
+| ASUS VivoBook 15 D509BA (A9-9425) | Catalina 10.15.7 | **Works:** sleeps (fans off), wakes on a key press with a clean picture. Tested with the old `SSDT-GPRW` workaround (below); retest with the USB wake setup |
 | ASUS VivoBook 15 D509BA | Sonoma 14 | **Wake hung** like Monterey (no picture, no panic); retest with the cache flush (see *Open: Monterey and Sonoma*) |
 | ASUS VivoBook 15 D509BA | Big Sur 11.7 | **Works** (2026-11-02), slow: ~26 s of GPU power-up (see *Also open*) |
 | ASUS VivoBook 15 D509BA | Monterey 12.7 | **Works** (2026-11-03, cache flush before S3): back 27 s after the CPU resumes, 20 s of it the GPU power-up (see *Also open*) |
 | ASUS VivoBook 15 D509BA | Lid close | **Doesn't sleep:** macOS sees the machine in desktop mode (see *Open: lid*) |
-| Dell Inspiron 3475 (A6-9225) | Tahoe | **Sleeps and wakes** with the cache flush (2026-11-03, `CarrizoRed-1793707503.log`), but EHC1 wakes it at once into a dark wake, every sleep, like the ASUS before `SSDT-GPRW`. Its DSDT has the same `GPRW(0x18, …)` for EHC1 (XHC0, with the keyboard and mouse, is 0x19), but on the Dell EHC1's root port 1 is an internal USB 2.0 hub (GHUB) feeding external USB 2.0 ports. The ASUS `SSDT-GPRW` stopped the instant wakes, and the USB 2.0 ports stopped working (macOS keeps the idle EHCI controller suspended and needs GPE 0x18 to see a plug-in), so it was taken out again. Next: find which port event fires the wake |
+| Dell Inspiron 3475 (A6-9225) | Tahoe | **Works** (2026-11-05): real S3 every time, stays asleep, wakes from a USB keyboard on a USB 2 port (EHC1) or a USB 3 port (XHC0), USB 2 and USB 3 working after the wake, 5+ sleeps in a row (logs `CarrizoRed-1793870741.log`, `CarrizoRed-1793879112.log`). Needs the setup in *USB wake on the AMD FCH* |
 | Other machines, Big Sur–Ventura, Sequoia | | Untested |
 
 The display-side fix is the same code on every macOS version and machine; it follows what Linux's DC driver does at
@@ -67,17 +68,49 @@ Always (boot and wake):
 Opt-in experiments that copy boot values back (not the Linux way, kept for bisecting): `-crwakeregrestore`,
 `-crtps1restore`, `-crtmdprestore`, `-cruniphyrestore`, `-crauxhpd`.
 
-## ACPI: SSDT-GPRW (D509BA)
+## USB wake on the AMD FCH
 
-On the D509BA the internal EHCI controller (EHC1, GPE 0x18: webcam and Bluetooth behind its hub) woke the machine at
-once, every ~90 s, into a dark wake. `SSDT-GPRW` returns sleep state 0 for GPE 0x18 under Darwin only; XHC0 (GPE 0x19,
-the external USB ports) stays a wake source, so USB keyboards still wake it. Lost: wake from a Bluetooth keyboard or
-mouse.
+Every Carrizo, Bristol Ridge and Stoney machine has the same USB block in the APU (the FCH): an xHCI (`1022:7914`,
+`XHC0`, GPE 0x19 on the machines seen) and an EHCI (`1022:7908`, `EHC1`, GPE 0x18) whose one root port feeds an internal
+USB 2 hub (`0438:7900`) with the USB 2 ports, webcam, card reader and Bluetooth behind it. Under macOS it woke the
+machine on its own, ~1 s after every S3 entry, until each of the causes below was fixed (Dell Inspiron 3475, Tahoe,
+2026-11-03 to 11-05; found one at a time with the EHC1/ACPI/FCH snapshots of `-crehcidiag`).
 
-It needs the OpenCore ACPI patch renaming only the method **definition** `GPRW` → `XPRW` (find `4750525702`, replace
-`5850525702`, `Count` 1). Renaming all occurrences makes the callers skip the SSDT. Source: `Support files/acpi/SSDT-GPRW.dsl`
-in the D509BA's EFI folder (CarrizoRed-RE). Other machines need their own check (`pmset -g log`, look for the wake
-reason).
+**The setup** (all four needed; the same files on any machine with AMD's reference firmware):
+1. FCHXHCIFix with `SSDT-FCHXHCI` (when `SSDT-XOSI` makes the firmware see Windows 8+) and **`SSDT-FCHSLEEP`** with its
+   OpenCore patch renaming only the `_PTS` definition (`5F50545301` → `5A50545301`, `Count` 1). See FCHXHCIFix's README.
+2. CarrizoRed (all on by default, below).
+3. No `SSDT-GPRW` or other `_PRW` override for EHC1/XHC0: they also take away keyboard wake (and on the Dell, USB 2
+   plug-in detection).
+
+**What was waking it, and what fixes each:**
+
+| Cause | Fix | Where |
+|---|---|---|
+| AMD's `FPTS` (in `_PTS`) powers EHCI off through an SMI (`FDDC (0x12, 3)`) while EHC1 is armed for wake: losing power is a wake. | Keep EHCI powered: `EHCD` set for the length of `_PTS` | `SSDT-FCHSLEEP` |
+| macOS arms every device with a `_PRW`; a PCIe port (the Ethernet controller's, GPE 0x16) signalled as the machine went down. | Arm only the USB controllers, the lid and an ACPI power button; PCIe WAKE# off (`-crnowakefilter`) | CarrizoRed, `pal_machine_sleep` |
+| The FCH routes the wake lines of three USB controllers (SciMap sources 24–26: devices 0x12, 0x13, 0x16) to one GPE; Stoney only has 0x12, and an absent one's line fired. | Move absent controllers' lines to GPE 0 at S3 entry, back on wake (`-crnowakeremap`) | CarrizoRed |
+| AMD's EHCI doesn't signal PME properly from D3 (Linux: commit 0bf3730b). | EHCI sleeps in D2 (`-crnoehcid2`) | CarrizoRed, at "will sleep" |
+| The BIOS sets the internal hub to resume on a downstream connect, disconnect or over-current in global suspend (EHCI config `0x84` bits 23:21, BKDG 55072 3.26.4.1.1), and something on it changes as the machine goes down. | Clear those three, keep wake on a device's remote wake (bit 20); also clear a stale EHCI PME_Status (`-crnoehciwakefix`) | CarrizoRed, `pal_machine_sleep` |
+| USB 3 never woke it: macOS arms the xHCI's ports properly (U3, WCE/WDE/WOE, PME_En), but the FCH needs the firmware's xHCI Sx hand-over (`FPTS` → `U3D3`: save the controller, SMI 0x67; `FWAK` → `U3D0` reloads its firmware), which an earlier `SSDT-FCHSLEEP` skipped by setting `XHCD` too. | `SSDT-FCHSLEEP` sets only `EHCD`: the xHCI goes through the firmware's path | `SSDT-FCHSLEEP` |
+
+Tried and dropped: suspending and halting the EHCI before D3 the way Linux's `ehci_bus_suspend` does (macOS leaves it
+running into D3): a hub request then timed out after the wake and USB 2 was dead. macOS's own EHCI handling works
+once the hub's wake enables are right. FCHXHCIFix also switches the webcam's hub port off during sleep, from an
+earlier round (the webcam loses power in S3, which the hub took as a connect change).
+
+**Checking it:** `pmset -g log | grep -i "wake reason"` should name `EHC1` or `XHC0` only after a key press. The disk log
+has "wake filter: sleep N, wake GPEs allowed: ..." at each sleep and "EHCI wake fix: hub wake enables (84) fcfe0018 ->
+fc1e0018 ..." after each wake (the values are the Dell's). "EHCI powered off at S3 entry" there means `SSDT-FCHSLEEP`
+isn't working.
+
+## ACPI: SSDT-GPRW (D509BA, superseded)
+
+Before the setup above, on the D509BA the internal EHCI controller (EHC1, GPE 0x18: webcam and Bluetooth behind its
+hub) woke the machine at once, every ~90 s, into a dark wake. `SSDT-GPRW` returned sleep state 0 for GPE 0x18 under
+Darwin only, with the OpenCore patch renaming only the method definition `GPRW` → `XPRW` (find `4750525702`, replace
+`5850525702`, `Count` 1). It cost wake from Bluetooth and USB 2 devices, and on the Dell it also killed USB 2 plug-in
+detection. Source: `Support files/acpi/SSDT-GPRW.dsl` in the D509BA's EFI folder (CarrizoRed-RE).
 
 ## The fix: cache flush before S3
 

@@ -1715,6 +1715,8 @@ static void sleepWatchdog(thread_call_param_t, thread_call_param_t) {
 static void ehciFind();
 static void wakeFilterPrepare();
 static void wakeFilterReport();
+static void wakeEhciPrepare();
+static void wakeEhciReport();
 static void wakeFilterRestore();
 
 static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *, void *, vm_size_t) {
@@ -1723,6 +1725,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 			systemSleeps++;
 			ehciFind();
 			wakeFilterPrepare();
+			wakeEhciPrepare();
 			wakeMarkStart();
 			if (!checkKernelArgument("-crnosleeppause")) {
 				__atomic_store_n(&gpuPoweringOn, false, __ATOMIC_RELAXED);
@@ -1783,6 +1786,7 @@ static IOReturn sleepWakeHandler(void *, void *, UInt32 messageType, IOService *
 		case kIOMessageSystemHasPoweredOn:
 			systemWakes++;
 			wakeFilterReport();
+			wakeEhciReport();
 			if (__atomic_exchange_n(&gpuSleeping, false, __ATOMIC_RELAXED))
 				diskLogEvent("watcher: GPU register reads resume (has powered on)");
 			diskLogEvent("system has powered on (%u)", systemWakes);
@@ -1842,7 +1846,7 @@ static void hookCpuSleep(KernelPatcher &patcher) {
 	capsProbe = checkKernelArgument("-crcapsprobe");
 	bool wakeMark = checkKernelArgument("-crwakemark");
 	if (!wakeMark && !capsProbe) {
-		hookCapsProbe(patcher);  // only the EHC1 check, with -crehcidiag/-crehcipme
+		hookCapsProbe(patcher);  // only the EHC1 check, with -crehcidiag
 		return;
 	}
 	KernelPatcher::RouteRequest request {"__Z16IOCPUSleepKernelv", wrapCpuSleepKernel, orgCpuSleepKernel};
@@ -2266,7 +2270,7 @@ static bool buildWakeStub32() {
 // driver asleep, interrupts off) and when acpi_sleep_kernel returns (no driver awake yet): PMCSR through the CF8/CFC
 // config ports (no locks), USBCMD/USBSTS/PORTSC through BAR0 when the controller is in D0. Found and mapped at "will
 // sleep".
-static bool ehciDiag, ehciPmeClear, ehciFound;
+static bool ehciDiag, ehciFound;
 static uint32_t ehciCf8;  // 0x80000000 | bus << 16 | device << 11 | function << 8
 static uint8_t ehciPm;
 static IOMemoryMap *ehciMap;
@@ -2351,26 +2355,15 @@ static void ehciCfgWrite32(uint8_t reg, uint32_t v) {
 //     nothing is connected, 11b always.
 //   D12F0x50 EHCI Misc Control, D12F0x54 EHCI Spare 1: PME level/pulse, D3cold PME, resume PME only out of D0, LS
 //     connect wake. D12F0x9C Hub Status: SpndO (25), RmWkUpEn (24).
-// The Dell still woke ~1 s after every S3 entry with EHC1 suspended the Linux way and every hub port off (logs
-// 1793806578, 1793807654): logged at each S3 edge, and with crehcihubwk=<mask> (bit 0 device resume, 1 over-current,
-// 2 disconnect, 3 connect) those hub wake enables are cleared and with -crehcinoforcereset D12F0x64[15:8] is cleared,
-// straight before S3.
-static uint32_t ehciHubWakeClear;
-static bool ehciNoForceReset;
-
-static void ehciHubConfig(const char *when, bool apply) {
-	uint32_t r84 = ehciCfgRead32(0x84), r64 = ehciCfgRead32(0x64);
+// Logged at each S3 edge with -crehcidiag. The wake enables in [23:21] are cleared at S3 entry by the EHCI wake fix
+// (wakeEhciPalSleep).
+static void ehciHubConfig(const char *when) {
+	uint32_t r84 = ehciCfgRead32(0x84);
 	if (r84 == ~0U)
 		return;
-	uint32_t n84 = r84 & ~((ehciHubWakeClear & 0xF) << 20), n64 = ehciNoForceReset ? (r64 & ~0xFF00U) : r64;
-	if (apply && n84 != r84)
-		ehciCfgWrite32(0x84, n84);
-	if (apply && n64 != r64)
-		ehciCfgWrite32(0x64, n64);
-	diskLogEvent("EHC1 %s config: 50 %08x 54 %08x 64 %08x%s 70 %08x 84 %08x%s 88 %08x 8C %08x 90 %08x 9C %08x", when,
-		ehciCfgRead32(0x50), ehciCfgRead32(0x54), r64, (apply && n64 != r64) ? " (force reset cleared)" : "",
-		ehciCfgRead32(0x70), ehciCfgRead32(0x84), (apply && n84 != r84) ? " (hub wake enables cleared)" : "",
-		ehciCfgRead32(0x88), ehciCfgRead32(0x8C), ehciCfgRead32(0x90), ehciCfgRead32(0x9C));
+	diskLogEvent("EHC1 %s config: 50 %08x 54 %08x 64 %08x 70 %08x 84 %08x 88 %08x 8C %08x 90 %08x 9C %08x", when,
+		ehciCfgRead32(0x50), ehciCfgRead32(0x54), ehciCfgRead32(0x64), ehciCfgRead32(0x70), r84, ehciCfgRead32(0x88),
+		ehciCfgRead32(0x8C), ehciCfgRead32(0x90), ehciCfgRead32(0x9C));
 }
 
 static void ehciCfgWrite16(uint8_t reg, uint16_t v) {
@@ -2419,7 +2412,7 @@ static void acpiBlocksFind() {
 }
 
 static void ehciFind() {
-	if (ehciFound || !(ehciDiag || ehciPmeClear))
+	if (ehciFound || !ehciDiag)
 		return;
 	acpiBlocksFind();
 	auto *iter = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
@@ -2513,7 +2506,7 @@ static void ehciSnapshot(const char *when, bool clearPme) {
 	}
 	diskLogEvent("EHC1 %s: PMCSR %04x%s (PME_Status %u, PME_En %u, D%u), USBCMD %x USBSTS %x PORTSC1 %x PORTSC2 %x", when,
 		pmcsr, after != pmcsr ? " cleared" : "", pmcsr >> 15, (pmcsr >> 8) & 1, pmcsr & 3, cmd, sts, port1, port2);
-	ehciHubConfig(when, !strcmp(when, "before S3"));
+	ehciHubConfig(when);
 	// GPE0 status bits: one per wake source (on these FCHs EHC1 0x18, XHC0 0x19, the PCIe ports and LAN 0x08 ...).
 	diskLogEvent("ACPI %s: PM1 status %04x enable %04x, GPE0 status %08x enable %08x, xHCI PMCSR %04x", when,
 		acpiPm1Evt ? portIn16(acpiPm1Evt) : 0xFFFF, acpiPm1Evt ? portIn16(static_cast<uint16_t>(acpiPm1Evt + 2)) : 0xFFFF,
@@ -2529,14 +2522,14 @@ static void ehciSnapshot(const char *when, bool clearPme) {
 
 static void wrapAcpiSleepKernel(void *func, void *refcon) {
 	if (!capsProbe) {
-		ehciSnapshot("before S3", ehciPmeClear);
+		ehciSnapshot("before S3", false);
 		sleepClockSnapshot(false);
 		FunctionCast(wrapAcpiSleepKernel, orgAcpiSleepKernel)(func, refcon);
 		sleepClockSnapshot(true);
 		ehciSnapshot("after S3", false);
 		return;
 	}
-	ehciSnapshot("before S3", ehciPmeClear);
+	ehciSnapshot("before S3", false);
 	// One 1 s blink, or three short ones when the trampoline wasn't patched.
 	bool patched = patchWakeTrampoline();
 	if (patched && wakeMemCheck) {
@@ -2700,6 +2693,22 @@ static uint8_t wakeRemapRead[3];
 // -crxhcid2 (test) does the same for the AMD xHCI.
 static bool wakeEhciD2Off, wakeXhciD2;
 static char wakeD2List[96];
+// EHCI wake fix (-crnoehciwakefix turns it off), for the FCH EHCI (1022:7908) at S3 entry, in wakeFilterPalSleep:
+//  - The FCH's own USB 2 hub (0438:7900, behind EHCI port 0: the external USB 2 ports, webcam, card reader ...) is set
+//    up by the BIOS to resume its upstream port in global suspend on a downstream connect, disconnect or over-current
+//    as well as on a device's remote wake (D12F0x84 Hub Config 1 [23:20], AMD BKDG 55072 3.26.4.1.1). Something on it
+//    changes state as the machine goes down (a device losing power), the hub resumes, and the machine is back ~1 s
+//    after every S3 entry (Dell Inspiron 3475, Tahoe: logs 1793806578 .. 1793809510, also with EHCI suspended and every
+//    hub port off the Linux way). Only the device-resume enable [20] is kept, which is all a key press needs: the Dell
+//    then stayed in S3 and woke from a USB 2 keyboard, every sleep (logs 1793810566, 1793870741).
+//  - PME_Status (PMCSR bit 15, write-1-to-clear) left set by an earlier wake keeps the next PME from reaching the ACPI
+//    controller (dark wakes don't bring EHCI back to D0); Linux clears it before enabling PME.
+// Needs the controller powered at that point: firmware whose _PTS powers EHCI off (AMD's FPTS) needs SSDT-FCHSLEEP
+// (FCHXHCIFix), otherwise the reads give all ones and nothing is written.
+static bool wakeEhciFixOff;
+static uint32_t wakeEhciCf8, wakeEhciFixed, wakeHubBefore, wakeHubAfter;
+static uint8_t wakeEhciPm;
+static uint16_t wakeEhciPmcsr;
 static uint8_t wakeAllow[32], wakeEnBefore[32], wakeEnAfter[32];
 static uint32_t wakeAllowGpes, wakeFiltered;
 static uint16_t wakePm1Before;
@@ -2707,6 +2716,77 @@ static char wakeAllowList[160];
 
 static uint8_t portIn8(uint16_t port);
 static void portOut8(uint16_t port, uint8_t v);
+
+static uint32_t cf8Read32(uint32_t cf8, uint8_t reg) {
+	asm volatile("outl %0, %1" : : "a"(cf8 | (reg & 0xFCU)), "Nd"(static_cast<uint16_t>(0xCF8)));
+	uint32_t v;
+	asm volatile("inl %1, %0" : "=a"(v) : "Nd"(static_cast<uint16_t>(0xCFC)));
+	return v;
+}
+
+static void cf8Write32(uint32_t cf8, uint8_t reg, uint32_t v) {
+	asm volatile("outl %0, %1" : : "a"(cf8 | (reg & 0xFCU)), "Nd"(static_cast<uint16_t>(0xCF8)));
+	asm volatile("outl %0, %1" : : "a"(v), "Nd"(static_cast<uint16_t>(0xCFC)));
+}
+
+static void cf8Write16(uint32_t cf8, uint8_t reg, uint16_t v) {
+	asm volatile("outl %0, %1" : : "a"(cf8 | (reg & 0xFCU)), "Nd"(static_cast<uint16_t>(0xCF8)));
+	asm volatile("outw %0, %1" : : "a"(v), "Nd"(static_cast<uint16_t>(0xCFC + (reg & 2))));
+}
+
+// The FCH EHCI's config address and PM capability, at "will sleep".
+static void wakeEhciPrepare() {
+	wakeEhciCf8 = 0;
+	if (wakeEhciFixOff)
+		return;
+	auto *iter = IOService::getMatchingServices(IOService::serviceMatching("IOPCIDevice"));
+	while (auto *pci = iter ? OSDynamicCast(IOPCIDevice, iter->getNextObject()) : nullptr) {
+		if (pci->configRead32(0) != 0x79081022)
+			continue;
+		uint8_t pm = 0;
+		pci->findPCICapability(kIOPCIPowerManagementCapability, &pm);
+		wakeEhciPm = pm;
+		wakeEhciCf8 = 0x80000000U | (static_cast<uint32_t>(pci->getBusNumber()) << 16) |
+			(static_cast<uint32_t>(pci->getDeviceNumber()) << 11) | (static_cast<uint32_t>(pci->getFunctionNumber()) << 8);
+		break;
+	}
+	if (iter)
+		iter->release();
+}
+
+// Interrupts off, at pal_machine_sleep: config space through CF8/CFC.
+static void wakeEhciPalSleep() {
+	if (!wakeEhciCf8)
+		return;
+	uint32_t r84 = cf8Read32(wakeEhciCf8, 0x84);
+	wakeHubBefore = wakeHubAfter = r84;
+	wakeEhciPmcsr = 0xFFFF;
+	if (r84 == ~0U)
+		return;
+	if (r84 & (7U << 21)) {
+		cf8Write32(wakeEhciCf8, 0x84, r84 & ~(7U << 21));
+		wakeHubAfter = cf8Read32(wakeEhciCf8, 0x84);
+	}
+	if (wakeEhciPm) {
+		auto reg = static_cast<uint8_t>(wakeEhciPm + 4);
+		wakeEhciPmcsr = cf8Read16(wakeEhciCf8, reg);
+		if (wakeEhciPmcsr != 0xFFFF && (wakeEhciPmcsr & 0x8000))
+			cf8Write16(wakeEhciCf8, reg, wakeEhciPmcsr);  // D-state and PME_En written back unchanged
+	}
+	wakeEhciFixed++;
+}
+
+static void wakeEhciReport() {
+	if (!wakeEhciCf8 || wakeEhciFixOff)
+		return;
+	if (wakeHubBefore == ~0U) {
+		diskLogEvent("EHCI wake fix: EHCI powered off at S3 entry (all ones), nothing done (needs SSDT-FCHSLEEP)");
+		return;
+	}
+	diskLogEvent("EHCI wake fix: hub wake enables (84) %08x -> %08x, PMCSR %04x%s; %u sleeps", wakeHubBefore, wakeHubAfter,
+		wakeEhciPmcsr, (wakeEhciPmcsr != 0xFFFF && (wakeEhciPmcsr & 0x8000)) ? " (stale PME_Status cleared)" : "",
+		wakeEhciFixed);
+}
 
 // One device's _PRW GPE into the allow list; tag names it in the log.
 static void wakeAllowPrw(IOACPIPlatformDevice *acpi, const char *tag, int &len) {
@@ -2811,6 +2891,7 @@ static void wakeFilterPrepare() {
 // pal_machine_sleep(type_a, type_b, bit_position, disable_mask, enable_mask) jumps here; it returns 0 (sleep the usual
 // way). Interrupts are off, only port I/O.
 extern "C" uint32_t wakeFilterPalSleep(uint8_t, uint8_t, uint32_t, uint32_t, uint32_t) {
+	wakeEhciPalSleep();
 	if (wakeFilterOn && wakeRemapCount && fchSmiMap) {
 		auto *sciMap = reinterpret_cast<volatile uint8_t *>(fchSmiMap->getVirtualAddress()) + 0x40;
 		for (uint8_t i = 0; i < wakeRemapCount; i++) {
@@ -2888,8 +2969,10 @@ static void patchSleepFlush(KernelPatcher &patcher) {
 	wakeRemapAll = checkKernelArgument("-crwakeremapall");
 	wakeEhciD2Off = checkKernelArgument("-crnoehcid2");
 	wakeXhciD2 = checkKernelArgument("-crxhcid2");
+	wakeEhciFixOff = checkKernelArgument("-crnoehciwakefix");
 	if (checkKernelArgument("-crnosleepflush")) {
 		wakeFilterOn = false;
+		wakeEhciFixOff = true;
 		return;
 	}
 	auto func = patcher.solveSymbol(KernelPatcher::KernelID, "_pal_machine_sleep");
@@ -2906,26 +2989,26 @@ static void patchSleepFlush(KernelPatcher &patcher) {
 	uint8_t jump[12] {0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0};
 	auto target = reinterpret_cast<uint64_t>(&wakeFilterPalSleep);
 	memcpy(jump + 2, &target, sizeof(target));
-	bool filter = wakeFilterOn && !memcmp(reinterpret_cast<const uint8_t *>(func) + 8, pad, sizeof(pad));
+	bool padded = !memcmp(reinterpret_cast<const uint8_t *>(func) + 8, pad, sizeof(pad));
+	bool filter = wakeFilterOn && padded, hook = (wakeFilterOn || !wakeEhciFixOff) && padded;
 	if (MachInfo::setKernelWriting(true, nullptr) != KERN_SUCCESS) {
 		SYSLOG("cr", "sleep flush: cannot write the kernel");
 		return;
 	}
-	if (filter)
+	if (hook)
 		memcpy(reinterpret_cast<void *>(func), jump, sizeof(jump));
 	else
 		memcpy(reinterpret_cast<void *>(func), flush, sizeof(flush));
 	MachInfo::setKernelWriting(false, nullptr);
 	wakeFilterOn = filter;
-	DBGLOG("cr", "sleep flush: pal_machine_sleep now flushes the caches%s", filter ? " and filters the wake sources" : "");
+	if (!hook)
+		wakeEhciFixOff = true;
+	DBGLOG("cr", "sleep flush: pal_machine_sleep now flushes the caches%s%s", filter ? " and filters the wake sources" : "",
+		hook && !wakeEhciFixOff ? ", EHCI wake fix" : "");
 }
 
 static void hookCapsProbe(KernelPatcher &patcher) {
-	ehciPmeClear = checkKernelArgument("-crehcipme");
-	if (!PE_parse_boot_argn("crehcihubwk", &ehciHubWakeClear, sizeof(ehciHubWakeClear)))
-		ehciHubWakeClear = 0;
-	ehciNoForceReset = checkKernelArgument("-crehcinoforcereset");
-	ehciDiag = ehciPmeClear || ehciHubWakeClear || ehciNoForceReset || checkKernelArgument("-crehcidiag");
+	ehciDiag = checkKernelArgument("-crehcidiag");
 	if (!capsProbe) {
 		if (!ehciDiag)
 			return;

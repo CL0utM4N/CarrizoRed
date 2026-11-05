@@ -23,7 +23,7 @@ scales with load (400 MHz idle, up to the chip's top level).
 | Display interrupts (vblank) | **Works** |
 | Acceleration / Metal (`AMDRadeonX4000`) | **Works.** The SMU loads the GPU microcode, the command processor and SDMA run, interrupts work, and WindowServer and apps render with Metal. Apple's shader compiler emits an interpolation pattern Stoney's 16-bank LDS gets wrong; CarrizoRed fixes the compiled pixel shaders before the GPU runs them, including when Metal re-uploads them (see *Metal needed*). Boot with `-crnoaccel` for an unaccelerated desktop |
 | GPU clock scaling (SCLK DPM) | **Works, on by default.** Apple's PowerPlay runs its Dummy back end here, so nothing would start the SMU's clock scaling and the GPU would stay at its lowest clock. CarrizoRed starts it 90 s after boot, from the SMU's own clock table: 400 MHz minimum, up to the top level (900 MHz on an A9-9425, 800 MHz on an A9-9420). `-crnosclkdpm` turns it off |
-| Sleep | **Works on Catalina** (D509BA): sleeps, wakes on a key press with a clean picture. CarrizoRed redoes what S3 resets in the display block the way Linux's DC driver does at resume (panel power, display clock and DP DTO, VBIOS scratch and backlight, AUX, ASSR). **Sonoma: the wake hangs** (fans only, no picture; on hold). Lid close doesn't sleep yet (macOS sees desktop mode). Other machines and versions untested. On the D509BA, `SSDT-GPRW` stops the internal USB 2 controller waking it at once. Details: [docs/SLEEP.md](docs/SLEEP.md) |
+| Sleep | **Works** on the D509BA (Catalina, Big Sur, Monterey) and the Dell Inspiron 3475 (Tahoe): real S3, and a USB keyboard on a USB 2 or USB 3 port wakes it (Dell; D509BA retest pending). CarrizoRed flushes the CPU caches before S3 (Apple's ACPI code doesn't, and the wake died without it), lets only the USB controllers, the lid and the power button wake the machine, and works around the AMD FCH's USB wake quirks; FCHXHCIFix's `SSDT-FCHSLEEP` keeps the USB 2 controller powered through S3. It redoes what S3 resets in the display block the way Linux's DC driver does at resume (panel power, display clock and DP DTO, VBIOS scratch and backlight, AUX, ASSR). Sonoma untested since the cache flush. Lid close doesn't sleep yet (macOS sees desktop mode). Details: [docs/SLEEP.md](docs/SLEEP.md) |
 | Brightness, external displays (HDMI), HDMI audio | Not done or untested |
 | Video decode/encode (UVD/VCE) | **On hold**: video plays and records in software. UVD powers up and Apple's firmware boots on it, but decoding hangs the GPU: Apple's driver gives UVD GPU virtual addresses, and Stoney's UVD has no VM support (Linux runs it in physical mode and rewrites every buffer address). Making it work means doing that translation in CarrizoRed. Findings and next steps in [docs/VIDEO.md](docs/VIDEO.md) |
 | Carrizo / Bristol Ridge | Same display engine and code paths; the SMU microcode loader, clock scaling and shader-engine fix include Carrizo's differences (second SDMA engine, second MEC), following Linux. **Untested** (no hardware): reports from owners are very welcome |
@@ -113,7 +113,7 @@ And Metal needed:
 | Freezes with clock scaling | Fixed: CarrizoRed's own interrupt-storm breaker was tripping on real interrupt bursts at higher clocks |
 | OpenGL | Expected to work, untested: Apple's AMD GL driver compiles through the same `libSC` CarrizoRed patches for Stoney (its `ATIRadeonX4000SCLib` wraps it), and the shader fix works on every submission whatever the API |
 | Video decode/encode | On hold: software decode and encode. UVD starts with Apple's firmware, but needs CarrizoRed to translate GPU virtual addresses to physical ones before it can decode ([docs/VIDEO.md](docs/VIDEO.md)) |
-| Sleep/wake | Works on Catalina (D509BA, with `SSDT-GPRW`). Sonoma's wake hangs before macOS's wake messages (on hold); lid sleep blocked by desktop mode; see [docs/SLEEP.md](docs/SLEEP.md) |
+| Sleep/wake | Works (D509BA Catalina–Monterey, Dell Tahoe with USB 2 and USB 3 keyboard wake). Sonoma to retest; lid sleep blocked by desktop mode; see [docs/SLEEP.md](docs/SLEEP.md) |
 | Carrizo / Bristol Ridge | Code paths written (SMU loader, clock scaling, caps), untested: no hardware |
 | Tahoe graphics memory | Open: Tahoe can fill the 512 MB carve-out (see *Graphics memory on Tahoe*) |
 | External displays, brightness, HDMI audio | Not started / untested |
@@ -230,6 +230,10 @@ The APUs' built-in USB 3 controller (FCH xHCI `1022:7914`) never delivers its in
 depend on CarrizoRed or Lilu, so put it in the EFI **before** installing macOS. Its README has the cause, the diagnosis
 and the list of affected machines.
 
+For sleep, also add FCHXHCIFix's `SSDT-FCHSLEEP` (with its `_PTS` rename): AMD's reference firmware powers the USB 2
+controller off in `_PTS`, which wakes the machine at once. CarrizoRed does the rest at S3 entry (see *Sleep* in
+[docs/SLEEP.md](docs/SLEEP.md)).
+
 ## Boot arguments
 
 ### Fixes (on by default; the flag turns one off)
@@ -253,6 +257,10 @@ and the list of affected machines.
 | `-crnoauxprobe` | Skip the diagnostic native AUX read of DPCD 0 (Linux DC's register sequence, bypassing the VBIOS AUX table) at boot and after a wake |
 | `-crnosleeppause` | Keep reading GPU registers from CarrizoRed's watcher (disk log status, clock sampling, display checks, SMU mailbox) while the GPU sleeps; by default they pause from "will sleep" until the GPU is powered again, since a register read once Apple has powered the GPU down can stall the CPU |
 | `-crnosleeppoweroff` | Don't power the eDP panel off before sleep (VBIOS POWER_OFF with the panel's parameters, right after Apple's DPCD 0x600 = 2), as Linux's DC does at suspend |
+| `-crnowakefilter` | Don't cut the armed wake sources down at S3 entry. By default only the USB controllers, the lid and an ACPI power button (each by its `_PRW` GPE) stay armed, and PCIe WAKE# is off: macOS arms every `_PRW` device, and a PCIe port signalling as the machine goes down brought it straight back |
+| `-crnowakeremap` | Leave the FCH's USB wake lines alone: by default the wake lines of FCH USB controllers that don't exist (SciMap sources 25 and 26 on Stoney) are moved off the shared USB GPE at S3 entry, since one of them fired as the machine went down |
+| `-crnoehcid2` | Let the FCH EHCI (`1022:7908`) sleep in D3: by default it sleeps in D2, since AMD's EHCI doesn't signal PME properly from D3 (Linux works around the same erratum) |
+| `-crnoehciwakefix` | At S3 entry, don't clear the FCH USB 2 hub's wake on connect, disconnect and over-current (EHCI config 0x84 bits 23:21; wake on a device's remote wake stays) or a stale EHCI PME_Status. With them set, the machine woke ~1 s after every S3 entry |
 | `-crtps1restore` | Experimental: after a wake, copy LVTMA_PWRSEQ_CNTL, the UNIPHY link controls, TMDP_REG3/5 and DIG_FE_CNTL from the boot's link training (TPS1) back just before Apple's training. A boot-time copy, not what Linux does |
 | `-crtmdprestore` | Experimental: after a wake, copy the UNIPHY macro registers' boot values back right after Apple's eDP transmitter ENABLE. A boot-time copy, not what Linux does |
 | `-crnowakepowercycle` | After a wake, don't power-cycle the eDP panel the way Linux's DC does (VBIOS POWER_OFF and POWER_ON with the panel's transmitter parameters, 500 ms apart, then wait for HPD); use the all-zero POWER_ON instead |
@@ -343,7 +351,7 @@ and the list of affected machines.
 | `-crnocensus` | Don't record each distinct draw set-up in the disk log |
 | `-crnomodel` | Leave the iGPU's `model` alone (by default it is named from the CPU brand string, e.g. "AMD Radeon R5 Graphics", or a `model` from DeviceProperties is kept) |
 | `-crwakemark` | Keep the sleep and wake events in the NVRAM variable `CR-wake`, from "will sleep" until 30 s after the wake, with the CPU's sleep and resume (`IOCPUSleepKernel`) and the power manager's phases (`IOPMrootDomain::tracePoint`). For a wake that leaves nothing in the disk log; forced flash writes, at most 100 per sleep. See [docs/SLEEP.md](docs/SLEEP.md) |
-| `-crehcidiag` | Test: the FCH EHCI controller (EHC1) right before S3 and right after the firmware returns: PCI PMCSR (PME_Status, PME_En, D-state) and USBCMD/USBSTS/PORTSC, in the disk log ("EHC1 before S3 ..."). `-crehcipme` also clears a set PME_Status before S3 |
+| `-crehcidiag` | Test: the FCH EHCI controller (EHC1) right before S3 and right after the firmware returns: PCI PMCSR (PME_Status, PME_En, D-state) and USBCMD/USBSTS/PORTSC, in the disk log ("EHC1 before S3 ...") and the EHCI's hub and S-state configuration |
 | `-crcapsprobe` | Test: the Caps Lock LED, set through the keyboard controller, shows how far a wake gets: blinks 1 s going to sleep; on in the wake trampoline (the first macOS code after the firmware); one off-and-on flash per resume step in `acpi_sleep_kernel` (the disk log names them at boot); on 3 s once `acpi_sleep_kernel` returns; off once `IOCPUSleepKernel` has started the CPUs. See [docs/SLEEP.md](docs/SLEEP.md) |
 | `-crwakememcheck` | Test, with `-crcapsprobe`: checksums the memory the early wake code reads just before S3 and checks it again in the trampoline; the Caps Lock LED goes off if it all matches, or blinks the number of the group that changed. See [docs/SLEEP.md](docs/SLEEP.md) |
 | `-crnosleepflush` | No cache flush before S3 (otherwise `pal_machine_sleep`, where Apple's ACPI code would flush, runs `wbinvd`: without it the CPU state saved for the wake can be lost, see [docs/SLEEP.md](docs/SLEEP.md)) |
