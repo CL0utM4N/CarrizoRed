@@ -3418,6 +3418,36 @@ static void hpdPoll() {
 	diskLogEvent("%s; GPIO_HPD mask %x a %x en %x y %x", line, now[18], now[19], now[20], now[21]);
 }
 
+// HDMI: the second pipe's state once the desktop is up (DCE 11.0 offsets): CRTC1 timing/control/status, the pixel
+// rate controls, DIG0-2 front/back end, HDMI and TMDS control, lane enables, UNIPHY A-C link/crossbar, pixel PLLs.
+static void pipeReport() {
+	if (!gpuMmio)
+		return;
+	static char line[2400];
+	int len = 0;
+	auto add = [&](const char *tag, const uint16_t *regs, size_t n) {
+		if (len >= 0 && static_cast<size_t>(len) < sizeof(line))
+			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %s:", tag);
+		for (size_t i = 0; i < n && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++)
+			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %x=%x", regs[i], gpuMmio[regs[i]]);
+	};
+	static const uint16_t crtc1[] {0x1D80, 0x1D87, 0x1D9C, 0x1D9D, 0x1DA3, 0x1DA4, 0x1DA6, 0x1B9C};
+	static const uint16_t rate[] {0x140, 0x144, 0x138};
+	static const uint16_t dig[] {0x4A00, 0x4A47, 0x4A09, 0x4A6B, 0x4A79, 0x4B00, 0x4B47, 0x4B09, 0x4B6B, 0x4B79, 0x4C00,
+		0x4C47, 0x4C09, 0x4C6B, 0x4C79};
+	static const uint16_t phy[] {0x4805, 0x4806, 0x4807, 0x4808, 0x4809, 0x480A};
+	uint16_t pll[64];
+	for (uint16_t i = 0; i < 64; i++)
+		pll[i] = static_cast<uint16_t>(0x1700 + i);
+	len = snprintf(line, sizeof(line), "pipes:");
+	add("crtc1", crtc1, arrsize(crtc1));
+	add("rate", rate, arrsize(rate));
+	add("dig", dig, arrsize(dig));
+	add("uniphy", phy, arrsize(phy));
+	add("pll", pll, arrsize(pll));
+	diskLogEvent("%s", line);
+}
+
 // One line per framebuffer: connector type, whether a display is attached (an IODisplayConnect child), and the
 // current mode's pixel count and clock. Other children: class (name), two levels deep.
 static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_t size) {
@@ -4236,6 +4266,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			if (desktopSince && !backlightChecked && t >= desktopSince + 30) {
 				backlightChecked = true;
 				backlightCheck();
+				pipeReport();
 			}
 		}
 
@@ -8199,6 +8230,20 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	uint8_t ok = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that, table, params,
 		flag);
 	call->ok = static_cast<uint8_t>((ok & 1) | patched);
+	// HDMI mode set (D509BA, log 1746945174: with -crmacgpu fb1 gets an AppleDisplay at 1920x1080 148.5 MHz but the
+	// monitor shows nothing): every display VBIOS call except AUX transfers and brightness steps, its parameters and
+	// result, the first 200.
+	if (table != AtomAuxTable && !blCall) {
+		static uint32_t vbLogged;
+		if (__atomic_fetch_add(&vbLogged, 1, __ATOMIC_RELAXED) < 200) {
+			uint8_t pb[16] {};
+			if (params)
+				memcpy(pb, params, sizeof(pb));
+			diskLogEvent("vbios: table %x -> %x params %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+				table, ok, pb[0], pb[1], pb[2], pb[3], pb[4], pb[5], pb[6], pb[7], pb[8], pb[9], pb[10], pb[11], pb[12], pb[13],
+				pb[14], pb[15]);
+		}
+	}
 	// Brightness: AppleBacklight sets a level through the framebuffer ('bklt'), and Apple's BaffinBiosDigitalConnection::
 	// setBacklight puts it in BIOS_SCRATCH_2 and runs this table with ATOM_TRANSMITTER_ACTION_BL_BRIGHTNESS_CONTROL (4).
 	// On the D509BA BL_PWM_CNTL's duty then follows the level (c000fa00 -> c0009f2e for 162 of 255, log 1746874764) but
