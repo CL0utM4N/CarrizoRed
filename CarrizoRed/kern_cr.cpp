@@ -25,6 +25,8 @@
 #include <IOKit/IOMessage.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/acpi/IOACPIPlatformDevice.h>
+#include <IOKit/graphics/IODisplay.h>
+#include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <pexpert/pexpert.h>
 #include <sys/fcntl.h>
@@ -3128,6 +3130,62 @@ static uint32_t numberProperty(IORegistryEntry *entry, const char *key) {
 	return 0;
 }
 
+// Brightness, once the desktop is up. With SSDT-PNLF the panel gets AppleBacklightDisplay, but the slider needs the
+// "brightness" display parameter, which AppleBacklight.kext's AppleIntelPanelA (on the "backlight" ACPI device) adds in
+// setDisplay only when the framebuffer answers getAttributeForConnection(0, 'bklt' kConnectionRawBacklight). AMD's
+// AMDFramebuffer passes 'bklt' to the panel's connection; BaffinSharedDigitalConnection answers it only when the
+// connector's feature bit 0x8 (backlight) is set. Logs each link: the display class, what is attached to the
+// backlight device, the display's parameters, and the framebuffer's 'bklt' answer.
+static void backlightCheck() {
+	char line[480];
+	int len = snprintf(line, sizeof(line), "backlight check:");
+	auto add = [&](const char *fmt, auto... args) {
+		if (len >= 0 && static_cast<size_t>(len) < sizeof(line))
+			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), fmt, args...);
+	};
+	if (auto *iter = IOService::getMatchingServices(IOService::nameMatching("backlight"))) {
+		while (auto *dev = OSDynamicCast(IOService, iter->getNextObject())) {
+			add(" device %s [", safeString(dev->getName()));
+			if (auto *kids = dev->getChildIterator(gIOServicePlane)) {
+				while (auto *kid = OSDynamicCast(IORegistryEntry, kids->getNextObject()))
+					add(" %s", kid->getMetaClass()->getClassName());
+				kids->release();
+			}
+			add(" ];");
+		}
+		iter->release();
+	} else {
+		add(" no \"backlight\" device;");
+	}
+	if (auto *iter = IOService::getMatchingServices(IOService::serviceMatching("IODisplay"))) {
+		while (auto *disp = OSDynamicCast(IODisplay, iter->getNextObject())) {
+			add(" display %s", disp->getMetaClass()->getClassName());
+			auto *conn = disp->getConnection();
+			auto *fb = conn ? conn->getFramebuffer() : nullptr;
+			if (fb) {
+				uintptr_t v[4] {};
+				IOReturn r = fb->getAttributeForConnection(conn->getConnection(), 'bklt', v);
+				add(" on %s: bklt %x (%lu, %lu-%lu)", fb->getMetaClass()->getClassName(), r, static_cast<unsigned long>(v[0]),
+					static_cast<unsigned long>(v[1]), static_cast<unsigned long>(v[2]));
+			}
+			add(", params");
+			if (auto *obj = disp->copyProperty("IODisplayParameters")) {
+				if (auto *params = OSDynamicCast(OSDictionary, obj)) {
+					if (auto *keys = OSCollectionIterator::withCollection(params)) {
+						while (auto *key = OSDynamicCast(OSSymbol, keys->getNextObject()))
+							add(" %s", key->getCStringNoCopy());
+						keys->release();
+					}
+				}
+				obj->release();
+			}
+			add(";");
+		}
+		iter->release();
+	}
+	diskLogEvent("%s", line);
+}
+
 // One line per framebuffer: connector type, whether a display is attached (an IODisplayConnect child), and the
 // current mode's pixel count and clock. Other children: class (name), two levels deep.
 static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_t size) {
@@ -3923,6 +3981,17 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 
 		now[0] = '\0';
 		describeChildren(self->iGPU, 0, now, sizeof(now));
+		// The backlight check once, 30 s after the desktop came up (AppleIntelPanelA has run setDisplay by then).
+		{
+			static uint32_t desktopSince;
+			static bool backlightChecked;
+			if (!desktopSince && desktopRunning())
+				desktopSince = t;
+			if (desktopSince && !backlightChecked && t >= desktopSince + 30) {
+				backlightChecked = true;
+				backlightCheck();
+			}
+		}
 
 		// AMD9500Controller's personality only matches once the iGPU has LoadController=true. On a Mac the graphics
 		// policy asks the wrangler for that (AtiGpuWrangler::vendor_doDeviceAttribute, attribute 3, flag bit 0: set
