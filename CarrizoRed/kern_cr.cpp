@@ -4762,7 +4762,26 @@ namespace {
 			__atomic_fetch_sub(&stageOpen[N], 1, __ATOMIC_RELAXED);
 			return 0;
 		}
+		// HDMI EDID (log 1746880098: BaffinHwI2cProxy::doReadEDID on DDC2 fails with e00002ca after ~450 ms): the I2C
+		// engine and the DDC2 pads before and after, the first 4 calls. DC_I2C_CONTROL, ARBITRATION, INTERRUPT_CONTROL,
+		// SW_STATUS, DDC2_HW_STATUS, DDC2_SPEED, DDC2_SETUP, TRANSACTION0/1, DATA; DC_GPIO_DDC2 MASK/A/EN/Y.
+		static const uint16_t i2cRegs[] {0x16D4, 0x16D5, 0x16D6, 0x16D7, 0x16D9, 0x16E0, 0x16E1, 0x16EA, 0x16EB, 0x16EE,
+			0x486C, 0x486D, 0x486E, 0x486F};
+		uint32_t i2cBefore[arrsize(i2cRegs)] {};
+		bool i2cSnap = gpuMmio && !strcmp(stages[N].name, "i2c.doReadEDID") && calls <= 4;
+		if (i2cSnap)
+			for (size_t r = 0; r < arrsize(i2cRegs); r++)
+				i2cBefore[r] = gpuMmio[i2cRegs[r]];
 		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(a, b, c, d, e, f);
+		if (i2cSnap) {
+			char line[600];
+			int len = snprintf(line, sizeof(line), "hdmi: doReadEDID(%x) = %x; I2C/DDC2 regs before -> after:", arg,
+				static_cast<uint32_t>(ret));
+			for (size_t r = 0; r < arrsize(i2cRegs) && len > 0 && static_cast<size_t>(len) < sizeof(line); r++)
+				len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %x=%x->%x", i2cRegs[r], i2cBefore[r],
+					gpuMmio[i2cRegs[r]]);
+			diskLogEvent("%s", line);
+		}
 		if (!strcmp(stages[N].name, "initializeProjectDependentResources"))
 			controllerReady = true;
 		traceEvent(stages[N].name, true, static_cast<uint32_t>(ret));
