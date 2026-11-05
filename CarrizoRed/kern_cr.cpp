@@ -4475,6 +4475,13 @@ namespace {
 		{"__ZN22BaffinHotPlugInterrupt6handleEPv", "hpdIrq", InController, true, false, 0},
 		{"__ZN22BaffinHotPlugInterrupt13enableCircuitEv", "hpdEnableCircuit", InController, true, false, 0},
 		{"__ZN14AMDFramebuffer11isConnectedEv", "fb.isConnected", InFramebuffer, false, false, 0},
+		// EDID (log 1746878983: HDMI's HPD2 (VBIOS: HPD GPIO 2, DDC line 1 on the hardware I2C engine) senses the monitor
+		// and Apple's isConnected says 1, but no display attaches): Apple's EDID read and its result.
+		{"__ZN16BaffinHwI2cProxy8readEdidEhtP4Edid", "i2c.readEdid", InController, true, false, 0, 3},
+		{"__ZN16BaffinHwI2cProxy10doReadEDIDEhtP4Edid", "i2c.doReadEDID", InController, true, false, 0, 3},
+		{"__ZN16BaffinHwI2cProxy11isSupportedEh", "i2c.isSupported", InController, true, false, 0, 1},
+		{"__ZN12ATIConnector20findEdidForConnectorEjP4Edidh", "conn.findEdid", InSupport, true, false, 0, 1},
+		{"__ZN12ATIConnector19checkDDCConnectionsEjjP4Edidh", "conn.checkDDC", InSupport, true, false, 0, 3},
 		{"__ZN17AMD9500Controller11turnOnDigonEb", "turnOnDigon", InController, false, false, 0, 1},
 		// Acceleration (Phase 3): HWServices loads the HWLibs plug-in (CAIL, which has its own Stoney support: device
 		// table row 0x98E4 -> STONEY_A0, Cail_Stoney_InitFunctionPointer), then the AMDRadeonX4000 accelerator brings up
@@ -4746,7 +4753,7 @@ namespace {
 
 #define CR_WRAP(n) reinterpret_cast<mach_vm_address_t>(wrapStage<n>)
 	void routeStages(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size, TraceKext kext) {
-		static_assert(arrsize(stages) == 186, "one wrapper per stage");
+		static_assert(arrsize(stages) == 191, "one wrapper per stage");
 		mach_vm_address_t wrappers[] {
 			CR_WRAP(0), CR_WRAP(1), CR_WRAP(2), CR_WRAP(3), CR_WRAP(4), CR_WRAP(5), CR_WRAP(6), CR_WRAP(7),
 			CR_WRAP(8), CR_WRAP(9), CR_WRAP(10), CR_WRAP(11), CR_WRAP(12), CR_WRAP(13), CR_WRAP(14), CR_WRAP(15),
@@ -4772,7 +4779,7 @@ namespace {
 			CR_WRAP(161), CR_WRAP(162), CR_WRAP(163), CR_WRAP(164), CR_WRAP(165), CR_WRAP(166), CR_WRAP(167), CR_WRAP(168),
 			CR_WRAP(169), CR_WRAP(170), CR_WRAP(171), CR_WRAP(172), CR_WRAP(173), CR_WRAP(174), CR_WRAP(175), CR_WRAP(176),
 			CR_WRAP(177), CR_WRAP(178), CR_WRAP(179), CR_WRAP(180), CR_WRAP(181), CR_WRAP(182), CR_WRAP(183), CR_WRAP(184),
-			CR_WRAP(185),
+			CR_WRAP(185), CR_WRAP(186), CR_WRAP(187), CR_WRAP(188), CR_WRAP(189), CR_WRAP(190),
 		};
 		for (size_t i = 0; i < arrsize(stages); i++) {
 			if (stages[i].kext != kext)
