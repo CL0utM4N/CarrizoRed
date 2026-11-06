@@ -25,7 +25,8 @@ scales with load (400 MHz idle, up to the chip's top level).
 | GPU clock scaling (SCLK DPM) | **Works, on by default.** Apple's PowerPlay runs its Dummy back end here, so nothing would start the SMU's clock scaling and the GPU would stay at its lowest clock. CarrizoRed starts it 90 s after boot, from the SMU's own clock table: 400 MHz minimum, up to the top level (900 MHz on an A9-9425, 800 MHz on an A9-9420). `-crnosclkdpm` turns it off |
 | Sleep | **Works** on the D509BA (Catalina, Big Sur, Monterey) and the Dell Inspiron 3475 (Tahoe): real S3, no wakes of its own, and a USB keyboard on a USB 2 or USB 3 port wakes it (both machines). CarrizoRed flushes the CPU caches before S3 (Apple's ACPI code doesn't, and the wake died without it), lets only the USB controllers, the lid and the power button wake the machine, and works around the AMD FCH's USB wake quirks; FCHXHCIFix's `SSDT-FCHSLEEP` keeps the USB 2 controller powered through S3. It redoes what S3 resets in the display block the way Linux's DC driver does at resume (panel power, display clock and DP DTO, VBIOS scratch and backlight, AUX, ASSR). Sonoma untested since the cache flush. Lid close sleeps on battery but not on AC (macOS sees desktop mode). Details: [docs/SLEEP.md](docs/SLEEP.md) |
 | Brightness | **Works:** the Displays slider and the brightness keys (D509BA on Monterey, Dell Inspiron 3475 on Tahoe). Needs `SSDT-PNLF` and [BrightnessKeys](https://github.com/acidanthera/BrightnessKeys) (see *Installing*). With them the panel is macOS's built-in display, which also makes lid-close sleep work on AC |
-| External displays (HDMI), HDMI audio | Not done or untested |
+| External displays (HDMI) | **Works on the D509BA** with `-crmacgpu` for now: the monitor is detected and lit at boot and on hot-plug (1920×1080 at 60 Hz tested), and unplugging it hands the desktop back to the panel. See *HDMI* below. Other machines' HDMI and DP ports untested |
+| HDMI audio | Not done |
 | Video decode/encode (UVD/VCE) | **On hold**: video plays and records in software. UVD powers up and Apple's firmware boots on it, but decoding hangs the GPU: Apple's driver gives UVD GPU virtual addresses, and Stoney's UVD has no VM support (Linux runs it in physical mode and rewrites every buffer address). Making it work means doing that translation in CarrizoRed. Findings and next steps in [docs/VIDEO.md](docs/VIDEO.md) |
 | Carrizo / Bristol Ridge | Same display engine and code paths; the SMU microcode loader, clock scaling and shader-engine fix include Carrizo's differences (second SDMA engine, second MEC), following Linux. **Untested** (no hardware): reports from owners are very welcome |
 
@@ -118,7 +119,8 @@ And Metal needed:
 | Carrizo / Bristol Ridge | Code paths written (SMU loader, clock scaling, caps), untested: no hardware |
 | Tahoe graphics memory | Open: Tahoe can fill the 512 MB carve-out (see *Graphics memory on Tahoe*) |
 | Brightness | Done: slider and keys, through Apple's AppleBacklight and AMD framebuffer (see *Brightness* under *Boot arguments*) |
-| External displays, HDMI audio | Not started / untested |
+| External displays (HDMI) | Works on the D509BA at boot and on hot-plug; needs `-crmacgpu` until that is made the default. Diagnostic logging still in |
+| HDMI audio | Next |
 | GPU occasionally not responding after a warm restart | Open (power off fully) |
 
 **Testing:** every boot writes `/private/var/log/CarrizoRed-<time>.log`: GPU, SMU and clock state every second, all SMU
@@ -270,6 +272,10 @@ controller off in `_PTS`, which wakes the machine at once. CarrizoRed does the r
 | `-crnobacklight` | Brightness: don't complete AppleBacklight's panel set-up. On Monterey and later its `AppleIntelPanel::setDisplay` matches the panel to the `Default` entry, then fails storing the match and returns false, so the panel gets no `brightness` parameter (no slider, no keys); CarrizoRed stores it and reports success. Also stops it giving the panel driver a `Default` entry when it has none |
 | `-crnoblupdate` | Brightness: don't latch the backlight PWM after Apple's VBIOS brightness call. DCE 11 double-buffers `BL_PWM_CNTL` behind `BL_PWM_GRP1_REG_LOCK`; the VBIOS changes the duty but nothing applies it, so the screen kept its brightness. CarrizoRed locks, rewrites, unlocks and waits, as Linux DC's `driver_set_backlight` does |
 | `-crnodevinfo` | Don't record the iGPU as the built-in GPU in Lilu's shared `DeviceInfo`. Lilu recognises an AMD iGPU by its `device-id` property, which the Polaris spoof changes, so plugins looking for the built-in panel through it (BrightnessKeys: the brightness keys' ACPI notifications) found nothing |
+| `-crnoddcfix` | HDMI: don't add the hardware I2C engine bit to DDC connectors' sense ids. Apple's `AtiBiosParser1` (ATOM object table rev 1.x, as on these APUs) reports the DDC line as line + 1 without bit `0x10`, and `BaffinHwI2cProxy` only uses the hardware I2C engine for `0x10 \| line`, so the EDID read never ran |
+| `-crnoddcprep` | HDMI: don't set the DDC line up for the hardware I2C engine before Apple's EDID read (`DC_I2C_DDCn_SPEED`/`SETUP` and the `DC_GPIO_DDCn` mask, as Linux DC does); without it the read timed out |
+| `-crnotmdsfix` | HDMI: leave Apple's TMDS (HDMI/DVI) transmitter and pixel clock calls as they are. CarrizoRed builds them as Linux DC does: the PHY clocked from the PLL the pixel clock actually went to (CarrizoRed remaps Apple's P2PLL to PPLL0, which DCE 11.0 uses), the HDMI connector object, not coherent, and the stream's encoder mode in SetPixelClock. Calls for the eDP panel aren't touched |
+| `-crnobootdisp` | HDMI: don't run the display set-up Linux DC's `init_hw` does at boot and before each display enable: the VBIOS EnableDispPowerGating INIT/DISABLE on both pipes and the display engine clock (FirmwareInfo's default, 847 MHz on the A9-9425, through SetPixelClock's DFS). Apple sets that clock through SetDCEClock, which these VBIOSes don't have, so it stayed at the 100 MHz the firmware left: enough for the panel, not for 1080p, and the HDMI monitor stayed black |
 | `-crnoehciwakefix` | At S3 entry, don't clear the FCH USB 2 hub's wake on connect, disconnect and over-current (EHCI config 0x84 bits 23:21; wake on a device's remote wake stays) or a stale EHCI PME_Status. With them set, the machine woke ~1 s after every S3 entry |
 | `-crtps1restore` | Experimental: after a wake, copy LVTMA_PWRSEQ_CNTL, the UNIPHY link controls, TMDP_REG3/5 and DIG_FE_CNTL from the boot's link training (TPS1) back just before Apple's training. A boot-time copy, not what Linux does |
 | `-crtmdprestore` | Experimental: after a wake, copy the UNIPHY macro registers' boot values back right after Apple's eDP transmitter ENABLE. A boot-time copy, not what Linux does |
@@ -325,6 +331,27 @@ controller off in `_PTS`, which wakes the machine at once. CarrizoRed does the r
 | `-crnocapsfix` | Stoney: 1 shader engine and the CAIL-reported CU count instead of Polaris 11's 2 SE / 8 CUs |
 | `-crnovmfix` | Converting local GPU page-table entries to the carve-out's physical address (`MC_VM_FB_OFFSET << 22`) |
 
+### HDMI
+
+External HDMI works on the D509BA (2026-11-06): detection, EDID, a picture at boot and on hot-plug, and the desktop
+moving back to the panel on unplug. Boot with `-crmacgpu` for now. Each step that was missing, in the order they were
+found (each has its own off switch above):
+
+1. **Port policy:** AGDP, Apple's graphics policy, looks the SMBIOS model up and applies its port policy, which keeps
+   the external port off. `-crmacgpu` makes it use its `Default` policy; it will become the default.
+2. **DDC (EDID):** Apple's ATOM parser for these VBIOSes reports the DDC line without the hardware I2C engine bit, so
+   no EDID was read (`-crnoddcfix`), and the DDC pads need setting up for the engine first, as Linux DC does
+   (`-crnoddcprep`).
+3. **TMDS transmitter:** Apple's calls clocked the PHY from a PLL DCE 11.0 doesn't use and set the wrong connector and
+   encoder mode; CarrizoRed builds them as Linux DC does (`-crnotmdsfix`).
+4. **Display engine clock and power gating:** with all of that, the monitor woke but stayed black: the display engine
+   clock was still the firmware's 100 MHz, too slow for 1080p, and Apple has no way to set it on these VBIOSes (no
+   SetDCEClock). HDMI first worked after a wake, whose restore sets the clock; CarrizoRed now does the same at boot and
+   before every display enable (`-crnobootdisp`).
+
+Still to do: `-crmacgpu` as the default, strip the HDMI diagnostic logging (`hpd:`, `hdmi:`, `vbios:` and `crtc`
+lines in the disk log), HDMI audio, and testing on the other machines.
+
 ### Diagnostics and experiments
 
 | Argument | Effect |
@@ -353,7 +380,8 @@ controller off in `_PTS`, which wakes the machine at once. CarrizoRed does the r
 | `-crstutter`, `-crfeds`, `-crfbwrklp` | Keep Apple's `CFG_USE_STUTTER` / `CFG_USE_FEDS` / `CFG_USE_FBWRKLP` (forced off by default) |
 | `-crnoaudio`, `-crnotcon` | Force `CFG_NO_AUDIO` on / `CFG_USE_TCON` off |
 | `-crrestore` | Write the firmware's boot values back into pipe 0's processing chain and hold them (display bisect) |
-| `-crmacgpu` | Neutralise AGDP's board-id lookup; set `built-in` and `AAPL,slot-name` on the iGPU |
+| `-crmacgpu` | Neutralise AGDP's board-id lookup (`board-id` read as `board-ix`, so AGDP uses its `Default` policy instead of the SMBIOS model's port policy, which kept the external port off); set `built-in` and `AAPL,slot-name` on the iGPU. **Needed for HDMI for now** (see *HDMI*) |
+| `-crhdmitest` | HDMI test: about 120 s after boot, send solid white on the second CRTC for 10 s |
 | `-crnosclkdpm` | Don't start the SMU's graphics clock scaling |
 | `crsclkmin=N`, `crsclkmax=N` | The lowest and highest clock level (defaults: level 2, 400 MHz, and the top level; on the A9-9425 levels 0–7 are 200–900 MHz) |
 | `-crnoclkread` | Don't read the SMU's clock table into the report |
