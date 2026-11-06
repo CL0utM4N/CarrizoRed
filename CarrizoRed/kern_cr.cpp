@@ -3446,6 +3446,17 @@ static void pipeReport() {
 	add("uniphy", phy, arrsize(phy));
 	add("pll", pll, arrsize(pll));
 	diskLogEvent("%s", line);
+	// Whole blocks, one line each: DIG1 (HDMI: FE/BE, HDMI control, GC/AV mute, infoframes, TMDS, lanes) and DIG0 (the
+	// working eDP) for comparison, the UNIPHY B and A macro registers (DCIO_UNIPHY1/0).
+	struct Block { const char *name; uint16_t base, count; };
+	static const Block blocks[] {{"dig1", 0x4B00, 0x80}, {"dig0", 0x4A00, 0x80}, {"uniphyB", 0x48E0, 0x20},
+		{"uniphyA", 0x48C0, 0x20}};
+	for (auto &b : blocks) {
+		len = snprintf(line, sizeof(line), "pipes %s @%x:", b.name, b.base);
+		for (uint16_t i = 0; i < b.count && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++)
+			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %x", gpuMmio[b.base + i]);
+		diskLogEvent("%s", line);
+	}
 }
 
 // One line per framebuffer: connector type, whether a display is attached (an IODisplayConnect child), and the
@@ -7958,7 +7969,8 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 		static int tmdsFixOff = -1;
 		if (tmdsFixOff < 0)
 			tmdsFixOff = checkKernelArgument("-crnotmdsfix") ? 1 : 0;
-		if (!tmdsFixOff && (bytes[6] == 2 || bytes[6] == 3) && bytes[3] != 4) {
+		// Not the eDP panel's calls (connector 0x14): Apple's eDP DISABLE also comes with DIG mode 2.
+		if (!tmdsFixOff && (bytes[6] == 2 || bytes[6] == 3) && bytes[3] != 4 && bytes[5] != 0x14) {
 			uint8_t before[3] {bytes[5], bytes[7], bytes[8]};
 			if (bytes[5] == 0x0D)
 				bytes[5] = 0x0C;
