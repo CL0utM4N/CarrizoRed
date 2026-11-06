@@ -7975,7 +7975,15 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			if (bytes[5] == 0x0D)
 				bytes[5] = 0x0C;
 			bytes[7] = static_cast<uint8_t>(bytes[7] & ~0x02U);
-			bytes[8] = 0;
+			// DIG select: not 0 as in Linux. Apple's driver leaves connecting the DIG back end to its front end to the VBIOS,
+			// which does it from this byte (log 1746948947: with 0, DIG1_DIG_BE_CNTL's FE source select was 0 and the FE
+			// symbol clock off). Keep INIT's value and put it in place of the stack garbage Apple sends with ENABLE (0x61).
+			static uint8_t initSel[8];
+			uint8_t phy = bytes[2] & 7;
+			if (bytes[3] == 7 && bytes[8] && bytes[8] <= 0x3F)
+				initSel[phy] = bytes[8];
+			else if (bytes[8] > 0x3F && initSel[phy])
+				bytes[8] = initSel[phy];
 			if (bytes[5] != before[0] || bytes[7] != before[1] || bytes[8] != before[2]) {
 				patched = 0x80;
 				static uint32_t tmdsFixLogged;
