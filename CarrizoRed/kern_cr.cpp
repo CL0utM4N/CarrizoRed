@@ -3449,8 +3449,13 @@ static void pipeReport() {
 	// Whole blocks, one line each: DIG1 (HDMI: FE/BE, HDMI control, GC/AV mute, infoframes, TMDS, lanes) and DIG0 (the
 	// working eDP) for comparison, the UNIPHY B and A macro registers (DCIO_UNIPHY1/0).
 	struct Block { const char *name; uint16_t base, count; };
+	// Scanout, pipe 0 (the working panel) and pipe 1 (HDMI) side by side, 0x200 apart: DCP (graphics surface), LB,
+	// DCFE (clock, reset), DMIF_PG (arbitration), SCL, BLND, CRTC. Log 1746951052: HDMI's CRTC1/DIG1/PLL all running,
+	// the monitor awake on a black picture.
 	static const Block blocks[] {{"dig1", 0x4B00, 0x80}, {"dig0", 0x4A00, 0x80}, {"uniphyB", 0x48E0, 0x20},
-		{"uniphyA", 0x48C0, 0x20}};
+		{"uniphyA", 0x48C0, 0x20}, {"pipe0", 0x1A00, 0x80}, {"pipe1", 0x1C00, 0x80}, {"pipe0", 0x1A80, 0x80},
+		{"pipe1", 0x1C80, 0x80}, {"pipe0", 0x1B00, 0x80}, {"pipe1", 0x1D00, 0x80}, {"pipe0", 0x1B80, 0x80},
+		{"pipe1", 0x1D80, 0x80}, {"dmifbuf", 0x320, 4}};
 	for (auto &b : blocks) {
 		len = snprintf(line, sizeof(line), "pipes %s @%x:", b.name, b.base);
 		for (uint16_t i = 0; i < b.count && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++)
