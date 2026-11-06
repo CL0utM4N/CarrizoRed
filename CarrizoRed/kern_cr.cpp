@@ -7948,6 +7948,31 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	// and the CRTC's pixel rate source (see atomPllFor) but not here: the D509BA's HDMI mode set programmed 148.5 MHz in
 	// PPLL0 while the PHY was told P2PLL, which DCE 11.0 doesn't use, and the monitor got no signal (log 1746945787:
 	// SetPixelClock ucPpll 2, transmitter config 0x26). Apply the same remap. -crnopllremap leaves both alone.
+	// The rest of a TMDS transmitter call as Linux DC's transmitter_control_v1_5 builds it (log 1746946459: still no
+	// signal with the clock source fixed; Apple sent 023a0101 040d032a 61...): ucConnObjId the connector's own id, not
+	// 0x0D (HDMI type B, dual link) for the D509BA's HDMI type A (VBIOS object 0x310C); ucDigEncoderSel 0 ("after DCE80
+	// the DIG front end is programmed by the driver", Apple passes 0x02 on INIT and stack garbage on ENABLE); coherent
+	// mode off. -crnotmdsfix leaves them.
+	if (table == AtomTransmitterTable && params) {
+		auto *bytes = static_cast<uint8_t *>(params);
+		static int tmdsFixOff = -1;
+		if (tmdsFixOff < 0)
+			tmdsFixOff = checkKernelArgument("-crnotmdsfix") ? 1 : 0;
+		if (!tmdsFixOff && (bytes[6] == 2 || bytes[6] == 3) && bytes[3] != 4) {
+			uint8_t before[3] {bytes[5], bytes[7], bytes[8]};
+			if (bytes[5] == 0x0D)
+				bytes[5] = 0x0C;
+			bytes[7] = static_cast<uint8_t>(bytes[7] & ~0x02U);
+			bytes[8] = 0;
+			if (bytes[5] != before[0] || bytes[7] != before[1] || bytes[8] != before[2]) {
+				patched = 0x80;
+				static uint32_t tmdsFixLogged;
+				if (tmdsFixLogged++ < 8)
+					diskLogEvent("hdmi: TMDS transmitter (action %u) as Linux DC: connector %x -> %x, config %x -> %x, DIG select %x -> %x",
+						bytes[3], before[0], bytes[5], before[1], bytes[7], before[2], bytes[8]);
+			}
+		}
+	}
 	if (table == AtomTransmitterTable && params) {
 		auto *bytes = static_cast<uint8_t *>(params);
 		uint8_t src = (bytes[7] >> 2) & 3;
