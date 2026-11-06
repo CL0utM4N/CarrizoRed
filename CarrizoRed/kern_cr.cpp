@@ -3462,6 +3462,16 @@ static void pipeReport() {
 			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %x", gpuMmio[b.base + i]);
 		diskLogEvent("%s", line);
 	}
+	// Over time (log 1746951984: DCP1_GRPH_UPDATE 5, mode and surface update pending, in one sample): 20 samples 5 ms
+	// apart of GRPH_UPDATE, SURFACE_ADDRESS_INUSE, CRTC position and frame count, LB buffer level, pipe 1 then pipe 0.
+	len = snprintf(line, sizeof(line), "pipes samples (update inuse pos frame lb | pipe 0):");
+	for (int i = 0; i < 20 && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++) {
+		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " [%x %x %x %x %x | %x %x %x]", gpuMmio[0x1C11],
+			gpuMmio[0x1C13], gpuMmio[0x1DA4], gpuMmio[0x1DA6], gpuMmio[0x1CD7], gpuMmio[0x1A11], gpuMmio[0x1BA4],
+			gpuMmio[0x1AD7]);
+		IODelay(5000);
+	}
+	diskLogEvent("%s", line);
 }
 
 // One line per framebuffer: connector type, whether a display is attached (an IODisplayConnect child), and the
