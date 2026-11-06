@@ -8312,6 +8312,10 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 		dcAuxPrepare();
 	uint32_t blBefore[4] {};
 	bool blCall = table == AtomTransmitterTable && params && static_cast<uint8_t *>(params)[3] == 4 && gpuMmio;
+	// The parameters as sent (after CarrizoRed's own fixes above): ATOM tables use the block as scratch and write over it.
+	uint8_t vbIn[16] {};
+	if (params)
+		memcpy(vbIn, params, sizeof(vbIn));
 	if (blCall)
 		for (int i = 0; i < 4; i++)
 			blBefore[i] = gpuMmio[0x4820 + i];
@@ -8327,9 +8331,10 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			uint8_t pb[16] {};
 			if (params)
 				memcpy(pb, params, sizeof(pb));
-			diskLogEvent("vbios: table %x -> %x params %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
-				table, ok, pb[0], pb[1], pb[2], pb[3], pb[4], pb[5], pb[6], pb[7], pb[8], pb[9], pb[10], pb[11], pb[12], pb[13],
-				pb[14], pb[15]);
+			auto *in = vbIn;
+			diskLogEvent("vbios: table %x -> %x in %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x%s",
+				table, ok, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], in[8], in[9], in[10], in[11], in[12], in[13],
+				in[14], in[15], memcmp(in, pb, sizeof(pb)) ? " (changed by the table)" : "");
 		}
 	}
 	// Brightness: AppleBacklight sets a level through the framebuffer ('bklt'), and Apple's BaffinBiosDigitalConnection::
