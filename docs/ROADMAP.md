@@ -12,11 +12,11 @@ Updated 2026-11-06.
 - Sleep and wake (D509BA Catalina–Monterey, Dell Tahoe): Linux DC's resume steps, a cache flush before S3 that macOS
   leaves out, and the AMD FCH's USB wake quirks; USB 2 and USB 3 keyboards wake it ([SLEEP.md](SLEEP.md))
 - Brightness slider and keys (D509BA Monterey, Dell Tahoe), which also gives lid-close sleep on AC
-- External HDMI on the D509BA, at boot and on hot-plug (needs `-crmacgpu` for now; README *HDMI*)
+- External HDMI (D509BA, Dell Tahoe), at boot and on hot-plug (README *HDMI*)
 
 ## Next, in the order the project set (2026-10-30)
 1. **Sleep leftovers:** Sonoma with the cache-flush fix; a wake watchdog that allows for a slow GPU power-up
-2. **HDMI leftovers:** `-crmacgpu` as the default, diagnostics out, the Dell's ports; then HDMI audio
+2. **HDMI audio**
 3. **Video encode** (VCE), then decode (UVD needs physical-address translation, [VIDEO.md](VIDEO.md))
 4. **GPU power management:** clock scaling that settles lower when idle, power gating; the ~20 s GPU power-up at
    every boot and wake (2 s waits in Apple's engine-control code, [SLEEP.md](SLEEP.md) *Also open*)

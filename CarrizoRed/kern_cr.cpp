@@ -875,8 +875,10 @@ static uint32_t wrapParser1GetConnectorInfo(void *that, uint8_t *info, uint8_t &
 		bool ddc = type == 0x800 || type == 0x4 || type == 0x200 || type == 0x10;
 		if (ddc && sense >= 1 && sense <= 6) {
 			c[0x13] = static_cast<uint8_t>(sense | 0x10);
-			diskLogEvent("hdmi: connector %u (type %x, hotplug %u): DDC sense id %x -> %x (hardware I2C engine)", i, type,
-				c[0x12], sense, c[0x13]);
+			static uint32_t senseLogged;
+			if (senseLogged++ < 8)
+				diskLogEvent("hdmi: connector %u (type %x, hotplug %u): DDC sense id %x -> %x (hardware I2C engine)", i, type,
+					c[0x12], sense, c[0x13]);
 		}
 	}
 	return ret;
@@ -1491,7 +1493,7 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 	accelDeferOff = !checkKernelArgument("-cracceldefer") || checkKernelArgument("-crnoaccel");
 
 	logPCIInfo();
-	if (checkKernelArgument("-crmacgpu"))
+	if (!checkKernelArgument("-crnomacgpu"))
 		setMacGpuProperties();
 	setGpuModel();
 	if (!checkKernelArgument("-crnommio"))
@@ -1642,7 +1644,7 @@ void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address
 			blockProbe(patcher, index, slide, size, "__ZN14AGPMController5probeEP9IOServicePi", "-crnoagpm");
 			blockProbe(patcher, index, slide, size, "__ZN4AGPM5probeEP9IOServicePi", "-crnoagpm");
 		} else if (i == KextAgdp) {
-			if (checkKernelArgument("-crmacgpu"))
+			if (!checkKernelArgument("-crnomacgpu"))
 				patchAgdpBoardId(patcher, i);
 			if (checkKernelArgument("-crnoagdp")) {
 				KernelPatcher::RouteRequest request {"__ZN32AppleGraphicsDeviceControlClient5startEP9IOService",
@@ -3388,106 +3390,6 @@ static void backlightPanelsInject() {
 	iter->release();
 }
 
-// HDMI: the six HPD pins (DCE 11 HPD0-5 at 0x1898 + 8n: INT_STATUS bit 1 SENSE, bit 4 SENSE_DELAYED; INT_CONTROL bit
-// 16 INT_EN; CONTROL bit 28 HPD_EN) and DC_GPIO_HPD MASK/A/EN/Y (0x488c-0x488f), logged when they change (at most 60
-// times), so a plug, the pin it lands on and whether the pin is enabled show up whatever Apple's driver does.
-static uint32_t hpdLast[22];
-static uint32_t hpdLogged;
-
-static void hpdPoll() {
-	if (!gpuMmio || hpdLogged >= 60)
-		return;
-	uint32_t now[22];
-	for (uint32_t n = 0; n < 6; n++) {
-		now[n * 3] = gpuMmio[0x1898 + 8 * n];
-		now[n * 3 + 1] = gpuMmio[0x1899 + 8 * n];
-		now[n * 3 + 2] = gpuMmio[0x189A + 8 * n];
-	}
-	for (uint32_t i = 0; i < 4; i++)
-		now[18 + i] = gpuMmio[0x488C + i];
-	if (!memcmp(now, hpdLast, sizeof(now)))
-		return;
-	memcpy(hpdLast, now, sizeof(now));
-	hpdLogged++;
-	char line[400];
-	int len = snprintf(line, sizeof(line), "hpd:");
-	for (uint32_t n = 0; n < 6 && len > 0 && static_cast<size_t>(len) < sizeof(line); n++)
-		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %u[sense %u en %u int %u: %x %x %x]", n,
-			(now[n * 3] >> 1) & 1, (now[n * 3 + 2] >> 28) & 1, (now[n * 3 + 1] >> 16) & 1, now[n * 3], now[n * 3 + 1],
-			now[n * 3 + 2]);
-	diskLogEvent("%s; GPIO_HPD mask %x a %x en %x y %x", line, now[18], now[19], now[20], now[21]);
-}
-
-// HDMI: the second pipe's state once the desktop is up (DCE 11.0 offsets): CRTC1 timing/control/status, the pixel
-// rate controls, DIG0-2 front/back end, HDMI and TMDS control, lane enables, UNIPHY A-C link/crossbar, pixel PLLs.
-static void pipeReport() {
-	if (!gpuMmio)
-		return;
-	static char line[2400];
-	int len = 0;
-	auto add = [&](const char *tag, const uint16_t *regs, size_t n) {
-		if (len >= 0 && static_cast<size_t>(len) < sizeof(line))
-			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %s:", tag);
-		for (size_t i = 0; i < n && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++)
-			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %x=%x", regs[i], gpuMmio[regs[i]]);
-	};
-	static const uint16_t crtc1[] {0x1D80, 0x1D87, 0x1D9C, 0x1D9D, 0x1DA3, 0x1DA4, 0x1DA6, 0x1B9C};
-	static const uint16_t rate[] {0x140, 0x144, 0x138};
-	static const uint16_t dig[] {0x4A00, 0x4A47, 0x4A09, 0x4A6B, 0x4A79, 0x4B00, 0x4B47, 0x4B09, 0x4B6B, 0x4B79, 0x4C00,
-		0x4C47, 0x4C09, 0x4C6B, 0x4C79};
-	static const uint16_t phy[] {0x4805, 0x4806, 0x4807, 0x4808, 0x4809, 0x480A};
-	uint16_t pll[64];
-	for (uint16_t i = 0; i < 64; i++)
-		pll[i] = static_cast<uint16_t>(0x1700 + i);
-	len = snprintf(line, sizeof(line), "pipes:");
-	add("crtc1", crtc1, arrsize(crtc1));
-	add("rate", rate, arrsize(rate));
-	add("dig", dig, arrsize(dig));
-	add("uniphy", phy, arrsize(phy));
-	add("pll", pll, arrsize(pll));
-	diskLogEvent("%s", line);
-	// Whole blocks, one line each: DIG1 (HDMI: FE/BE, HDMI control, GC/AV mute, infoframes, TMDS, lanes) and DIG0 (the
-	// working eDP) for comparison, the UNIPHY B and A macro registers (DCIO_UNIPHY1/0).
-	struct Block { const char *name; uint16_t base, count; };
-	// Scanout, pipe 0 (the working panel) and pipe 1 (HDMI) side by side, 0x200 apart: DCP (graphics surface), LB,
-	// DCFE (clock, reset), DMIF_PG (arbitration), SCL, BLND, CRTC. Log 1746951052: HDMI's CRTC1/DIG1/PLL all running,
-	// the monitor awake on a black picture.
-	static const Block blocks[] {{"dig1", 0x4B00, 0x80}, {"dig0", 0x4A00, 0x80}, {"uniphyB", 0x48E0, 0x20},
-		{"uniphyA", 0x48C0, 0x20}, {"pipe0", 0x1A00, 0x80}, {"pipe1", 0x1C00, 0x80}, {"pipe0", 0x1A80, 0x80},
-		{"pipe1", 0x1C80, 0x80}, {"pipe0", 0x1B00, 0x80}, {"pipe1", 0x1D00, 0x80}, {"pipe0", 0x1B80, 0x80},
-		{"pipe1", 0x1D80, 0x80}, {"dmifbuf", 0x320, 4}};
-	for (auto &b : blocks) {
-		len = snprintf(line, sizeof(line), "pipes %s @%x:", b.name, b.base);
-		for (uint16_t i = 0; i < b.count && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++)
-			len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %x", gpuMmio[b.base + i]);
-		diskLogEvent("%s", line);
-	}
-	// Over time (log 1746951984: DCP1_GRPH_UPDATE 5, mode and surface update pending, in one sample): 20 samples 5 ms
-	// apart of GRPH_UPDATE, SURFACE_ADDRESS_INUSE, CRTC position and frame count, LB buffer level, pipe 1 then pipe 0.
-	len = snprintf(line, sizeof(line), "pipes samples (update inuse pos frame lb | pipe 0):");
-	for (int i = 0; i < 20 && len >= 0 && static_cast<size_t>(len) < sizeof(line); i++) {
-		len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " [%x %x %x %x %x | %x %x %x]", gpuMmio[0x1C11],
-			gpuMmio[0x1C13], gpuMmio[0x1DA4], gpuMmio[0x1DA6], gpuMmio[0x1CD7], gpuMmio[0x1A11], gpuMmio[0x1BA4],
-			gpuMmio[0x1AD7]);
-		IODelay(5000);
-	}
-	diskLogEvent("%s", line);
-	// -crhdmitest: CRTC1 sends a solid white (blank data, YCbCr like Apple's stream: Cr 0x200, Y 0x3AC, Cb 0x200) for
-	// 10 s, whatever is in memory. White on the monitor: the link works and the black is the scanned-out content;
-	// still black: the link (PHY/DIG/encoding) is at fault. Everything put back afterwards.
-	if (checkKernelArgument("-crhdmitest") && (gpuMmio[0x1D9C] & 1)) {
-		uint32_t color = gpuMmio[0x1DCA], blank = gpuMmio[0x1D9D];
-		gpuMmio[0x1DCA] = 0x200EB200;
-		gpuMmio[0x1D9D] = blank | 0x100;
-		diskLogEvent("hdmi test: CRTC1 solid white for 10 s (blank colour %x -> %x, blank control %x -> %x)", color,
-			gpuMmio[0x1DCA], blank, gpuMmio[0x1D9D]);
-		IOSleep(10000);
-		gpuMmio[0x1D9D] = blank;
-		gpuMmio[0x1DCA] = color;
-		diskLogEvent("hdmi test: CRTC1 back to normal");
-	}
-}
-
 // One line per framebuffer: connector type, whether a display is attached (an IODisplayConnect child), and the
 // current mode's pixel count and clock. Other children: class (name), two levels deep.
 static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_t size) {
@@ -4286,9 +4188,6 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				backlightPanelsInject();
 		}
 
-		if (!__atomic_load_n(&gpuSleeping, __ATOMIC_RELAXED))
-			hpdPoll();
-
 		// The registry walk below: every second during start-up, every 10 s once Metal is drawing.
 		if (tick % 2 || (desktopRunning() && tick % 20)) {
 			IOSleep(500);
@@ -4306,7 +4205,6 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			if (desktopSince && !backlightChecked && t >= desktopSince + 30) {
 				backlightChecked = true;
 				backlightCheck();
-				pipeReport();
 			}
 		}
 
@@ -4841,16 +4739,6 @@ namespace {
 			__atomic_fetch_sub(&stageOpen[N], 1, __ATOMIC_RELAXED);
 			return 0;
 		}
-		// HDMI EDID (log 1746880098: BaffinHwI2cProxy::doReadEDID on DDC2 fails with e00002ca after ~450 ms): the I2C
-		// engine and the DDC2 pads before and after, the first 4 calls. DC_I2C_CONTROL, ARBITRATION, INTERRUPT_CONTROL,
-		// SW_STATUS, DDC2_HW_STATUS, DDC2_SPEED, DDC2_SETUP, TRANSACTION0/1, DATA; DC_GPIO_DDC2 MASK/A/EN/Y.
-		static const uint16_t i2cRegs[] {0x16D4, 0x16D5, 0x16D6, 0x16D7, 0x16D9, 0x16E0, 0x16E1, 0x16EA, 0x16EB, 0x16EE,
-			0x486C, 0x486D, 0x486E, 0x486F};
-		uint32_t i2cBefore[arrsize(i2cRegs)] {};
-		bool i2cSnap = gpuMmio && !strcmp(stages[N].name, "i2c.doReadEDID") && calls <= 4;
-		if (i2cSnap)
-			for (size_t r = 0; r < arrsize(i2cRegs); r++)
-				i2cBefore[r] = gpuMmio[i2cRegs[r]];
 		// DDC line set-up before Apple's EDID read. BaffinHwI2cProxy writes only DC_I2C_CONTROL/ARBITRATION/SW_STATUS/
 		// TRANSACTIONn/DATA and relies on the firmware having prepared every DDC line, as a Mac's does. The D509BA's
 		// firmware left DDC2 (its HDMI port) with the pads in GPIO mode (DC_GPIO_DDC2_MASK clock/data mask bits set),
@@ -4893,26 +4781,9 @@ namespace {
 			}
 		}
 		auto ret = FunctionCast(wrapStage<N>, stages[N].org)(a, b, c, d, e, f);
-		if (i2cSnap) {
-			char line[600];
-			int len = snprintf(line, sizeof(line), "hdmi: doReadEDID(%x) = %x; I2C/DDC2 regs before -> after:", arg,
-				static_cast<uint32_t>(ret));
-			for (size_t r = 0; r < arrsize(i2cRegs) && len > 0 && static_cast<size_t>(len) < sizeof(line); r++)
-				len += snprintf(line + len, sizeof(line) - static_cast<size_t>(len), " %x=%x->%x", i2cRegs[r], i2cBefore[r],
-					gpuMmio[i2cRegs[r]]);
-			diskLogEvent("%s", line);
-		}
 		if (!strcmp(stages[N].name, "initializeProjectDependentResources"))
 			controllerReady = true;
 		traceEvent(stages[N].name, true, static_cast<uint32_t>(ret));
-		// HDMI detection: the frequent sense calls, argument and result, the first 60 into the disk log.
-		if (!strcmp(stages[N].name, "hpdSense") || !strcmp(stages[N].name, "conn.isConnected") ||
-			!strncmp(stages[N].name, "fb.", 3) || !strncmp(stages[N].name, "ctl.", 4)) {
-			static uint32_t senseLogged;
-			if (__atomic_fetch_add(&senseLogged, 1, __ATOMIC_RELAXED) < 150)
-				diskLogEvent("hdmi: %s(this %llx, %x) = %x", stages[N].name, reinterpret_cast<uint64_t>(a) & 0xFFFFFF, arg,
-					static_cast<uint32_t>(ret));
-		}
 		// Mode 5: d points at a status buffer the call fills (DP training: per-lane status read from the DPCD).
 		if (stages[N].arg == 5 && d)
 			traceEvent("  status", true, *static_cast<uint32_t *>(d));
@@ -7192,25 +7063,27 @@ void CRDriver::blockProbe(KernelPatcher &patcher, size_t index, mach_vm_address_
 
 bool CRDriver::wrapStartFail(IOService *, IOService *) { return false; }
 
-// -crmacgpu: make the iGPU look like a Mac's own GPU to Apple's policy code.
+// Make the iGPU look like a Mac's own GPU to Apple's policy code.
 // AGDP picks a per-board configuration from ConfigMap by the platform's "board-id". For the iMac19,1 SMBIOS that is
 // Config3 (GFX0: EDID override index 0, FeatureControl 12; IGPU: unload), written for that iMac's panel and GPUs.
 // Renaming the property it reads (the only "board-id" string in the binary, Sequoia 24H32) to "board-ix" makes the
-// lookup fail, so AGDP uses its Default config ("none"). Same approach as WhateverGreen's agdpmod=pikera.
+// lookup fail, so AGDP uses its Default config ("none"). Same approach as WhateverGreen's agdpmod=pikera. Needed for
+// external displays: with the model's config the HDMI framebuffer never got a display (D509BA, Dell 3475). On by default
+// since 2026-11-06; -crnomacgpu turns this and setMacGpuProperties off.
 void CRDriver::patchAgdpBoardId(KernelPatcher &patcher, size_t kext) {
 	static const uint8_t find[] {'b', 'o', 'a', 'r', 'd', '-', 'i', 'd', 0};
 	static const uint8_t replace[] {'b', 'o', 'a', 'r', 'd', '-', 'i', 'x', 0};
 	KernelPatcher::LookupPatch patch {&kexts[kext], find, replace, sizeof(find), 1};
 	patcher.applyLookupPatch(&patch);
 	if (patcher.getError() == KernelPatcher::Error::NoError) {
-		SYSLOG("cr", "-crmacgpu: AGDP board-id lookup neutralised");
+		SYSLOG("cr", "macgpu: AGDP board-id lookup neutralised");
 	} else {
-		SYSLOG("cr", "-crmacgpu: AGDP board-id patch failed (error %d)", patcher.getError());
+		SYSLOG("cr", "macgpu: AGDP board-id patch failed (error %d)", patcher.getError());
 		patcher.clearError();
 	}
 }
 
-// -crmacgpu: the properties a Mac's own GPU has (the iGPU has none): "built-in" and AAPL,slot-name "built-in", so
+// The properties a Mac's own GPU has (the iGPU has none): "built-in" and AAPL,slot-name "built-in", so
 // Apple's code doesn't treat it as removable (the controller personality is IOPCITunnelCompatible and ATIController
 // has eGPU paths), and a "model". The device keeps its ACPI name (VGA): AGDP and AGPM attach per-name policies to
 // GFX0/IGPU.
@@ -7219,7 +7092,7 @@ void CRDriver::setMacGpuProperties() {
 	iGPU->setProperty("built-in", builtIn, sizeof(builtIn));
 	char slotName[] = "built-in";
 	iGPU->setProperty("AAPL,slot-name", slotName, sizeof(slotName));
-	SYSLOG("cr", "-crmacgpu: built-in and AAPL,slot-name set");
+	SYSLOG("cr", "macgpu: built-in and AAPL,slot-name set");
 }
 
 // The GPU's name in About This Mac and System Information: the iGPU's "model". With the Polaris device ID Apple's
@@ -8373,38 +8246,19 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			if (reclock)
 				displaySetup(that, flag, "crtc enable", callback->orgExecuteBiosCommandTable);
 			static uint32_t crtcLogged;
-			if (__atomic_fetch_add(&crtcLogged, 1, __ATOMIC_RELAXED) < 40)
-				diskLogEvent("crtc %u enable: power gating off %u; DENTIST %x (set %x)%s", pipe, pgOk & 1, dentist, dispclkSet,
-					reclock ? ", display clock set again" : "");
+			if (reclock && __atomic_fetch_add(&crtcLogged, 1, __ATOMIC_RELAXED) < 8)
+				diskLogEvent("crtc %u enable: power gating off %u; display engine clock set again (DENTIST %x, set %x)", pipe,
+					pgOk & 1, dentist, dispclkSet);
 		}
 	}
 	uint32_t blBefore[4] {};
 	bool blCall = table == AtomTransmitterTable && params && static_cast<uint8_t *>(params)[3] == 4 && gpuMmio;
-	// The parameters as sent (after CarrizoRed's own fixes above): ATOM tables use the block as scratch and write over it.
-	uint8_t vbIn[16] {};
-	if (params)
-		memcpy(vbIn, params, sizeof(vbIn));
 	if (blCall)
 		for (int i = 0; i < 4; i++)
 			blBefore[i] = gpuMmio[0x4820 + i];
 	uint8_t ok = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that, table, params,
 		flag);
 	call->ok = static_cast<uint8_t>((ok & 1) | patched);
-	// HDMI mode set (D509BA, log 1746945174: with -crmacgpu fb1 gets an AppleDisplay at 1920x1080 148.5 MHz but the
-	// monitor shows nothing): every display VBIOS call except AUX transfers and brightness steps, its parameters and
-	// result, the first 200.
-	if (table != AtomAuxTable && !blCall) {
-		static uint32_t vbLogged;
-		if (__atomic_fetch_add(&vbLogged, 1, __ATOMIC_RELAXED) < 200) {
-			uint8_t pb[16] {};
-			if (params)
-				memcpy(pb, params, sizeof(pb));
-			auto *in = vbIn;
-			diskLogEvent("vbios: table %x -> %x in %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x%s",
-				table, ok, in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7], in[8], in[9], in[10], in[11], in[12], in[13],
-				in[14], in[15], memcmp(in, pb, sizeof(pb)) ? " (changed by the table)" : "");
-		}
-	}
 	// Brightness: AppleBacklight sets a level through the framebuffer ('bklt'), and Apple's BaffinBiosDigitalConnection::
 	// setBacklight puts it in BIOS_SCRATCH_2 and runs this table with ATOM_TRANSMITTER_ACTION_BL_BRIGHTNESS_CONTROL (4).
 	// On the D509BA BL_PWM_CNTL's duty then follows the level (c000fa00 -> c0009f2e for 162 of 255, log 1746874764) but
