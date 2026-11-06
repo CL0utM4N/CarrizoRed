@@ -7942,6 +7942,25 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			}
 		}
 	}
+	// TMDS (DVI 2, HDMI 3) PHY clock source. The PHY takes its clock from the PLL in asConfig ucPhyClkSrcId (bits 3:2,
+	// ENCODER_REFCLK_SRC_P1PLL 0 / P2PLL 1 / DCPLL 2), which Linux sets to the same ATOM PLL id as SetPixelClock's
+	// ucPpll. Apple passes its own PLL index there, and CarrizoRed remaps index 1 to ATOM_PPLL0 (2) for SetPixelClock
+	// and the CRTC's pixel rate source (see atomPllFor) but not here: the D509BA's HDMI mode set programmed 148.5 MHz in
+	// PPLL0 while the PHY was told P2PLL, which DCE 11.0 doesn't use, and the monitor got no signal (log 1746945787:
+	// SetPixelClock ucPpll 2, transmitter config 0x26). Apply the same remap. -crnopllremap leaves both alone.
+	if (table == AtomTransmitterTable && params) {
+		auto *bytes = static_cast<uint8_t *>(params);
+		uint8_t src = (bytes[7] >> 2) & 3;
+		if ((bytes[6] == 2 || bytes[6] == 3) && src == 1 && atomPllFor(src) != src) {
+			uint8_t before = bytes[7];
+			bytes[7] = static_cast<uint8_t>((bytes[7] & ~0x0CU) | (atomPllFor(src) << 2));
+			patched = 0x80;
+			static uint32_t tmdsLogged;
+			if (tmdsLogged++ < 6)
+				diskLogEvent("hdmi: TMDS transmitter (PHY %u, action %u, mode %u): PHY clock source P2PLL -> PPLL0, config %x -> %x",
+					bytes[2], bytes[3], bytes[6], before, bytes[7]);
+		}
+	}
 	// DP colour depth. The firmware drives this eDP panel at 6 bpc (DP_PIXEL_FORMAT.DP_COMPONENT_DEPTH = 0, FMT truncation
 	// to 6 bits + dither): an 18 bpp panel. Apple's DIGxEncoderControl (table 4) v4 calls pass ucBitPerColor (+6) =
 	// PANEL_8BIT_PER_COLOR for DP mode (ucEncoderMode +4 = 0), and DP_PIXEL_FORMAT ended up at 8 bpc. Spoof boot 31: link
