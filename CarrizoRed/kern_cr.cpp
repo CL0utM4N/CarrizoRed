@@ -3472,6 +3472,20 @@ static void pipeReport() {
 		IODelay(5000);
 	}
 	diskLogEvent("%s", line);
+	// -crhdmitest: CRTC1 sends a solid white (blank data, YCbCr like Apple's stream: Cr 0x200, Y 0x3AC, Cb 0x200) for
+	// 10 s, whatever is in memory. White on the monitor: the link works and the black is the scanned-out content;
+	// still black: the link (PHY/DIG/encoding) is at fault. Everything put back afterwards.
+	if (checkKernelArgument("-crhdmitest") && (gpuMmio[0x1D9C] & 1)) {
+		uint32_t color = gpuMmio[0x1DCA], blank = gpuMmio[0x1D9D];
+		gpuMmio[0x1DCA] = 0x200EB200;
+		gpuMmio[0x1D9D] = blank | 0x100;
+		diskLogEvent("hdmi test: CRTC1 solid white for 10 s (blank colour %x -> %x, blank control %x -> %x)", color,
+			gpuMmio[0x1DCA], blank, gpuMmio[0x1D9D]);
+		IOSleep(10000);
+		gpuMmio[0x1D9D] = blank;
+		gpuMmio[0x1DCA] = color;
+		diskLogEvent("hdmi test: CRTC1 back to normal");
+	}
 }
 
 // One line per framebuffer: connector type, whether a display is attached (an IODisplayConnect child), and the
