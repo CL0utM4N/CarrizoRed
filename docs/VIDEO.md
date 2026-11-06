@@ -131,6 +131,9 @@ answers, firmware loaded, ring tests) before any playback test.
 space creates video contexts (device-ID fix), the SMU powers UVD and VCE, CAIL's UVD power gating is off, and UVD starts
 with Apple's firmware. VCE (encode) sessions are refused cleanly (`-crvce` lets them through; they hung in testing, with
 VCE's VCPU still in reset, likely the same power gating mode: `CAIL_DisableVCEPowerGating` is the first thing to try).
+Unlike UVD, VCE on Stoney shouldn't need address translation: Linux runs VCE in VM mode from Stoney on
+(`vce_v3_0_set_ring_funcs`, `asic_type >= CHIP_STONEY`), as Apple's driver does. Carrizo's VCE 3.1 runs in physical mode.
+For GCN 2's UVD 4.2 / VCE 2.0, see [OLDER_APUS.md](OLDER_APUS.md) (*Video*).
 
 **Held back:** UVD sessions are refused unless `-cruvd`, and HEVC decode is withdrawn unless `-cruvdhevc`, so nothing reaches
 UVD. With `-cruvd` decode hangs the GPU. `-cruvdpanic` gives a report 20 s into the first session if the firmware hasn't

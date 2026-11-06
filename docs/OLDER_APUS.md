@@ -159,7 +159,101 @@ What that means for the patch list:
 | CP / compute | Graphics ring registers unchanged; compute queue (HQD) registers partly reshuffled (25 collisions) | Remap or keep compute queues off at first |
 | Shape | Kabini/Mullins: 1 shader engine, 2 CUs, 1 render backend, 2 tile pipes (`ADDR_SURF_P2`), raster config 0. Kaveri: 1 SE, 8 CUs, 2 RBs, 4 pipes, `RB_MAP_PKR0(2)`, 2 MECs | Report CAIL's values to the kernel layer and to Metal (as for Stoney) |
 | Power | `kv_dpm`: messages to the SMU inside the APU, different from Stoney's SMU8 messages | PowerPlay's dummy back end first, then `kv_dpm` messages if worth it |
-| Video | UVD 4.2 / VCE 2 on GCN 2, which can't use GPUVM (Linux `gmc_v7_0.c`) | Later, as on Stoney ([VIDEO.md](VIDEO.md)) |
+| Video | UVD 4.2 / VCE 2.0, physical addressing only; Sequoia's accelerator has only UVD 6 code, but still Apple's CI VCE classes and (Ventura, checked) a CIK VCE firmware | VCE: remap and address translation. UVD: an engine layer of our own. See *Video* below |
+
+## Video: UVD 4.2 and VCE 2.0
+
+Researched 2026-11-06. Apple's side was read in Monterey 12.5's and Ventura 13.5.2's `AMDRadeonX4000` (the copies
+in OpenCore Legacy Patcher's PatcherSupportPkg, which keep class symbols). **Sequoia is not checked yet**:
+`scripts/video_gcn2_check.py` runs the same checks on the KDK's binaries.
+
+### The hardware (Linux)
+
+- Every GCN 2 APU has UVD 4.2 and VCE 2.0. **The firmware is the same file for all of them**: linux-firmware's
+  `bonaire`, `hawaii`, `kaveri`, `kabini` and `mullins` `_uvd.bin` are byte-identical (232,752 B), and so are the
+  `_vce.bin` (101,072 B, `VCEFW 50.5.2`).
+- Decode: MPEG-2, MPEG-4, H.264 and VC-1, up to 2048×1152 (`cik_video_codecs_decode`). No HEVC. Encode: H.264, up to
+  2048×1152.
+- **UVD 4.2 vs UVD 6.0 registers** (`uvd_4_2_d.h` vs `uvd_6_0_d.h`): of 58 common registers, 54 are at the same
+  offset. `UVD_PGFSM_CONFIG`, `PGFSM_READ_TILE1/2` and `UVD_POWER_STATUS` moved (`0x38F8`+ → `0x38C0`+). UVD 6 adds
+  the 64-bit address registers (`LMI_RBC_RB/IB_64BIT_BAR_*`, `LMI_VCPU_CACHE_64BIT_BAR_*`), the VMID registers and the
+  encode rings. Two offsets **mean different things**:
+
+| Offset | UVD 4.2 | UVD 6.0 |
+|---|---|---|
+| `0x3DA1` | `UVD_RBC_IB_BASE` | `UVD_LMI_RBC_IB_VMID` |
+| `0x3DA3` | `UVD_RBC_RB_BASE` | `UVD_LMI_RBC_RB_VMID` |
+
+- **UVD 4.2 addressing is 32-bit plus extensions**: bits 28–31 in `UVD_LMI_ADDR_EXT`, bits 32–39 in
+  `UVD_LMI_EXT40_ADDR` (`uvd_v4_2_mc_resume`); Linux allows 64-bit addresses only from UVD 5.0
+  (`adev->uvd.address_64_bit`). So, on top of physical mode (as Stoney's UVD, [VIDEO.md](VIDEO.md) stage 7):
+  - no buffer may cross a 256 MB boundary;
+  - message and feedback buffers must be in the same 256 MB segment as the firmware (VCPU) buffer
+    (`amdgpu_uvd_cs_pass2`; Linux forces them there, `amdgpu_uvd_force_into_vcpu_segment`).
+- **VCE 2.0 vs VCE 3.0** (`vce_2_0_d.h` vs `vce_3_0_d.h`): 39 common registers, 25 at the same offset, including the
+  ring registers (`VCE_RB_BASE_LO/HI`, `VCE_RB_SIZE` at `0x8060`–`0x8062`, the LLQ ring at `0x805B`–`0x805D`). The
+  LMI block moved by `+0x80` (`VCE_LMI_CTRL` `0x8526` → `0x85A6`, …) and so did `VCE_SYS_INT_*`. VCE 2.0 has one
+  firmware cache BAR (`VCE_LMI_VCPU_CACHE_40BIT_BAR`); VCE 3 programs three.
+- **VCE addressing:** VCE 2.0 runs in physical mode (`amdgpu_vce_ring_parse_cs`: addresses rewritten, no buffer may
+  cross a 4 GB boundary). That's a much looser rule than UVD 4.2's.
+
+### What Apple's accelerator has
+
+| | Monterey 12.5 | Ventura 13.5.2 |
+|---|---|---|
+| UVD hardware classes | `AMDCIUVDHWEngine` → `AMDSIUVDHWEngine`, with SI's ring and channel | VI only (`AMDVIUVDHWEngine`, `AMDUVD6v3HWEngine`) |
+| VCE hardware classes | `AMDCIVCEHWEngine`, `AMDCIVCERing`, `AMDCIVCEChannel` (+ LLQ) | **the same CI classes**: VI's derive from them |
+| Multimedia layer (firmware, messages) | `AMDUVDTrinity`, `AMDUVDCIK`, `AMDUVDVI`, `AMDUVD6v3`; `AMDSIVCE`, `AMDCIKVCE`, `AMDVIVCE`, `AMDVCE3v4` | the same eight |
+| CIK VCE firmware | plain, in the accelerator | plain, in the accelerator (below) |
+| CI hardware (`AMDCIHardware`, `AMDBonaireHardware`) | yes | no |
+
+- **UVD: Ventura's code programs UVD 6.** The UVD IB command written by `AMDVIUVDChannel` and
+  `AMDUVD6v3DecChannel::initializeIndirectBufferCmd` sets `0x3DA1` (the VMID), `0x3C67`/`0x3C66` (64-bit address)
+  and `0x3DA2` (size). On UVD 4.2 that puts the VMID into `UVD_RBC_IB_BASE` and the address into registers that
+  don't exist. The ring set-up (`AMDVIUVDRing::init`) is the same: `0x3C68`/`0x3C69` and `0x3DA3`.
+  Monterey's SI channel shows the UVD 3/4 version: `UVD_LMI_EXT40_ADDR` (`0x3D26`), `UVD_RBC_IB_BASE`,
+  `UVD_RBC_IB_SIZE`, and the ring at `UVD_RBC_RB_BASE` plus `EXT40`. Ventura removed that code with the SI/CI
+  hardware classes.
+- **VCE: the CI engine is the one Polaris uses.** `AMDVIVCEHWEngine` derives from `AMDCIVCEHWEngine` and doesn't
+  override `initHardware`, `configCacheWindows`, `initHardwareRings` or the clock functions. `AMDVIVCEChannel`
+  derives from `AMDCIVCEChannel`. `AMDCIVCERing` writes the ring registers that VCE 2 and 3 share;
+  `AMDVIVCERing` / `AMDVCE3v4Ring` also write `0xC200` (`GRBM_GFX_INDEX`, VCE instance select).
+- **The CIK VCE firmware is embedded** (Ventura, `AMDCIKVCE`'s image): file offset `0x26B770`, 103,760 B, tagged
+  `[ATI LIB=VCEFW,52.1.2]` at `+0x16AF0`. Linux's `kaveri_vce.bin` has the same layout (tag at `+0x16AB0`), and
+  211 of its 1,268 64-byte chunks occur in Apple's image: a newer build of the same firmware. The other two images
+  are `AMDVIVCE`'s (177,344 B, Carrizo-like) and `AMDVCE3v4`'s (166,752 B, Polaris).
+- **No plain UVD firmware for any chip**, as known from Sequoia (CAIL decrypts UVD firmware). Whether Sequoia's
+  HWLibs still carries a CIK UVD image is open. Linux's `kaveri_uvd.bin` works for every GCN 2 APU, and
+  `LICENSE.amdgpu` allows shipping it.
+
+### What that means
+
+- **VCE (H.264 encode) is the nearer target.** Firmware, engine, ring and channel classes are Apple's. To do:
+  - the multimedia layer picks `AMDCIKVCE` for the chip;
+  - the LMI registers are remapped (`+0x80`), with one cache BAR instead of three (CAIL or `configCacheWindows`, to
+    check);
+  - every address in each VCE IB is rewritten to a memory-controller address (physical mode, 4 GB rule). It's the
+    same translation as Stoney's UVD stage 7, with a simpler rule set.
+- **UVD (decode) needs an engine layer of our own.** Apple's code is UVD 6 only, so:
+  - rewrite the ring set-up and every IB command into the UVD 4.2 form (`EXT40` + `RBC_IB_BASE` + `RBC_IB_SIZE`);
+  - program the firmware cache windows with `LMI_ADDR_EXT`/`EXT40`;
+  - remap `PGFSM`/`POWER_STATUS`;
+  - translate every message address to physical (as on Stoney);
+  - keep all UVD buffers inside 256 MB segments, with messages and feedback in the firmware's segment. With the
+    carve-out moved to GPU address 0, its first 256 MB is the natural window; user-space bitstreams need bounce
+    buffers there;
+  - supply the firmware, Apple's (if Sequoia's CAIL still has it) or Linux's.
+  Stoney's stage 7 address translation comes first: most of it carries over.
+- **A hybrid shader decoder is relatively more attractive here than on Stoney**, for HEVC (no hardware decode at
+  all on GCN 2) on Kaveri-class chips. Kabini and Mullins (2 CUs) are too small for it.
+
+### To check on Sequoia
+
+`python scripts/video_gcn2_check.py --accel <KDK>/AMDRadeonX4000 --hwlibs <KDK>/AMDRadeonX4000HWLibs --fw kaveri_vce.bin kaveri_uvd.bin`:
+- do `AMDCIVCE*`, `AMDCIKVCE` and `AMDUVDCIK` and the `52.1.2` image survive;
+- does CAIL have UVD/VCE code for the KV family (Spectre/Kalindi/Godavari), or only generic `CailUvdInit` /
+  `CailVceInit`. That decides whether CAIL can bring the engines up, or CarrizoRed does it as Linux's
+  `uvd_v4_2_start` / `vce_v2_0_start`.
 
 ## Display: `AMD9500Controller` (DCE 11.2) on DCE 8
 
@@ -262,7 +356,8 @@ Details are in KaberiRed's `docs/TEST_MACHINE.md`.
 5. **Metal.** Report a CI chip to user space so `AMDMTLBronzeDriver` takes its CI path and libSC its Bonaire back
    end. Find the user-space patterns again in the `x86_64` cache. Kabini/Mullins: port the interpolation fixer to GFX7
    encodings. Milestone: WindowServer composites on the GPU.
-6. **Later:** `kv_dpm` clock control, sleep, video, Ventura and later (with CryptexFixup).
+6. **Later:** `kv_dpm` clock control, sleep, Ventura and later (with CryptexFixup), video: VCE (H.264 encode)
+   first, then UVD 4.2 (see *Video*).
 
 ## Relation to KaberiRed
 
