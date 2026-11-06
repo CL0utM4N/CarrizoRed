@@ -7,7 +7,7 @@ used them), so on a hackintosh they've only had the firmware framebuffer.
 
 ## Status
 
-> **Experimental, in active development.** The first pre-release, **0.1.0**, is on the
+> **Experimental, in active development.** Pre-releases (latest **0.3.0**) are on the
 > [Releases](https://github.com/CL0utM4N/CarrizoRed/releases) page. Expect kernel panics and black screens, and
 > don't run it on a machine you depend on. Everything below is from a handful of test machines.
 
@@ -23,7 +23,7 @@ scales with load (400 MHz idle, up to the chip's top level).
 | Display interrupts (vblank) | **Works** |
 | Acceleration / Metal (`AMDRadeonX4000`) | **Works.** The SMU loads the GPU microcode, the command processor and SDMA run, interrupts work, and WindowServer and apps render with Metal. Apple's shader compiler emits an interpolation pattern Stoney's 16-bank LDS gets wrong; CarrizoRed fixes the compiled pixel shaders before the GPU runs them, including when Metal re-uploads them (see *Metal needed*). Boot with `-crnoaccel` for an unaccelerated desktop |
 | GPU clock scaling (SCLK DPM) | **Works, on by default.** Apple's PowerPlay runs its Dummy back end here, so nothing would start the SMU's clock scaling and the GPU would stay at its lowest clock. CarrizoRed starts it 90 s after boot, from the SMU's own clock table: 400 MHz minimum, up to the top level (900 MHz on an A9-9425, 800 MHz on an A9-9420). `-crnosclkdpm` turns it off |
-| Sleep | **Works** on the D509BA (Catalina, Big Sur, Monterey) and the Dell Inspiron 3475 (Tahoe): real S3, no wakes of its own, and a USB keyboard on a USB 2 or USB 3 port wakes it (both machines). CarrizoRed flushes the CPU caches before S3 (Apple's ACPI code doesn't, and the wake died without it), lets only the USB controllers, the lid and the power button wake the machine, and works around the AMD FCH's USB wake quirks; FCHXHCIFix's `SSDT-FCHSLEEP` keeps the USB 2 controller powered through S3. It redoes what S3 resets in the display block the way Linux's DC driver does at resume (panel power, display clock and DP DTO, VBIOS scratch and backlight, AUX, ASSR). Sonoma untested since the cache flush. Lid close sleeps on battery but not on AC (macOS sees desktop mode). Details: [docs/SLEEP.md](docs/SLEEP.md) |
+| Sleep | **Works** on the D509BA (Catalina, Big Sur, Monterey) and the Dell Inspiron 3475 (Tahoe): real S3, no wakes of its own, and a USB keyboard on a USB 2 or USB 3 port wakes it (both machines). CarrizoRed flushes the CPU caches before S3 (Apple's ACPI code doesn't, and the wake died without it), lets only the USB controllers, the lid and the power button wake the machine, and works around the AMD FCH's USB wake quirks; FCHXHCIFix's `SSDT-FCHSLEEP` keeps the USB 2 controller powered through S3. It redoes what S3 resets in the display block the way Linux's DC driver does at resume (panel power, display clock and DP DTO, VBIOS scratch and backlight, AUX, ASSR). Sonoma untested since the cache flush. Lid close sleeps on AC too with `SSDT-PNLF` (see *Brightness*). Details: [docs/SLEEP.md](docs/SLEEP.md) |
 | Brightness | **Works:** the Displays slider and the brightness keys (D509BA on Monterey, Dell Inspiron 3475 on Tahoe). Needs `SSDT-PNLF` and [BrightnessKeys](https://github.com/acidanthera/BrightnessKeys) (see *Installing*). With them the panel is macOS's built-in display, which also makes lid-close sleep work on AC |
 | External displays (HDMI) | **Works** on the D509BA and the Dell Inspiron 3475 (Tahoe): the monitor is detected and lit at boot and on hot-plug (1920×1080 at 60 Hz tested), and unplugging it hands the desktop back to the panel. See *HDMI* below. DisplayPort outputs untested |
 | HDMI audio | Not done |
@@ -115,7 +115,7 @@ And Metal needed:
 | Freezes with clock scaling | Fixed: CarrizoRed's own interrupt-storm breaker was tripping on real interrupt bursts at higher clocks |
 | OpenGL | Expected to work, untested: Apple's AMD GL driver compiles through the same `libSC` CarrizoRed patches for Stoney (its `ATIRadeonX4000SCLib` wraps it), and the shader fix works on every submission whatever the API |
 | Video decode/encode | On hold: software decode and encode. UVD starts with Apple's firmware, but needs CarrizoRed to translate GPU virtual addresses to physical ones before it can decode ([docs/VIDEO.md](docs/VIDEO.md)) |
-| Sleep/wake | Done: works on the D509BA and the Dell (Tahoe), with USB 2 and USB 3 keyboard wake. Sonoma to retest; lid sleep on AC blocked by desktop mode (works on battery); see [docs/SLEEP.md](docs/SLEEP.md) |
+| Sleep/wake | Done: works on the D509BA and the Dell (Tahoe), with USB 2 and USB 3 keyboard wake. Sonoma to retest; lid sleep on AC works with `SSDT-PNLF`; see [docs/SLEEP.md](docs/SLEEP.md) |
 | Carrizo / Bristol Ridge | Code paths written (SMU loader, clock scaling, caps), untested: no hardware |
 | Tahoe graphics memory | Open: Tahoe can fill the 512 MB carve-out (see *Graphics memory on Tahoe*) |
 | Brightness | Done: slider and keys, through Apple's AppleBacklight and AMD framebuffer (see *Brightness* under *Boot arguments*) |
@@ -197,12 +197,13 @@ The pieces CarrizoRed needs:
    loads. The panic text carries a "black box" report: trace, registers, link, interrupts and accelerator state.
    `debug=0x100` makes the machine halt on the panic instead of rebooting. Read the report back from NVRAM
    (`AAPL,PanicInfo`) after the next boot, e.g. with OpenShell `dmpstore -all -s fs0:\nvram.bin`.
-5. **Brightness (laptops and all-in-ones):** add `SSDT-PNLF.aml` (compiled from
+5. **Brightness (laptops and all-in-ones):** add `SSDT-PNLF.aml` (attached to each release, or compiled from
    [docs/opencore/SSDT-PNLF.dsl](docs/opencore/SSDT-PNLF.dsl): `iasl SSDT-PNLF.dsl`) to `EFI/OC/ACPI` and `config.plist` →
    ACPI → Add, and [BrightnessKeys](https://github.com/acidanthera/BrightnessKeys/releases) after Lilu in Kernel → Add.
    The SSDT is the `"backlight"` device macOS looks for before it treats a panel as built-in; without it the panel is an
    external-style display: no brightness control, and closing the lid doesn't sleep the machine on AC.
-6. **After boot:** `log show --last boot --predicate 'eventMessage CONTAINS "CarrizoRed"'` and
+6. **External displays (HDMI):** nothing to add; see *HDMI* under *Boot arguments*.
+7. **After boot:** `log show --last boot --predicate 'eventMessage CONTAINS "CarrizoRed"'` and
    `ioreg -lw0 | grep CarrizoRed`.
 
 ### Finding the iGPU's path
