@@ -8030,6 +8030,30 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	// PIXEL_CLOCK_PARAMETERS_V6 ucPpll (byte 8) = 0xFF, usFbDiv/ucPostDiv/ucRefDiv (4-7) and ulFbDivDecFrac (12-15) 0,
 	// ucMiscInfo (11) without REF_DIV_SRC (0x10), for ucEncoderMode (10) DP (0) or DP MST (5) and a ucPpll that isn't a
 	// DCE 11 PLL (ATOM_PPLL1 0, PPLL2 1, PPLL0/DCPLL 2, EXT_PLL1/2 8/9, EXT_CLOCK 10, INVALID 0xFF). -crnodppclk disables.
+	// TMDS pixel clock encoder mode. Linux DC's set_pixel_clock_v6 sends ucEncoderMode = ATOM_ENCODER_MODE_HDMI (3) /
+	// DVI (2) for a TMDS stream. Apple's HDMI calls on the D509BA: the reset (clock 0) has mode 3, the real ones
+	// (148.49 MHz on PPLL0, CRTC 1) mode 0, DP, so the VBIOS set the clock up for a DP link and the monitor got nothing
+	// (logs 1746945787-1746949490). A DP stream never gets a real DCE PLL here (its calls are turned into DP DTO ones
+	// below), so mode 0 with PLL 0-2 is a TMDS call: give it the CRTC's last TMDS mode. -crnotmdsfix leaves it.
+	if (table == AtomPixelClockTable && params) {
+		auto *bytes = static_cast<uint8_t *>(params);
+		static uint8_t crtcTmdsMode[8];
+		static int pclkTmdsOff = -1;
+		if (pclkTmdsOff < 0)
+			pclkTmdsOff = checkKernelArgument("-crnotmdsfix") ? 1 : 0;
+		uint8_t crtc = bytes[3] & 7;
+		if (bytes[10] == 2 || bytes[10] == 3)
+			crtcTmdsMode[crtc] = bytes[10];
+		else if (!pclkTmdsOff && bytes[10] == 0 && bytes[8] <= 2 && crtcTmdsMode[crtc] &&
+			(bytes[0] | bytes[1] << 8 | bytes[2] << 16)) {
+			bytes[10] = crtcTmdsMode[crtc];
+			patched = 0x80;
+			static uint32_t modeLogged;
+			if (modeLogged++ < 6)
+				diskLogEvent("hdmi: SetPixelClock CRTC %u PLL %u: encoder mode DP -> %s (%u0 kHz)", crtc, bytes[8],
+					bytes[10] == 3 ? "HDMI" : "DVI", bytes[0] | bytes[1] << 8 | bytes[2] << 16);
+		}
+	}
 	if (table == AtomPixelClockTable && params && !checkKernelArgument("-crnodppclk")) {
 		auto *bytes = static_cast<uint8_t *>(params);
 		uint8_t ppll = bytes[8], mode = bytes[10];
