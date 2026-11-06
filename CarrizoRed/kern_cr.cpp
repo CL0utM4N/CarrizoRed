@@ -3390,6 +3390,39 @@ static void backlightPanelsInject() {
 	iter->release();
 }
 
+// HDMI hot-plug: each DCE 11 HPD pin interrupts on one edge, chosen by DC_HPD_INT_CONTROL.DC_HPD_INT_POLARITY (bit 8:
+// 1 = on connect, 0 = on disconnect), so after every plug or unplug the driver has to point it at the next one. Linux
+// sets it from the pin's sense every time (dce_v11_0_hpd_set_polarity). Apple's driver missed it on the Dell 3475
+// (log 1793976226): after an unplug HPD1 read sense 0 with polarity still 0, so the replug raised no interrupt and macOS
+// never saw the monitor again. A pin left waiting for the state it is already in (interrupt enabled, nothing pending,
+// polarity == sense) for two polls in a row (~1 s, so Apple's own handling isn't raced) gets its polarity flipped.
+// -crnohpdfix disables.
+static void hpdPolarityFix() {
+	static int off = -1;
+	if (off < 0)
+		off = checkKernelArgument("-crnohpdfix") ? 1 : 0;
+	if (off || !gpuMmio)
+		return;
+	static uint8_t stuck[6];
+	static uint32_t logged;
+	for (uint32_t n = 0; n < 6; n++) {
+		uint32_t status = gpuMmio[0x1898 + 8 * n], control = gpuMmio[0x1899 + 8 * n], hpd = gpuMmio[0x189A + 8 * n];
+		bool enabled = (hpd >> 28) & 1 && (control >> 16) & 1;
+		uint32_t sense = (status >> 1) & 1, polarity = (control >> 8) & 1;
+		if (!enabled || (status & 1) || polarity != sense || status == 0xFFFFFFFF) {
+			stuck[n] = 0;
+			continue;
+		}
+		if (++stuck[n] < 2)
+			continue;
+		stuck[n] = 0;
+		gpuMmio[0x1899 + 8 * n] = (control & ~0x100U) | (sense ? 0 : 0x100U);
+		if (logged++ < 16)
+			diskLogEvent("hpd: pin %u (sense %u) was waiting for a %s it already had; polarity set for the next %s", n,
+				sense, sense ? "connect" : "disconnect", sense ? "disconnect" : "connect");
+	}
+}
+
 // One line per framebuffer: connector type, whether a display is attached (an IODisplayConnect child), and the
 // current mode's pixel count and clock. Other children: class (name), two levels deep.
 static void describeChildren(IORegistryEntry *entry, int depth, char *buf, size_t size) {
@@ -4187,6 +4220,9 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			if (!backlightOff)
 				backlightPanelsInject();
 		}
+
+		if (!__atomic_load_n(&gpuSleeping, __ATOMIC_RELAXED))
+			hpdPolarityFix();
 
 		// The registry walk below: every second during start-up, every 10 s once Metal is drawing.
 		if (tick % 2 || (desktopRunning() && tick % 20)) {

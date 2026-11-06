@@ -277,6 +277,7 @@ controller off in `_PTS`, which wakes the machine at once. CarrizoRed does the r
 | `-crnoddcprep` | HDMI: don't set the DDC line up for the hardware I2C engine before Apple's EDID read (`DC_I2C_DDCn_SPEED`/`SETUP` and the `DC_GPIO_DDCn` mask, as Linux DC does); without it the read timed out |
 | `-crnotmdsfix` | HDMI: leave Apple's TMDS (HDMI/DVI) transmitter and pixel clock calls as they are. CarrizoRed builds them as Linux DC does: the PHY clocked from the PLL the pixel clock actually went to (CarrizoRed remaps Apple's P2PLL to PPLL0, which DCE 11.0 uses), the HDMI connector object, not coherent, and the stream's encoder mode in SetPixelClock. Calls for the eDP panel aren't touched |
 | `-crnobootdisp` | HDMI: don't run the display set-up Linux DC's `init_hw` does at boot and before each display enable: the VBIOS EnableDispPowerGating INIT/DISABLE on both pipes and the display engine clock (FirmwareInfo's default, 847 MHz on the A9-9425, through SetPixelClock's DFS). Apple sets that clock through SetDCEClock, which these VBIOSes don't have, so it stayed at the 100 MHz the firmware left: enough for the panel, not for 1080p, and the HDMI monitor stayed black |
+| `-crnohpdfix` | HDMI: don't correct a hot-plug pin left waiting for the wrong edge. Each HPD pin interrupts only on connect or only on disconnect (`DC_HPD_INT_POLARITY`), and the driver has to flip it after each event, as Linux does; Apple's sometimes didn't after an unplug, so the next plug-in went unnoticed (Dell 3475). CarrizoRed checks the pins every 0.5 s and flips one that has been waiting for the state it's already in for 1 s |
 | `-crnoehciwakefix` | At S3 entry, don't clear the FCH USB 2 hub's wake on connect, disconnect and over-current (EHCI config 0x84 bits 23:21; wake on a device's remote wake stays) or a stale EHCI PME_Status. With them set, the machine woke ~1 s after every S3 entry |
 | `-crtps1restore` | Experimental: after a wake, copy LVTMA_PWRSEQ_CNTL, the UNIPHY link controls, TMDP_REG3/5 and DIG_FE_CNTL from the boot's link training (TPS1) back just before Apple's training. A boot-time copy, not what Linux does |
 | `-crtmdprestore` | Experimental: after a wake, copy the UNIPHY macro registers' boot values back right after Apple's eDP transmitter ENABLE. A boot-time copy, not what Linux does |
@@ -349,6 +350,8 @@ missing, in the order they were found (each has its own off switch above):
    clock was still the firmware's 100 MHz, too slow for 1080p, and Apple has no way to set it on these VBIOSes (no
    SetDCEClock). HDMI first worked after a wake, whose restore sets the clock; CarrizoRed now does the same at boot and
    before every display enable (`-crnobootdisp`).
+5. **Replug:** on the Dell, after an unplug Apple's driver sometimes left the hot-plug pin waiting for another unplug,
+   so plugging back in did nothing; CarrizoRed points the pin at the next plug-in, as Linux does (`-crnohpdfix`).
 
 Still to do: HDMI audio, and DisplayPort outputs on machines that have them.
 
