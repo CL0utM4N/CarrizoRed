@@ -7936,6 +7936,67 @@ IOReturn CRDriver::wrapInstallInterrupts(void *that) {
 	return ret;
 }
 
+// The display set-up Linux DC's init_hw does and Apple doesn't: the VBIOS EnableDispPowerGating table on both pipes, with
+// ATOM_INIT and then ATOM_DISABLE (power gating off), and the display engine clock (see below). Needed after S3, and at
+// boot for anything past the firmware's eDP mode: HDMI on the D509BA (1080p, 148.5 MHz) stayed black, CRTC1 running and
+// DIG1 in HDMI mode, until a wake ran this (log 1746955837: DENTIST_DISPCLK_CNTL 0x64190064, DID 0x64 = 100 MHz from
+// the 3.6 GHz VCO, before; 847 MHz after, and the picture came up).
+static uint32_t dispclkSet;  // DENTIST_DISPCLK_CNTL after our display engine clock set, 0 if not set
+static void displaySetup(void *that, uint32_t flag, const char *when, mach_vm_address_t orgTable) {
+	auto org = reinterpret_cast<uint8_t (*)(void *, uint32_t, void *, uint32_t)>(orgTable);
+	if (!checkKernelArgument("-crnowakerestore")) {
+		uint8_t results[4] {};
+		for (uint8_t pipe = 0; pipe < 2; pipe++) {
+			uint8_t pg[16] {};
+			pg[0] = pipe;
+			pg[1] = 7;  // ATOM_INIT
+			results[pipe * 2] = org(that, AtomDispPowerGatingTable, pg, flag);
+			memset(pg, 0, sizeof(pg));
+			pg[0] = pipe;
+			pg[1] = 0;  // ATOM_DISABLE: no power gating
+			results[pipe * 2 + 1] = org(that, AtomDispPowerGatingTable, pg, flag);
+		}
+		diskLogEvent("%s: EnableDispPowerGating INIT/DISABLE pipe 0 %u/%u pipe 1 %u/%u; DISPPLL_BG_CNTL %x PLL_CNTL %x", when,
+			results[0] & 1, results[1] & 1, results[2] & 1, results[3] & 1, gpuMmio ? gpuMmio[0x171E] : 0,
+			gpuMmio ? gpuMmio[0x1707] : 0);
+	}
+	// The display engine clock, the way Linux's DC sets it on DCE 11.0 (dce_set_clock -> program_display_engine_pll ->
+	// SetPixelClock V6 with ucPpll ATOM_EXT_PLL1, DC's DFS, and ulDispEngClkFreq). Apple sets it through SetDCEClock,
+	// which this VBIOS doesn't have (command table 46 is empty; "setDisplayClock: ASSERT m_setDceClock"), so after S3
+	// nothing sets the display clocks: DENTIST_DPREFCLK_WDIVIDER was back at its 100 MHz reset value (DID 0x64; the
+	// firmware's 0x24 is 400 MHz from the 3.6 GHz DENTIST VCO), the DP DTO modulos 0, DP_VID_M wrong and the trained
+	// link black (wake #32, log 1793402311; SetDCEClock returned 0 kHz). Use the VBIOS's default display engine clock
+	// (FirmwareInfo ulDefaultDispEngineClkFreq), as legacy Linux does at init. If the DTO modulo is still 0 after it,
+	// ask again with PIXEL_CLOCK_V6_MISC_GEN_DPREFCLK (0x40). -crnodispclk disables.
+	if (!checkKernelArgument("-crnodispclk") && vbiosImage) {
+		uint16_t fiSize = 0;
+		auto *fi = VBIOS::findDataTable(static_cast<const uint8_t *>(vbiosImage->getBytesNoCopy()),
+			vbiosImage->getLength(), 4, fiSize);  // FirmwareInfo
+		uint32_t dispclk = 0;
+		if (fi && fiSize >= 44)
+			memcpy(&dispclk, fi + 40, sizeof(dispclk));  // ulDefaultDispEngineClkFreq, 10 kHz units
+		if (dispclk) {
+			uint32_t dentist = gpuMmio ? gpuMmio[0x124] : 0, modulo = gpuMmio ? gpuMmio[0x142] : 0;
+			uint8_t ok2 = 0, pc[16] {};
+			memcpy(pc, &dispclk, sizeof(dispclk));
+			pc[8] = 8;  // ucPpll: ATOM_EXT_PLL1 (DFS)
+			uint8_t ok1 = org(that, AtomPixelClockTable, pc, flag);
+			uint32_t dentist1 = gpuMmio ? gpuMmio[0x124] : 0, modulo1 = gpuMmio ? gpuMmio[0x142] : 0;
+			if (!modulo1) {
+				memset(pc, 0, sizeof(pc));
+				memcpy(pc, &dispclk, sizeof(dispclk));
+				pc[8] = 8;
+				pc[11] = 0x40;  // PIXEL_CLOCK_V6_MISC_GEN_DPREFCLK
+				ok2 = org(that, AtomPixelClockTable, pc, flag);
+			}
+			dispclkSet = gpuMmio ? gpuMmio[0x124] : 0;
+			diskLogEvent("%s: display engine clock %u0 kHz via SetPixelClock DFS: ok %u, then GEN_DPREFCLK %s; DENTIST "
+				"%x -> %x -> %x, DTO0 modulo %x -> %x -> %x", when, dispclk, ok1 & 1, modulo1 ? "not needed" : ok2 & 1 ? "ok" :
+				"failed", dentist, dentist1, gpuMmio ? gpuMmio[0x124] : 0, modulo, modulo1, gpuMmio ? gpuMmio[0x142] : 0);
+		}
+	}
+}
+
 uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *params, uint32_t flag) {
 	atomParser = that;
 	atomFlag = flag;
@@ -8161,60 +8222,7 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 		// (DISPPLL_BG_CNTL.DISPPLL_BG_PDN = 1, the firmware's 0x80 read 0x81), and PLL0's reference select was reset. Linux
 		// DC's init_hw starts by running the VBIOS EnableDispPowerGating table on every pipe, with ATOM_INIT (7) and then
 		// ATOM_DISABLE (power gating off), which sets the display block up again. Do the same for both pipes first.
-		if (!checkKernelArgument("-crnowakerestore")) {
-			uint8_t results[4] {};
-			for (uint8_t pipe = 0; pipe < 2; pipe++) {
-				uint8_t pg[16] {};
-				pg[0] = pipe;
-				pg[1] = 7;  // ATOM_INIT
-				results[pipe * 2] = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
-					AtomDispPowerGatingTable, pg, flag);
-				memset(pg, 0, sizeof(pg));
-				pg[0] = pipe;
-				pg[1] = 0;  // ATOM_DISABLE: no power gating
-				results[pipe * 2 + 1] = FunctionCast(wrapExecuteBiosCommandTable,
-					callback->orgExecuteBiosCommandTable)(that, AtomDispPowerGatingTable, pg, flag);
-			}
-			diskLogEvent("wake: EnableDispPowerGating INIT/DISABLE pipe 0 %u/%u pipe 1 %u/%u; DISPPLL_BG_CNTL %x PLL_CNTL %x",
-				results[0] & 1, results[1] & 1, results[2] & 1, results[3] & 1, gpuMmio ? gpuMmio[0x171E] : 0,
-				gpuMmio ? gpuMmio[0x1707] : 0);
-		}
-		// The display engine clock, the way Linux's DC sets it on DCE 11.0 (dce_set_clock -> program_display_engine_pll ->
-		// SetPixelClock V6 with ucPpll ATOM_EXT_PLL1, DC's DFS, and ulDispEngClkFreq). Apple sets it through SetDCEClock,
-		// which this VBIOS doesn't have (command table 46 is empty; "setDisplayClock: ASSERT m_setDceClock"), so after S3
-		// nothing sets the display clocks: DENTIST_DPREFCLK_WDIVIDER was back at its 100 MHz reset value (DID 0x64; the
-		// firmware's 0x24 is 400 MHz from the 3.6 GHz DENTIST VCO), the DP DTO modulos 0, DP_VID_M wrong and the trained
-		// link black (wake #32, log 1793402311; SetDCEClock returned 0 kHz). Use the VBIOS's default display engine clock
-		// (FirmwareInfo ulDefaultDispEngineClkFreq), as legacy Linux does at init. If the DTO modulo is still 0 after it,
-		// ask again with PIXEL_CLOCK_V6_MISC_GEN_DPREFCLK (0x40). -crnodispclk disables.
-		if (!checkKernelArgument("-crnodispclk") && vbiosImage) {
-			uint16_t fiSize = 0;
-			auto *fi = VBIOS::findDataTable(static_cast<const uint8_t *>(vbiosImage->getBytesNoCopy()),
-				vbiosImage->getLength(), 4, fiSize);  // FirmwareInfo
-			uint32_t dispclk = 0;
-			if (fi && fiSize >= 44)
-				memcpy(&dispclk, fi + 40, sizeof(dispclk));  // ulDefaultDispEngineClkFreq, 10 kHz units
-			if (dispclk) {
-				uint32_t dentist = gpuMmio ? gpuMmio[0x124] : 0, modulo = gpuMmio ? gpuMmio[0x142] : 0;
-				uint8_t ok2 = 0, pc[16] {};
-				memcpy(pc, &dispclk, sizeof(dispclk));
-				pc[8] = 8;  // ucPpll: ATOM_EXT_PLL1 (DFS)
-				uint8_t ok1 = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
-					AtomPixelClockTable, pc, flag);
-				uint32_t dentist1 = gpuMmio ? gpuMmio[0x124] : 0, modulo1 = gpuMmio ? gpuMmio[0x142] : 0;
-				if (!modulo1) {
-					memset(pc, 0, sizeof(pc));
-					memcpy(pc, &dispclk, sizeof(dispclk));
-					pc[8] = 8;
-					pc[11] = 0x40;  // PIXEL_CLOCK_V6_MISC_GEN_DPREFCLK
-					ok2 = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
-						AtomPixelClockTable, pc, flag);
-				}
-				diskLogEvent("wake: display engine clock %u0 kHz via SetPixelClock DFS: ok %u, then GEN_DPREFCLK %s; DENTIST "
-					"%x -> %x -> %x, DTO0 modulo %x -> %x -> %x", dispclk, ok1 & 1, modulo1 ? "not needed" : ok2 & 1 ? "ok" :
-					"failed", dentist, dentist1, gpuMmio ? gpuMmio[0x124] : 0, modulo, modulo1, gpuMmio ? gpuMmio[0x142] : 0);
-			}
-		}
+		displaySetup(that, flag, "wake", callback->orgExecuteBiosCommandTable);
 		uint32_t restored = restoreAfterWake();
 		diskLogEvent("wake: %u registers restored before the first AUX transaction (VBIOS scratch and backlight from sleep%s)",
 			restored, checkKernelArgument("-crwakeregrestore") ? ", boot-time display registers" : "");
@@ -8339,6 +8347,37 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	}
 	if (aux && __atomic_load_n(&dcAuxOn, __ATOMIC_RELAXED))
 		dcAuxPrepare();
+	// Boot: the same set-up once, before Apple's first display call (it has none of its own: no SetDCEClock in this VBIOS,
+	// "setDisplayClock: ASSERT m_setDceClock"). Then before every CRTC enable (EnableCRTC, table 0x23, ucEnable 1), that
+	// pipe's power gating off again and the display engine clock back if something changed it: after the wake HDMI
+	// worked until a replug, then black again. -crnobootdisp disables.
+	if (!aux && gpuMmio && !wakeRestorePending) {
+		static int bootDispOff = -1;
+		if (bootDispOff < 0)
+			bootDispOff = checkKernelArgument("-crnobootdisp");
+		static bool bootDispDone;
+		if (!bootDispOff && !bootDispDone) {
+			bootDispDone = true;
+			displaySetup(that, flag, "boot", callback->orgExecuteBiosCommandTable);
+		} else if (!bootDispOff && table == 0x23 && params && static_cast<uint8_t *>(params)[1] == 1) {
+			uint8_t pipe = static_cast<uint8_t *>(params)[0];
+			uint8_t pg[16] {};
+			pg[0] = pipe;
+			pg[1] = 0;  // ATOM_DISABLE: no power gating
+			uint8_t pgOk = 0;
+			if (pipe < 2)
+				pgOk = FunctionCast(wrapExecuteBiosCommandTable, callback->orgExecuteBiosCommandTable)(that,
+					AtomDispPowerGatingTable, pg, flag);
+			uint32_t dentist = gpuMmio[0x124];
+			bool reclock = dispclkSet && (dentist & 0x7F) != (dispclkSet & 0x7F);
+			if (reclock)
+				displaySetup(that, flag, "crtc enable", callback->orgExecuteBiosCommandTable);
+			static uint32_t crtcLogged;
+			if (__atomic_fetch_add(&crtcLogged, 1, __ATOMIC_RELAXED) < 40)
+				diskLogEvent("crtc %u enable: power gating off %u; DENTIST %x (set %x)%s", pipe, pgOk & 1, dentist, dispclkSet,
+					reclock ? ", display clock set again" : "");
+		}
+	}
 	uint32_t blBefore[4] {};
 	bool blCall = table == AtomTransmitterTable && params && static_cast<uint8_t *>(params)[3] == 4 && gpuMmio;
 	// The parameters as sent (after CarrizoRed's own fixes above): ATOM tables use the block as scratch and write over it.
