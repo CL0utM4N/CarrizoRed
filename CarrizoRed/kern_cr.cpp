@@ -5672,6 +5672,28 @@ static uint64_t wrapCailEnableAts(void *) {
 	return 0;
 }
 
+// VCE start. Stoney's VCE is 3.4, the Polaris one, but CAIL's Stoney tables use the Tonga (VCE 3.0/3.1) init,
+// Cail_Tonga_VceInit, which points the VCPU at its firmware through the single VCE_LMI_VCPU_CACHE_40BIT_BAR (0x8597)
+// and only sets VCE_VCPU_CNTL.CLK_EN. VCE 3.4 has three cache BARs (0x8616-0x8618, one per cache region, with the
+// region number in bits 31:24 of each VCE_VCPU_CACHE_OFFSETn) and needs VCPU_CNTL bit 21 cleared: Linux does both
+// for asic_type >= CHIP_STONEY (vce_v3_0_mc_resume, vce_v3_0_start), and so does Apple's Cail_Ellesmere_VceInit,
+// otherwise the same function with the same arguments. With the Tonga one the screen recording's session hung, the
+// VCPU still in soft reset ("VCELLQ event timeout"). On Stoney, run the Ellesmere one. -crnovceinit leaves CAIL's.
+static mach_vm_address_t orgCailTongaVceInit, cailEllesmereVceInit;
+static uint32_t vceInits;
+
+static uint64_t wrapCailTongaVceInit(void *cail, void *info) {
+	using Fn = uint64_t (*)(void *, void *);
+	bool swap = cailEllesmereVceInit != 0;
+	auto ret = swap ? reinterpret_cast<Fn>(cailEllesmereVceInit)(cail, info) :
+		FunctionCast(wrapCailTongaVceInit, orgCailTongaVceInit)(cail, info);
+	if (vceInits++ < 8)
+		diskLogEvent("vce: %s VceInit = %llx; VCE_STATUS %x VCPU_CNTL %x SOFT_RESET %x", swap ? "Ellesmere (VCE 3.4)" :
+			"Tonga", ret, gpuMmio ? gpuMmio[0x8001] : 0, gpuMmio ? gpuMmio[0x8005] : 0, gpuMmio ? gpuMmio[0x8048] : 0);
+	traceNote("vceinit=%s:%llx ", swap ? "ell" : "tonga", ret);
+	return ret;
+}
+
 // SMU microcode loading (port of Linux smu8_smumgr.c, MIT). nvram71/72: the GPU's microcode RAMs ignore direct writes
 // (RLC and PFP word 0 read back random values after a write) and the SMU firmware header's UcodeLoadStatus is 0. On
 // Carrizo and Stoney only the SMU can load the RLC, CP (CE, PFP, ME, MEC jump table) and SDMA microcode. Windows does
@@ -6649,7 +6671,7 @@ static uint64_t wrapStoneyEnableCpPg(void *, uint64_t) {
 // none of them taking effect (no PowerPlay key notes, flags untouched, ATS not skipped) with no "noroute" note.
 enum HwlibsHook {
 	HookPeciRead, HookPeciSize, HookWaitFor, HookAts, HookHaltRlc, HookFlags, HookSmuFormat, HookSmuLoad, HookEarlyInit,
-	HookPgEnable, HookPgGfx, HookPgCp
+	HookPgEnable, HookPgGfx, HookPgCp, HookVceInit
 };
 static uint32_t hwlibsHooks, hwlibsHookFails;
 
@@ -6903,6 +6925,15 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			static const HwlibsHook pgHooks[] {HookPgEnable, HookPgGfx, HookPgCp};
 			for (size_t i = 0; i < arrsize(pg); i++)
 				routeHwlibs(patcher, index, pg[i], slide, size, pgHooks[i]);
+		}
+		if (family == ChipFamily::Stoney && !checkKernelArgument("-crnovceinit")) {
+			cailEllesmereVceInit = solveOrSignature(patcher, index, "_Cail_Ellesmere_VceInit", slide, size);
+			patcher.clearError();
+			KernelPatcher::RouteRequest vce {"_Cail_Tonga_VceInit", wrapCailTongaVceInit, orgCailTongaVceInit};
+			if (!cailEllesmereVceInit)
+				traceNote("vceinit=noellesmere ");
+			else
+				routeHwlibs(patcher, index, vce, slide, size, HookVceInit);
 		}
 		if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crats")) {
 			KernelPatcher::RouteRequest ats {"_Cail_Spectre_EnableAts", wrapCailEnableAts, orgCailEnableAts};
