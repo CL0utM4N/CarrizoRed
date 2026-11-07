@@ -22,7 +22,7 @@ resume, using each machine's own VBIOS tables and transmitter parameters, with n
 
 ## What S3 does to the display
 
-S3 powers the display block off. Before CarrizoRed's resume steps, after a wake:
+S3 powers the display block off. Before UnifiedRed's resume steps, after a wake:
 - the VBIOS scratch registers (`BIOS_SCRATCH_0–15`, 0x5C9) and the backlight PWM (`BL_PWM_CNTL`/`CNTL2`/`PERIOD_CNTL`,
   `LVTMA_PWRSEQ_REF_DIV`, 0x4820–0x4822 and 0x481D) are back at reset values;
 - DENTIST (0x124) has DPREFCLK at its reset divider (DID 0x64 = 100 MHz; the firmware sets 0x24 = 400 MHz at boot, from
@@ -37,14 +37,14 @@ Apple's Polaris driver redoes none of this for an APU: it runs ASIC_Init (VBIOS 
 which these VBIOSes don't have (table 46 missing; Apple's `m_setDceClock` is NULL). Apple also passes its Polaris
 "no PLL" index 6 for DP pixel clocks.
 
-## What CarrizoRed does
+## What UnifiedRed does
 
 At sleep (`kIOMessageSystemWillSleep`):
 1. saves the VBIOS scratch and backlight registers;
 2. after Apple's DPCD 0x600 = 2 (panel to D3), powers the eDP panel off with the VBIOS (DIG1TransmitterControl v1.5
    POWER_OFF, the panel's parameters), as DC's `dce110_edp_power_control` does at suspend. `-crnosleeppoweroff`.
 
-At wake, before Apple's first AUX transaction (all in `wrapExecuteBiosCommandTable`, `CarrizoRed/kern_cr.cpp`):
+At wake, before Apple's first AUX transaction (all in `wrapExecuteBiosCommandTable`, `UnifiedRed/kern_cr.cpp`):
 1. VBIOS EnableDispPowerGating (table 0x0D) INIT then DISABLE on pipes 0 and 1;
 2. the display engine clock the way DC's `dce_set_clock` does on DCE 11.0: SetPixelClock V6 (table 0x0C) with
    `ucPpll` 8 (the DFS) and FirmwareInfo's `ulDefaultDispEngineClkFreq` (847.06 MHz on the D509BA), which also sets
@@ -81,7 +81,7 @@ machine on its own, ~1 s after every S3 entry, until each of the causes below wa
 **The setup** (all four needed; the same files on any machine with AMD's reference firmware):
 1. FCHXHCIFix with `SSDT-FCHXHCI` (when `SSDT-XOSI` makes the firmware see Windows 8+) and **`SSDT-FCHSLEEP`** with its
    OpenCore patch renaming only the `_PTS` definition (`5F50545301` → `5A50545301`, `Count` 1). See FCHXHCIFix's README.
-2. CarrizoRed (all on by default, below).
+2. UnifiedRed (all on by default, below).
 3. No `SSDT-GPRW` or other `_PRW` override for EHC1/XHC0: they also take away keyboard wake (and on the Dell, USB 2
    plug-in detection).
 
@@ -90,10 +90,10 @@ machine on its own, ~1 s after every S3 entry, until each of the causes below wa
 | Cause | Fix | Where |
 |---|---|---|
 | AMD's `FPTS` (in `_PTS`) powers EHCI off through an SMI (`FDDC (0x12, 3)`) while EHC1 is armed for wake: losing power is a wake. | Keep EHCI powered: `EHCD` set for the length of `_PTS` | `SSDT-FCHSLEEP` |
-| macOS arms every device with a `_PRW`; a PCIe port (the Ethernet controller's, GPE 0x16) signalled as the machine went down. | Arm only the USB controllers, the lid and an ACPI power button; PCIe WAKE# off (`-crnowakefilter`) | CarrizoRed, `pal_machine_sleep` |
-| The FCH routes the wake lines of three USB controllers (SciMap sources 24–26: devices 0x12, 0x13, 0x16) to one GPE; Stoney only has 0x12, and an absent one's line fired. | Move absent controllers' lines to GPE 0 at S3 entry, back on wake (`-crnowakeremap`) | CarrizoRed |
-| AMD's EHCI doesn't signal PME properly from D3 (Linux: commit 0bf3730b). | EHCI sleeps in D2 (`-crnoehcid2`) | CarrizoRed, at "will sleep" |
-| The BIOS sets the internal hub to resume on a downstream connect, disconnect or over-current in global suspend (EHCI config `0x84` bits 23:21, BKDG 55072 3.26.4.1.1), and something on it changes as the machine goes down. | Clear those three, keep wake on a device's remote wake (bit 20); also clear a stale EHCI PME_Status (`-crnoehciwakefix`) | CarrizoRed, `pal_machine_sleep` |
+| macOS arms every device with a `_PRW`; a PCIe port (the Ethernet controller's, GPE 0x16) signalled as the machine went down. | Arm only the USB controllers, the lid and an ACPI power button; PCIe WAKE# off (`-crnowakefilter`) | UnifiedRed, `pal_machine_sleep` |
+| The FCH routes the wake lines of three USB controllers (SciMap sources 24–26: devices 0x12, 0x13, 0x16) to one GPE; Stoney only has 0x12, and an absent one's line fired. | Move absent controllers' lines to GPE 0 at S3 entry, back on wake (`-crnowakeremap`) | UnifiedRed |
+| AMD's EHCI doesn't signal PME properly from D3 (Linux: commit 0bf3730b). | EHCI sleeps in D2 (`-crnoehcid2`) | UnifiedRed, at "will sleep" |
+| The BIOS sets the internal hub to resume on a downstream connect, disconnect or over-current in global suspend (EHCI config `0x84` bits 23:21, BKDG 55072 3.26.4.1.1), and something on it changes as the machine goes down. | Clear those three, keep wake on a device's remote wake (bit 20); also clear a stale EHCI PME_Status (`-crnoehciwakefix`) | UnifiedRed, `pal_machine_sleep` |
 | USB 3 never woke it: macOS arms the xHCI's ports properly (U3, WCE/WDE/WOE, PME_En), but the FCH needs the firmware's xHCI Sx hand-over (`FPTS` → `U3D3`: save the controller, SMI 0x67; `FWAK` → `U3D0` reloads its firmware), which an earlier `SSDT-FCHSLEEP` skipped by setting `XHCD` too. | `SSDT-FCHSLEEP` sets only `EHCD`: the xHCI goes through the firmware's path | `SSDT-FCHSLEEP` |
 
 Tried and dropped: suspending and halting the EHCI before D3 the way Linux's `ehci_bus_suspend` does (macOS leaves it
@@ -125,7 +125,7 @@ whatever is still only in cache at S3 is lost, the saved CR3, GDT, IDT and stack
 reached memory by chance follows each version's memory layout, which is why Catalina and Big Sur woke and Monterey and
 Sonoma didn't.
 
-CarrizoRed turns `pal_machine_sleep`'s 8 bytes into `wbinvd; xor eax, eax; ret` (`patchSleepFlush`). Nothing in the
+UnifiedRed turns `pal_machine_sleep`'s 8 bytes into `wbinvd; xor eax, eax; ret` (`patchSleepFlush`). Nothing in the
 kernel calls it; Apple's ACPI driver calls it once, right before writing SLP_TYP and SLP_EN. On by default;
 `-crnosleepflush` turns it off.
 
@@ -134,7 +134,7 @@ no checkpoint in `acpi_sleep_kernel` flashed, and the memory-check build, whose 
 right before S3, got through the whole resume. Monterey 12.7 with the fix (`CarrizoRed-1746689635.log`): will sleep
 99 s, CPU resumed 126.3 s, GPU power-up 131.0 to 151.3 s, has powered on 153.3 s.
 
-The one wake before that (nvram10, the memory-check build) was cut short by CarrizoRed's 45 s wake watchdog while the
+The one wake before that (nvram10, the memory-check build) was cut short by UnifiedRed's 45 s wake watchdog while the
 GPU was still powering up, because the SMU microcode reload timed out (11.6 s) that time. On the fixed wake it took
 31 ms. Still to do: a watchdog that waits while the power-up is making progress, and why the reload can time out.
 
@@ -147,14 +147,14 @@ First seen on the D509BA, Sonoma, same EFI and kext as the working Catalina:
 
 NVRAM marks (`CR-wake`, `-crwakemark`, nvram2–4.bin) always end at Apple's GPU halt during sleep
 (`Cail_Tonga_MicroEngineControlCp (call 8)`), 30 s after "will sleep". On Catalina those same calls are also the last
-CarrizoRed events, followed by macOS writing the sleep image. There was never a "system will power on" and never a
+UnifiedRed events, followed by macOS writing the sleep image. There was never a "system will power on" and never a
 "CPU sleeping" from the `IOCPUSleepKernel` hook. So either Sonoma never reaches the CPU sleep (a driver's power-off or
 the sleep image hangs), or the hook or late NVRAM writes don't work there. The last build tried (679efdd) also logs
 the power manager's own phases (`IOPMrootDomain::tracePoint`: 0x14 drivers, 0x17 platform, 0x18 CPUs, 0x2x wake) and
 records in the `CR-wake` header whether the hooks went in; run as nvram40/41 (below).
 
 **2026-11-02, first lead:** `pmset -g log` records every attempt as "Entering Sleep state" followed directly by the
-next boot: no wake, no failure record. In every Sonoma log the last line is CarrizoRed's watcher tick about half a
+next boot: no wake, no failure record. In every Sonoma log the last line is UnifiedRed's watcher tick about half a
 second before Apple's GPU halt; on Catalina the log runs on through the drivers' power-off. The watcher read GPU, SMU
 and display registers every 500 ms through the whole sleep, and on Sonoma the sleep image is set up after the GPU is
 powered down, a longer window for a read of the powered-off GPU to stall a core. Since this build the watcher's register
@@ -182,7 +182,7 @@ boot.
 | wake: `powerUpHW` | `initialize_hardware`, `enableInterruptHubAgp` | `initializeHardwareRegisters` directly; no interrupt hub buffer | wake only |
 | AMD9500Controller, AMDSupport, AMDFramebuffer sleep code | | compiler changes (`memset`, typed allocators); `setPanelPowerState` no longer resets the cached HPD state | wake only |
 
-CarrizoRed's own events during the sleep are identical on both (panel off, the same five halts). CarrizoRed's
+UnifiedRed's own events during the sleep are identical on both (panel off, the same five halts). UnifiedRed's
 version-specific code in this window, the dyld page patcher (`cs_validate_page` on Sonoma, `cs_validate_range` on
 Catalina), only compares and copies page bytes. The `wifip2pd` 30 s wait is a Sonoma daemon (no Wi-Fi driver is
 loaded) and doesn't hold the sleep. So no difference in the GPU's sleep path explains a hang; what's left is either
@@ -239,9 +239,9 @@ Every one still hangs: the key press starts the fans, with no picture, no panic 
 | `-crtscsync` (below) | the cores' TSCs: at boot they are -0x4f and +0x23 ticks apart, i.e. in sync |
 | Caps Lock during the hang | nothing; but no LED, so nothing in macOS answers. Either the firmware never hands back control, or the kernel stopped with interrupts off |
 | RTCMemoryFixup 1.0.7 with `rtcfx_exclude=00-FF` (no macOS writes to CMOS memory) | a CMOS byte macOS writes at sleep clashing with the firmware's S3 resume |
-| `-crnoaccel` plus CarrizoRed's sleep and wake steps off (`-crnosleeppoweroff -crnowakerestore -crnowakepowercycle -crnodcaux -crnodispclk`) | set up, result not reported |
+| `-crnoaccel` plus UnifiedRed's sleep and wake steps off (`-crnosleeppoweroff -crnowakerestore -crnowakepowercycle -crnodcaux -crnodispclk`) | set up, result not reported |
 
-No CarrizoRed at all (kext and `device-id` spoof off): Monterey doesn't sleep at all (the screen stays on), so this
+No UnifiedRed at all (kext and `device-id` spoof off): Monterey doesn't sleep at all (the screen stays on), so this
 split can't be made that way.
 
 **`-crtscsync`** (2ef26df, test only): after each `processor_start(_reason)` all CPUs read the TSC together inside
@@ -286,7 +286,7 @@ Also compared, Big Sur 11.7.11 vs Monterey 12.5.1 (Boot KCs; IOPCIFamily source 
 - **AppleUSBXHCIPCI RTD3:** reworked in Monterey (`setPowerStateGated`, "scheduling/initiating RTD3 entry"), but
   `pciWakeInitializeForRTD3` only enables it when the controller's ACPI node has `_GPE`; XHC0 has none, on both. 1022:7914
   gets the generic `AppleUSBXHCIPCI` (`AppleAMDUSBXHCIPCI` matches only 1002:73a4/73a6).
-- **CarrizoRed's kernel hooks:** by default only `cs_validate_page` (dyld page patches), not on the wake path.
+- **UnifiedRed's kernel hooks:** by default only `cs_validate_page` (dyld page patches), not on the wake path.
   `acpi_sleep_kernel` and `IOCPUSleepKernel` have plain prologues (pushes, `sub rsp`, `mov r15, rsi`; no RIP-relative
   operand in the first 14 bytes) on both, so a probe can hook them.
 - **FADT:** day alarm index 0x0D (AMD FCH register D), month 0, century 0x32; RTC0 exposes bank 0 only. Nothing odd.
@@ -329,14 +329,14 @@ kernel collections and their data sit, against memory the firmware's S3 resume u
 leaves behind at sleep.
 
 Next, cheapest first:
-0. **No CarrizoRed, then fewer kexts** (no build needed): Monterey with CarrizoRed and the `device-id` spoof off
+0. **No UnifiedRed, then fewer kexts** (no build needed): Monterey with UnifiedRed and the `device-id` spoof off
    (VESA display), `pmset -g log` as the sign of life. If that wakes, the cause is in the GPU stack. If it still hangs,
    go down to Lilu, VirtualSMC and VoodooPS2 only, then add the rest back in halves: ECEnabler, SMCBatteryManager,
    NVMeFix, RestrictEvents (`revpatch`), the VoodooI2C set, FCHXHCIFix with the xHCI reset patch, USBMap. Also free:
    sleep within a minute of boot. If that wakes and later sleeps don't, firmware memory that macOS reuses is a lead
    (`ProtectMemoryRegions`, `UEFI > ReservedMemory`).
-   Tried 2026-11-03: without CarrizoRed, Monterey doesn't sleep at all (screen stays on); the kext halves still apply
-   with CarrizoRed kept.
+   Tried 2026-11-03: without UnifiedRed, Monterey doesn't sleep at all (screen stays on); the kext halves still apply
+   with UnifiedRed kept.
 1. **Caps Lock probe, `-crcapsprobe`:** the LED through the keyboard controller (i8042 0xED, the keyboard port
    re-enabled with 0xAE first). Going to sleep, at the start of `acpi_sleep_kernel`: on 1 s, then off (proves the
    controller takes the commands). After the key press: on when `acpi_sleep_kernel` returns, held 3 s; off when
@@ -372,7 +372,7 @@ Next, cheapest first:
    this), at addresses that move with the macOS version's layout.
    Checkpoint line confirmed on 12.7 (all 11 steps listed), so the result stands.
    Fourth version, memory check: just before S3 (a callback in front of the platform's, which `acpi_sleep_cpu` calls
-   once the CPU state is saved) CarrizoRed checksums what the early wake reads, in groups: 1 `acpi_wake_prot`, 2
+   once the CPU state is saved) UnifiedRed checksums what the early wake reads, in groups: 1 `acpi_wake_prot`, 2
    `BootPML4` and its tables on the switch's path, 3 `Lwake_64`'s code, 4 the save area (`master_gdtr`, `saved_*`;
    `low_eintstack` ends right below it), 5 the kernel's page tables on the restore's path, 6 GDT, 7 IDT, 8 TSS, 9 the
    stack `Lwake_64` returns on (page tables without accessed/dirty bits). At wake, 0x2800 sends the trampoline to a
@@ -390,7 +390,7 @@ Next, cheapest first:
    **Fix (default, `-crnosleepflush` turns it off):** `pal_machine_sleep`'s 8 bytes become `wbinvd; xor eax, eax;
    ret`; nothing in the kernel calls it, Apple's ACPI driver calls it once, right before writing SLP_TYP/SLP_EN. The
    memory check is now opt-in (`-crwakememcheck`). Still open: the wake stops after `IOCPUSleepKernel`.
-   **That wake (nvram10, the memory-check build): CarrizoRed's wake watchdog panicked, "wake stuck 45 s after
+   **That wake (nvram10, the memory-check build): UnifiedRed's wake watchdog panicked, "wake stuck 45 s after
    kIOMessageSystemWillPowerOn: system never powered on, watcher ticks 83".** So the kernel was fully back and
    running (the watcher ticked), the drivers had "will power on", and the GPU was in its power-up: the SMU microcode
    reload timed out after 11.6 s (`resp b0033 b0034 b0252 b0254...`), one CAIL wait failed (`[ec05]&1!=0`), then
@@ -429,8 +429,8 @@ and the log shows `desktopMode 0`; see *Brightness* in the README.
 
 | Argument | What it gives |
 |---|---|
-| (default) | The disk log `/private/var/log/CarrizoRed-<time>.log`: sleep, wake, every VBIOS call of a wake, a display report 30 s after a wake (or 1 s after a failed DPCD transfer) |
-| `-crwakemark` | `CR-wake` in NVRAM (Apple's GUID 7C436110-…): CarrizoRed's events from "will sleep" to 30 s after the wake, the CPU's sleep and resume, the power manager's phases. Forced flash writes, up to 100 per sleep |
+| (default) | The disk log `/private/var/log/UnifiedRed-<time>.log`: sleep, wake, every VBIOS call of a wake, a display report 30 s after a wake (or 1 s after a failed DPCD transfer) |
+| `-crwakemark` | `CR-wake` in NVRAM (Apple's GUID 7C436110-…): UnifiedRed's events from "will sleep" to 30 s after the wake, the CPU's sleep and resume, the power manager's phases. Forced flash writes, up to 100 per sleep |
 | (default) | Wake watchdogs: a panic with the black-box report if a wake doesn't complete (45 s after "will power on", or 150 s of awake time after "will sleep" with the watcher stopped). `-crnowakepanic` |
 | `-crcapsprobe` | Test: the Caps Lock LED shows how far a wake gets (*Where it stands*) |
 | `-crtscsync` | Test: syncs the cores' TSCs after the wake starts them; "TSC ..." lines in the disk log, the boot measurement too |

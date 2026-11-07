@@ -1,6 +1,6 @@
 //
 //  kern_info.c
-//  CarrizoRed
+//  UnifiedRed
 //
 //  Equivalent of the <target>_info.c file Xcode generates for kexts: declares
 //  kmod_info and points libkmod's _start/_stop at Lilu's plugin entry points.

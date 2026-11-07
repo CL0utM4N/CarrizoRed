@@ -1,6 +1,6 @@
 //
 //  kern_vbios.cpp
-//  CarrizoRed
+//  UnifiedRed
 //
 //  See kern_vbios.hpp. Matching and validation follow Linux amdgpu_bios.c (MIT).
 //
@@ -15,9 +15,9 @@
 #include <libkern/c++/OSDictionary.h>
 #include <string.h>
 
-// Why the last inject() failed, published as "CarrizoRed,vbios-status" so it shows in ioreg without the kernel log.
+// Why the last inject() failed, published as "UnifiedRed,vbios-status" so it shows in ioreg without the kernel log.
 static void setStatus(IOPCIDevice *pci, const char *status) {
-	pci->setProperty("CarrizoRed,vbios-status", status);
+	pci->setProperty("UnifiedRed,vbios-status", status);
 	SYSLOG("vbios", "%s", status);
 }
 
@@ -109,11 +109,11 @@ bool VBIOS::inject(IOPCIDevice *pci, uint16_t vendorId, uint16_t deviceId) {
 
 			pci->setProperty(ImageProperty, const_cast<uint8_t *>(data), image->imageLength);
 			SYSLOG("vbios", "injected %s from VFCT (%u bytes)", ImageProperty, image->imageLength);
-			pci->setProperty("CarrizoRed,vbios-status", "injected from VFCT");
+			pci->setProperty("UnifiedRed,vbios-status", "injected from VFCT");
 			injected = true;
 			break;
 		}
-		if (!injected && !pci->getProperty("CarrizoRed,vbios-status"))
+		if (!injected && !pci->getProperty("UnifiedRed,vbios-status"))
 			setStatus(pci, "no VFCT image matches this device/slot");
 	}
 

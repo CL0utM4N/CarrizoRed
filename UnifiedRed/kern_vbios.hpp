@@ -1,6 +1,6 @@
 //
 //  kern_vbios.hpp
-//  CarrizoRed
+//  UnifiedRed
 //
 //  APUs have no PCI expansion ROM: the VBIOS is handed over by the system firmware in the ACPI VFCT table.
 //  AMDSupport's AtomBiosProxy::readAtomBios() reads the "ATY,bin_image" property of the GPU first and only falls

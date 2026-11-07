@@ -1,17 +1,17 @@
 #
-#  CarrizoRed build
+#  UnifiedRed build
 #
 #  Builds the kext with plain clang on macOS (no Xcode project needed).
 #  Run ./scripts/bootstrap.sh once first to fetch Lilu.kext and MacKernelSDK.
 #
-#    make            Release build -> build/Release/CarrizoRed.kext
-#    make DEBUG=1    Debug build   -> build/Debug/CarrizoRed.kext (enables DBGLOG)
+#    make            Release build -> build/Release/UnifiedRed.kext
+#    make DEBUG=1    Debug build   -> build/Debug/UnifiedRed.kext (enables DBGLOG)
 #    make zip        Zips the kext (and dSYM-less debug info) for distribution
 #    make clean
 #
 
-PRODUCT_NAME   := CarrizoRed
-MODULE_NAME    := com.carrizored.$(PRODUCT_NAME)
+PRODUCT_NAME   := UnifiedRed
+MODULE_NAME    := com.unifiedred.$(PRODUCT_NAME)
 MODULE_VERSION := 0.3.0
 MIN_MACOS      := 11.0
 # The commit, in the disk log header (which build wrote a log).

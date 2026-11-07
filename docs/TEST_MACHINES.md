@@ -73,19 +73,19 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   SanDisk USB 3 stick enumerates on XHC0 at 5 Gbps and the installer boots. XHCIProbe dropped from the EFI.
   The patch needs `Limit` 2048, not 1024: the `Find` bytes sit 571 bytes into `reset()` on Sequoia but 1078 on Monterey
   12.5.1, where a 1024 limit left it unpatched and the installer waited for its root device again (2026-10-28).
-- **First CarrizoRed run (installer, 2026-10-10):** loads after dropping a bad `OSBundleCompatibleVersion` (1.0 >
+- **First UnifiedRed run (installer, 2026-10-10):** loads after dropping a bad `OSBundleCompatibleVersion` (1.0 >
   version 0.0.1 made XNU reject it silently). Reports Stoney Ridge, rev `0xDA`, 512 MB, carve-out at `0x1FF000000`,
   `GB_ADDR_CONFIG` `0x22010001` (Linux's Stoney golden value). VBIOS injection said No: the platform expert was looked
   up by a registry path that doesn't resolve; now uses `IOService::getPlatform()`.
 - The `shared_region … vm_shared_region_start_address() failed` and launchd `error = 37` lines in verbose recovery
   are noise; processes keep running.
-- **Spoof boots 5–19 (2026-10-10/11), the "freeze ~20 s after start-up": it was a kernel panic caused by CarrizoRed's
+- **Spoof boots 5–19 (2026-10-10/11), the "freeze ~20 s after start-up": it was a kernel panic caused by UnifiedRed's
   own tracing, invisible on screen.** `AAPL,PanicInfo` from boot 19 (NVRAM dump via OpenShell `dmpstore`): general
   protection fault in `AMD9500Controller::hwInitializeHardwareSettings + 0x12`, in WindowServer, under
   `IOFramebuffer::open → AMDFramebuffer::enableController → initializeHardware`. Lilu's `createTrampoline` copies a
   wrapped function's prologue without relocating it; with a 14-byte jump the copy includes the stack-protector load
   `mov rax, [rip + guard@GOT]` at +0xb, which then reads the wrong address (`RAX` = "aryP12OS"). `ATIController::start`
-  and `initializeProjectInfo` have the same prologue; whether a boot crashed depended on kext load addresses. CarrizoRed
+  and `initializeProjectInfo` have the same prologue; whether a boot crashed depended on kext load addresses. UnifiedRed
   now refuses to wrap any function with a RIP-relative operand or relative branch in its first 14 bytes
   (`routeChecked`). Lessons: read `AAPL,PanicInfo` before theorising about a "freeze"; the verbose console isn't
   redrawn after a panic once WindowServer has taken the screen.
@@ -118,7 +118,7 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   `Object_Header` confirms eDP is on UNIPHY enum 1 = PHY A (HDMI on PHY B), so the PHY is right. The PHY clock is not:
   `DIG1TransmitterControl` v1.5 gets `ucPhyClkSrcId = 0` (P1PLL), but FirmwareInfo `usUniphyDPModeExtClkFreq` =
   100 MHz ("non-zero: DP-mode Uniphy input clock from the external spread clock"), and Linux DC on DCE 11.0 only
-  drives DP from `CLOCK_SOURCE_ID_EXTERNAL` (`ucPhyClkSrcId` 3). CarrizoRed now patches the transmitter parameters in
+  drives DP from `CLOCK_SOURCE_ID_EXTERNAL` (`ucPhyClkSrcId` 3). UnifiedRed now patches the transmitter parameters in
   DP modes to the external reference.
 - **Spoof boot 25 (DP PHY on the external clock, 0x81 = patched in the black box):** training still fails the same
   way. Apple's encoder/transmitter parameters now match what legacy amdgpu passes for Carrizo (rate, symbol clock,
@@ -131,7 +131,7 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   clock recovery (0x202 = 00) and asks for more swing up to max, never locking. Everything Apple tells the sink is
   consistent, so the PHY output isn't reaching the panel. Legacy amdgpu's eDP enable runs
   `UNIPHYTransmitterControl` with `ATOM_TRANSMITTER_ACTION_POWER_ON` (12) before `ENABLE`; Apple never does, and its
-  clean-up had switched the LVTMA power sequencer off (SYNCEN gates the PHY output). CarrizoRed now injects that
+  clean-up had switched the LVTMA power sequencer off (SYNCEN gates the PHY output). UnifiedRed now injects that
   call (`-crnoedppoweron` disables) and snapshots the eDP registers when training pattern 1 starts.
 - **Spoof boot 27 (eDP POWER_ON injected):** the **backlight comes on** and the sequencer is in the firmware's state
   at TPS1 (`LVTMA_PWRSEQ_STATE` 0x41F), but the sink still sees no clock recovery. Comparing against amdgpu's
@@ -146,7 +146,7 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
 - **Spoof boot 29:** training succeeds (DPCD 0x202 = 07, aligned), video on, no DISPOUT FIFO error, and the scanout
   memory is a uniform grey (0xFFBFBFBF on the top, middle and bottom rows), yet the panel shows identical coloured
   rows. Apple writes `LB_MEMORY_CTRL.LB_MEMORY_SIZE` = 0x404 (sized for Polaris's 13-bit DCE 11.2 field); the firmware
-  and Linux (`LB_TOTAL_NUMBER_OF_ENTRIES`) use 0x6B0. CarrizoRed now forces 0x6B0 (`-crnolbfix` disables).
+  and Linux (`LB_TOTAL_NUMBER_OF_ENTRIES`) use 0x6B0. UnifiedRed now forces 0x6B0 (`-crnolbfix` disables).
 - **Spoof boot 30 (LB size fixed, `LB_MEMORY_CTRL` 0x706B0):** no change. Every watched surface register equals the
   firmware's apart from the surface address (+3 MB) and pitch (1536 px). Next: an exhaustive boot-vs-now diff of
   DCCG, DMIF/DCI, all of pipe 0 (DCP incl. DVMM, LB, SCL, BLND, CRTC, FMT), LVTMA/HPD and DIG0/DP0.
@@ -154,7 +154,7 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   (`DP_PIXEL_FORMAT.DP_COMPONENT_DEPTH` 0, `FMT_BIT_DEPTH_CONTROL` truncate to 6 bits + spatial dither); Apple sets
   8 bpc (`DP_COMPONENT_DEPTH` 1, no FMT reduction, encoder `ucBitPerColor` = `PANEL_8BIT_PER_COLOR`). An 18 bpp
   panel decoding 24 bpp data gives identical coloured rows. The rest of the diff is Apple's own gamma/regamma LUT,
-  gamut remap, cursor, scaler init, CRTC double-buffer settings and status/counter registers. CarrizoRed now caps the
+  gamut remap, cursor, scaler init, CRTC double-buffer settings and status/counter registers. UnifiedRed now caps the
   DP colour depth at the firmware's (`-crnobpccap` disables).
 - **Spoof boot 32 (6 bpc cap applied):** DP pixel format and M/N now equal the firmware's; the whole DIG0/DP0 block
   matches. The panel now flashes, still with identical random-colour rows plus a white line. Remaining differences
@@ -186,7 +186,7 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   written (WPTR 0x90C0, write-back agreeing, RPTR 0), MSI enabled (address 0xFEE10000, data 0x4072, INTx disabled).
   But `IH_CNTL` = 0x01080000: `ENABLE_INTR` off, so the IH never signals. Apple's `setHardwareEnabled` sets
   `ENABLE_INTR` in `IH_RB_CNTL` bit 17 (Tonga layout); CZ keeps it in `IH_CNTL` bit 0 and needs `RPTR_REARM` (bit 4)
-  for MSI (Linux `cz_ih` vs `tonga_ih`). CarrizoRed now mirrors the enable into `IH_CNTL` (`-crnoihfix` disables).
+  for MSI (Linux `cz_ih` vs `tonga_ih`). UnifiedRed now mirrors the enable into `IH_CNTL` (`-crnoihfix` disables).
 - **Spoof boot 38 (IH_CNTL fix, `crpanicat=120`): reached the macOS Recovery setup screen** on the internal panel.
   115 interrupts handled, ring drained (RPTR = WPTR = 0x730), IH idle, `IH_CNTL` = 0x01080011. Apple masks CRTC0
   V_UPDATE again when idle (`CRTC_INTERRUPT_CONTROL` 0x8000020). The scanout memory holds the setup screen's dark
@@ -203,7 +203,7 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   HID-over-I2C touchpad (`\_SB.I2CD.ETPD`, address 0x15, GPIO interrupt).
 - **`usb-spoof` (no deliberate panic) boots fully into Recovery** on Apple's Polaris display driver.
 - **First `usb-spoof-accel` boot (nvram27): the accelerator never attached.** Only the display drivers were on the iGPU
-  and no accelerator patch ran. The graphics policy now sets `LoadController` by itself, so CarrizoRed's request
+  and no accelerator patch ran. The graphics policy now sets `LoadController` by itself, so UnifiedRed's request
   (which also set `LoadHWServices` / `LoadAccelerator`) was skipped. The acceleration request is now separate and made
   once `AMD9500Controller` is attached.
 - **Second `usb-spoof-accel` boot (nvram28): still no accelerator,** and no trace of the request either. The black box
@@ -211,7 +211,7 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   was already set), both `probe()` calls, and the iGPU's `Load*` properties.
 
 ### Consequences
-- The CarrizoRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
+- The UnifiedRed VFCT injector will match this image (vendor/device/slot/function `1002:98E4` `00:01.0`).
 - The pixel-clock path Apple uses for DCE 11.0 VBIOSes is the one this VBIOS needs.
 - **New item:** no `SetDCEClock` table, so check Apple's display-engine-clock path.
 - **Phase 3 note:** BAR0 (256 MB) is smaller than the carve-out (512 MB). Apple's accelerator must not assume the
@@ -250,10 +250,10 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
 - **XHCIProbe 0.5.1 with MSI-X (`cfgX=0`, `msix=1`, `fee10000/4070`, unmasked): no change** (`ev 1`, `EINT` always
   set). So neither MSI nor MSI-X from this controller reaches the CPU. AppleUSBXHCI's handling would work if it did:
   `primaryFilterInterrupt` just calls the interrupter's `clearInterruptPending` (a no-op for MSI) and returns true, and
-  `primaryInterrupt` drains the event ring without an EHB check. CarrizoRed now forwards the interrupts in software:
+  `primaryInterrupt` drains the event ring without an EHB check. UnifiedRed now forwards the interrupts in software:
   it hooks `IOFilterInterruptEventSource::filterInterruptEventSource` to catch the source AppleUSBXHCIPCI creates for
   `1022:7914`, polls `USBSTS.EINT` every 1 ms, clears it and calls the source's `signalInterrupt()` (`-crnoxhcifwd`).
-- **Forwarder, first two boots: never ran.** XHCIProbe 0.5.2 printed "(no CarrizoRed-xhcifwd property)": the hooks on
+- **Forwarder, first two boots: never ran.** XHCIProbe 0.5.2 printed "(no UnifiedRed-xhcifwd property)": the hooks on
   `filterInterruptEventSource` (both variants) never saw the controller's source, because the USB boot device's driver
   starts before Lilu's patcher. The forwarder now finds the source after the fact: a thread waits for
   `AppleUSBXHCIPCI` on `1022:7914`, walks its work loop's event chain inside the gate and takes the
@@ -265,8 +265,8 @@ kept outside the repo in `Desktop/CarrizoRed-RE/`).
   got through `validate_root_image` quickly. So the controller does complete transfers promptly; its events simply
   never raise an interrupt macOS sees, and the EINT-only forwarder missed most of them. Root cause still open (likely
   the controller not re-asserting after the first event: EHB / IMAN handling on this FCH); the workaround costs a
-  work-loop wake-up every ~2.5 ms. To do: move the forwarder out of CarrizoRed into its own Lilu plugin.
-- **Forwarder moved out of CarrizoRed into `FCHXHCIFix/`** (2026-10-13; later the same day into its own public
+  work-loop wake-up every ~2.5 ms. To do: move the forwarder out of UnifiedRed into its own Lilu plugin.
+- **Forwarder moved out of UnifiedRed into `FCHXHCIFix/`** (2026-10-13; later the same day into its own public
   repository, github.com/CL0utM4N/FCHXHCIFix, with the write-up that was `docs/FCH_XHCI.md`): a plain IOKit kext matching `1022:7914` in its
-  own `IOMatchCategory`, so it works without CarrizoRed and Lilu. Included in every D509BA EFI. Boot-args
+  own `IOMatchCategory`, so it works without UnifiedRed and Lilu. Included in every D509BA EFI. Boot-args
   `-fchxhcioff`, `fchxhcimode=1`; state in the controller's `FCHXHCIFix-state` property (XHCIProbe 0.5.4 prints it).

@@ -1,11 +1,12 @@
 //
 //  kern_cr.cpp
-//  CarrizoRed
+//  UnifiedRed
 //
 //  Phase 1: observe only. Finds the iGPU, logs what the hardware reports, and
 //  watches Apple's Polaris kexts load. Nothing is patched yet.
 //
 
+#include "kern_platprobe.hpp"
 #include "kern_cr.hpp"
 #include "kern_vbios.hpp"
 #include "kern_sigs.hpp"
@@ -47,7 +48,7 @@
 // Trampolines: Lilu builds every plugin's in one shared 4 KB buffer (KernelPatcher::tempExecutableMemory). Once it is
 // full, createTrampoline returns 0, routeFunctionInternal returns EINVAL, and routeMultiple takes that non-zero value for
 // the trampoline's address and reports success: the function is left untouched and nothing is logged as failed. With
-// ~150 traced stages CarrizoRed alone needs more than 4 KB, so whichever kext loaded last lost its hooks; HWLibs, loaded
+// ~150 traced stages UnifiedRed alone needs more than 4 KB, so whichever kext loaded last lost its hooks; HWLibs, loaded
 // last on most boots, lost CAIL's (nvram133/40: earlyInitialize still Apple's prologue at setupCAIL, the "re-patch"
 // reported success and changed nothing, yet a direct write landed). So routeChecked builds the trampoline itself, in
 // its own pool, has Lilu write only the jump (no wrapper, so no trampoline), and reads the jump back.
@@ -433,7 +434,7 @@ static void checkGpuAlive(volatile uint32_t *mmio) {
 	if (!gpuDeadMs && gpuRegistersDead(mmio)) {
 		uint64_t ms = uptimeMs();
 		gpuDeadMs = ms ? ms : 1;
-		IOLog("CarrizoRed: the GPU stopped responding (registers read 0xFFFFFFFF); power the machine off fully\n");
+		IOLog("UnifiedRed: the GPU stopped responding (registers read 0xFFFFFFFF); power the machine off fully\n");
 	}
 }
 
@@ -1239,7 +1240,7 @@ static const char *className(const OSObject *object) {
 
 [[noreturn]] static void preemptionLeak(const char *where, IOEventSource *source, int32_t before, int32_t after) {
 	OSObject *owner = source ? EventSourcePeek::ownerOf(source) : nullptr;
-	panic("CarrizoRed: preemption level %d -> %d across %s: %s, owner %s, action %p", before, after, where,
+	panic("UnifiedRed: preemption level %d -> %d across %s: %s, owner %s, action %p", before, after, where,
 		className(source), className(owner), source ? EventSourcePeek::actionOf(source) : nullptr);
 }
 
@@ -1271,7 +1272,7 @@ static bool wrapRunEventSources(IOWorkLoop *that) {
 			snprintf(list + len, sizeof(list) - len, "%s%s/%s %p", n ? ", " : "", className(source),
 				className(EventSourcePeek::ownerOf(source)), EventSourcePeek::actionOf(source));
 		}
-		panic("CarrizoRed: preemption level %d -> %d across IOWorkLoop::runEventSources, sources: %s", before, after,
+		panic("UnifiedRed: preemption level %d -> %d across IOWorkLoop::runEventSources, sources: %s", before, after,
 			list);
 	}
 	return ok;
@@ -1304,7 +1305,7 @@ static IOReturn wrapMessageClient(IOService *that, UInt32 type, OSObject *client
 			handler = *reinterpret_cast<mach_vm_address_t *>(reinterpret_cast<uint8_t *>(client) + 0x20);
 			target = *reinterpret_cast<mach_vm_address_t *>(reinterpret_cast<uint8_t *>(client) + 0x28);
 		}
-		panic("CarrizoRed: preemption level %d -> %d across IOService::messageClient: message %x from %s to %s, "
+		panic("UnifiedRed: preemption level %d -> %d across IOService::messageClient: message %x from %s to %s, "
 			"handler %p in %s, target %p", before, after, type, className(that), cls, reinterpret_cast<void *>(handler),
 			kextOf(handler), reinterpret_cast<void *>(target));
 	}
@@ -1348,7 +1349,10 @@ static void hookPreemptionCheck(KernelPatcher &patcher) {
 
 void CRDriver::init() {
 	callback = this;
-	SYSLOG("cr", "CarrizoRed starting on kernel %d.%d", getKernelVersion(), getKernelMinorVersion());
+	// First, before anything of ours touches the hardware: the read-only platform probe (-crplatprobe, from KaberiRed;
+	// for the Kabini boot freeze, docs/gcn2/TEST_MACHINES.md).
+	PlatformProbe::start();
+	SYSLOG("cr", "UnifiedRed starting on kernel %d.%d", getKernelVersion(), getKernelMinorVersion());
 
 	lilu.onPatcherLoadForce(
 		[](void *user, KernelPatcher &patcher) { static_cast<CRDriver *>(user)->processPatcher(patcher); }, this);
@@ -1369,6 +1373,8 @@ struct KernelMsgBuf {
 static KernelMsgBuf **msgbufVar;
 
 void CRDriver::processPatcher(KernelPatcher &patcher) {
+	if (checkKernelArgument("-crplatprobe"))
+		PlatformProbe::checkIdle(patcher);
 	physmapBaseVar = reinterpret_cast<uint64_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_base"));
 	physmapMaxVar = reinterpret_cast<uint64_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_physmap_max"));
 	msgbufVar = reinterpret_cast<KernelMsgBuf **>(patcher.solveSymbol(KernelPatcher::KernelID, "_msgbufp"));
@@ -1502,7 +1508,7 @@ void CRDriver::processPatcher(KernelPatcher &patcher) {
 	// AMDSupport reads the VBIOS from "ATY,bin_image" before trying the (absent) PCI ROM.
 	if (!checkKernelArgument("-crnovbios")) {
 		bool ok = VBIOS::inject(iGPU, WIOKit::VendorID::ATIAMD, deviceId);
-		iGPU->setProperty("CarrizoRed,vbios-injected", ok);
+		iGPU->setProperty("UnifiedRed,vbios-injected", ok);
 	}
 	keepVbiosImage(iGPU);
 	setSoftPowerPlayTable();
@@ -1524,11 +1530,11 @@ void CRDriver::setSoftPowerPlayTable() {
 		image->getLength(), VBIOS::PowerPlayInfoTable, size) : nullptr;
 	if (!table) {
 		SYSLOG("cr", "no PowerPlayInfo table in the VBIOS, PowerPlay will look for it itself");
-		iGPU->setProperty("CarrizoRed,soft-pptable", "none");
+		iGPU->setProperty("UnifiedRed,soft-pptable", "none");
 		return;
 	}
 	iGPU->setProperty("PP_PhmSoftPowerPlayTable", const_cast<uint8_t *>(table), size);
-	iGPU->setProperty("CarrizoRed,soft-pptable", size, 16);
+	iGPU->setProperty("UnifiedRed,soft-pptable", size, 16);
 	softPPTableSize = size;
 	softPPTableRev = static_cast<uint16_t>(table[2] << 8 | table[3]);
 	SYSLOG("cr", "PP_PhmSoftPowerPlayTable: VBIOS PowerPlayInfo, %u bytes, rev %u.%u", size, table[2], table[3]);
@@ -1761,7 +1767,7 @@ void CRDriver::patchPlls(KernelPatcher &patcher, size_t index, mach_vm_address_t
 
 void *CRDriver::wrapCreatePllAssigner(void *controller, void *connectors, uint8_t numConnectors, uint8_t numPlls) {
 	uint8_t plls = numPlls > DisplayPlls ? DisplayPlls : numPlls;
-	IOLog("CarrizoRed: PLL assigner: %u connectors, %u PLLs (Apple asked for %u)\n", numConnectors, plls, numPlls);
+	IOLog("UnifiedRed: PLL assigner: %u connectors, %u PLLs (Apple asked for %u)\n", numConnectors, plls, numPlls);
 	traceNote("plls=%u/%u ", plls, numPlls);
 	return FunctionCast(wrapCreatePllAssigner, callback->orgCreatePllAssigner)(controller, connectors, numConnectors,
 		plls);
@@ -1779,7 +1785,7 @@ uint64_t CRDriver::wrapSetPixelClock(void *that, void *clockParams, const void *
 	memcpy(&clock, static_cast<uint8_t *>(clockParams) + 0x08, sizeof(clock));
 	const char *note = pll >= DisplayPlls && pll <= 5 ? " (INVALID on the APU)" : "";
 	if (ml_get_interrupts_enabled())
-		IOLog("CarrizoRed: setPixelClock crtc %u PLL %u -> ATOM %u, clock %u%s\n", crtc, pll, atomPll, clock, note);
+		IOLog("UnifiedRed: setPixelClock crtc %u PLL %u -> ATOM %u, clock %u%s\n", crtc, pll, atomPll, clock, note);
 	traceEvent("setPixelClock crtc<<16|pll<<8|atom", true, (crtc << 16) | (pll << 8) | atomPll);
 	return FunctionCast(wrapSetPixelClock, callback->orgSetPixelClock)(that, clockParams, info);
 }
@@ -1792,9 +1798,9 @@ void CRDriver::wrapSetCrtcToPixelClock(void *that, uint8_t crtc, uint8_t pll, vo
 
 // While Apple's display stack starts, print what attached below the iGPU (classes and names, 3 levels) to the verbose
 // console whenever it changes, for 10 minutes. When the panel keeps showing the boot console but the GUI has started
-// elsewhere, this is the only output that can be seen. Also published as "CarrizoRed,tree". -crnowatch stops the
+// elsewhere, this is the only output that can be seen. Also published as "UnifiedRed,tree". -crnowatch stops the
 // printing (the thread still requests the controller, see below).
-// System sleep and wake in the disk log: sleep (S3) powers the GPU off, and what CarrizoRed set up once per boot (SMU
+// System sleep and wake in the disk log: sleep (S3) powers the GPU off, and what UnifiedRed set up once per boot (SMU
 // microcode load, the FB window move, SCLK DPM, RB+, video power) has to be redone on wake. First, see the sequence.
 static void diskLogEvent(const char *fmt, ...);
 static void wakeMarkStart();
@@ -3211,7 +3217,7 @@ static void mirrorKernelLog() {
 		if (c != '\n')
 			continue;  // overlong: cut, the rest dropped until the newline
 		line[lineLen] = '\0';
-		bool want = !strnstr(line, "CarrizoRed", lineLen) && !strnstr(line, "CapabilityChange[", lineLen) &&
+		bool want = !strnstr(line, "UnifiedRed", lineLen) && !strnstr(line, "CapabilityChange[", lineLen) &&
 			!strnstr(line, "display_change_handler", lineLen);
 		bool hit = false;
 		for (size_t k = 0; want && !hit && k < arrsize(keys); k++)
@@ -3221,7 +3227,7 @@ static void mirrorKernelLog() {
 			mirrored++;
 			if (echoed < 40 && (strnstr(line, "ccelerator", lineLen) || strnstr(line, "Failed to", lineLen))) {
 				echoed++;
-				IOLog("CarrizoRed: klog: %s\n", line);
+				IOLog("UnifiedRed: klog: %s\n", line);
 			}
 		}
 		lineLen = 0;
@@ -3232,7 +3238,7 @@ void CRDriver::wakeWatchdogFired(const char *when, bool notPoweredOn, uint32_t b
 	if (!notPoweredOn && beats >= 20)
 		return;
 	char reason[200];
-	snprintf(reason, sizeof(reason), "CarrizoRed: wake stuck %s: %s, watcher ticks %u (sleep %u, wake %u).", when,
+	snprintf(reason, sizeof(reason), "UnifiedRed: wake stuck %s: %s, watcher ticks %u (sleep %u, wake %u).", when,
 		notPoweredOn ? "system never powered on" : "the watcher stopped", beats, systemSleeps, systemWakes);
 	panic("%s\n%s", reason, callback->composeReport(0, ""));
 }
@@ -3325,7 +3331,7 @@ static void backlightCheck() {
 	} else {
 		add(" no \"backlight\" device;");
 	}
-	// No IOGraphicsFamily symbols here (CarrizoRed doesn't link against it: an unbound import of IODisplay's metaclass
+	// No IOGraphicsFamily symbols here (UnifiedRed doesn't link against it: an unbound import of IODisplay's metaclass
 	// panicked the watcher at boot, nvram50): classes by name, display -> IODisplayConnect -> framebuffer through the
 	// registry, and only a virtual call on the framebuffer (connection 0, the panel's).
 	if (auto *iter = IOService::getMatchingServices(IOService::serviceMatching("IODisplay"))) {
@@ -3366,7 +3372,7 @@ static void backlightCheck() {
 // 194 entries, Monterey's has none (D509BA log 1746870993: only IODisplayParameters), so the panel never got the
 // parameter. With a "Default" entry and a framebuffer that answers kConnectionRawBacklight ('bklt', AMD's does: 0-255),
 // it builds its brightness curve from the framebuffer's range (0, max/4, 3max/4, max*1021/1024) and drives the
-// backlight through 'bklt'; the entry's own four big-endian points are then not used. So CarrizoRed gives it one,
+// backlight through 'bklt'; the entry's own four big-endian points are then not used. So UnifiedRed gives it one,
 // with its own points, before the panel's IODisplay starts (that's when the display collects its parameter handlers).
 // -crnobacklight leaves it alone.
 static bool backlightPanelsDone;
@@ -3611,7 +3617,7 @@ static void sampleGpuClock() {
 
 // Disk log (-crnodisklog disables). A freeze stops the CPU, and kernel NVRAM writes outside a panic never reach the
 // flash (nvram183-203), so a hard freeze left nothing. Instead, every second a line of GPU, SMU and DPM state is
-// appended to /private/var/log/CarrizoRed-<boot time>.log and forced to disk (open, write, fsync, close each time: a
+// appended to /private/var/log/UnifiedRed-<boot time>.log and forced to disk (open, write, fsync, close each time: a
 // freeze loses at most the last second, and nothing stays open at shutdown). Events (every SMU message and its answer,
 // DPM steps) are queued in memory from boot and written with the next line; the full black-box report is appended at
 // t=120 s and every 300 s. One file per boot: several test boots, then copy them all off in one go.
@@ -3768,7 +3774,7 @@ static bool diskLogAppend(const char *text, size_t len) {
 		clock_sec_t secs = 0;
 		clock_usec_t usecs = 0;
 		clock_get_calendar_microtime(&secs, &usecs);
-		snprintf(diskLogPath, sizeof(diskLogPath), "/private/var/log/CarrizoRed-%lu.log", static_cast<unsigned long>(secs));
+		snprintf(diskLogPath, sizeof(diskLogPath), "/private/var/log/UnifiedRed-%lu.log", static_cast<unsigned long>(secs));
 	}
 	vfs_context_t ctx = vfs_context_create(nullptr);
 	if (!ctx)
@@ -3907,7 +3913,7 @@ static void diskLogTick(uint32_t t, uint32_t stallTicks) {
 			len += static_cast<size_t>(n) < sizeof(line) - len ? static_cast<size_t>(n) : sizeof(line) - len - 1;
 	};
 	if (!diskLogStarted) {
-		add("CarrizoRed disk log; build %s (%s, " xStringify(MODULE_VERSION) "); boot-args: %s\ncolumns: t ms | sclk cur/tgt "
+		add("UnifiedRed disk log; build %s (%s, " xStringify(MODULE_VERSION) "); boot-args: %s\ncolumns: t ms | sclk cur/tgt "
 			"level (profile) | vid gfx/nb | temp C | GRBM_STATUS GRBM_STATUS2 CP_STAT | gfx rptr/wptr | sdma0 rptr/wptr | "
 			"ih rptr/wptr | flips perf/irq | submits fixed | smu msg/resp/arg | stall | dpm | ih calls/false alarms/broken "
 			"[| uvd ... vce ...] | cpu P-state, clock while busy\n", xStringify(CR_COMMIT), CR_BUILD_KIND,
@@ -4043,15 +4049,15 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		// New trace events (written lock-free by the wrappers).
 		uint32_t head = __atomic_load_n(&traceHead, __ATOMIC_RELAXED);
 		if (head - printed > TraceRingSize) {
-			IOLog("CarrizoRed: (%u trace events dropped)\n", head - printed - static_cast<uint32_t>(TraceRingSize));
+			IOLog("UnifiedRed: (%u trace events dropped)\n", head - printed - static_cast<uint32_t>(TraceRingSize));
 			printed = head - static_cast<uint32_t>(TraceRingSize);
 		}
 		for (; printed != head; printed++) {
 			auto &event = traceRing[printed % TraceRingSize];
 			if (event.exit)
-				IOLog("CarrizoRed: <- %s = 0x%x\n", event.name, event.value);
+				IOLog("UnifiedRed: <- %s = 0x%x\n", event.name, event.value);
 			else
-				IOLog("CarrizoRed: -> %s\n", event.name);
+				IOLog("UnifiedRed: -> %s\n", event.name);
 		}
 
 		// Interrupt activity since the last tick: a storm shows as a fast-climbing handler count.
@@ -4060,18 +4066,18 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			// Once the desktop runs, interrupts never stop: log them every 30 s, or when they storm.
 			uint32_t calls = __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED);
 			if (calls != lastCalls && (!desktopRunning() || tick % 60 == 0 || calls - lastCalls > 5000))
-				IOLog("CarrizoRed: IH handler calls %u (+%u), rptr writes %u, last rptr 0x%x\n", calls, calls - lastCalls,
+				IOLog("UnifiedRed: IH handler calls %u (+%u), rptr writes %u, last rptr 0x%x\n", calls, calls - lastCalls,
 					__atomic_load_n(&ihReadPointerWrites, __ATOMIC_RELAXED), ihLastReadPointer);
 			lastCalls = calls;
 		}
 
 		if (ihStormBroken && tick % 6 == 0) {
 			auto &snap = ihSnapshot;
-			IOLog("CarrizoRed: IH STORM broken at %llu ms after %u handler calls; ring in %s, size 0x%x\n", snap.ms,
+			IOLog("UnifiedRed: IH STORM broken at %llu ms after %u handler calls; ring in %s, size 0x%x\n", snap.ms,
 				snap.calls, snap.vram ? "VRAM" : "system memory", snap.size);
-			IOLog("CarrizoRed: IH RB_CNTL=%08x RB_BASE=%08x RPTR=%08x WPTR=%08x WPTR_ADDR=%02x:%08x CNTL=%08x STATUS=%08x\n",
+			IOLog("UnifiedRed: IH RB_CNTL=%08x RB_BASE=%08x RPTR=%08x WPTR=%08x WPTR_ADDR=%02x:%08x CNTL=%08x STATUS=%08x\n",
 				snap.rbCntl, snap.rbBase, snap.rptr, snap.wptr, snap.wptrAddrHi, snap.wptrAddrLo, snap.cntl, snap.status);
-			IOLog("CarrizoRed: IH write-back as CPU sees it=%08x at %llx; ring cpu %llx gpu %llx\n", snap.wbValue,
+			IOLog("UnifiedRed: IH write-back as CPU sees it=%08x at %llx; ring cpu %llx gpu %llx\n", snap.wbValue,
 				snap.wbAddress, snap.ringCpu, snap.ringGpu);
 		}
 
@@ -4080,7 +4086,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			static uint32_t regPrinted;
 			uint32_t regHead = __atomic_load_n(&regRingHead, __ATOMIC_RELAXED);
 			if (regHead - regPrinted > RegRingSize) {
-				IOLog("CarrizoRed: (%u queued register lines dropped)\n",
+				IOLog("UnifiedRed: (%u queued register lines dropped)\n",
 					regHead - regPrinted - static_cast<uint32_t>(RegRingSize));
 				regPrinted = regHead - static_cast<uint32_t>(RegRingSize);
 			}
@@ -4094,7 +4100,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 
 		// Heartbeat once the register log is armed: shows whether register traffic continues up to a freeze.
 		if (regLogFromMs && tick % 4 == 0)
-			IOLog("CarrizoRed: hb t=%us regs %u ih %u missing-pipe %u pm %u cfgwr %u\n", t,
+			IOLog("UnifiedRed: hb t=%us regs %u ih %u missing-pipe %u pm %u cfgwr %u\n", t,
 				__atomic_load_n(&regAccesses, __ATOMIC_RELAXED), __atomic_load_n(&ihHandlerCalls, __ATOMIC_RELAXED),
 				__atomic_load_n(&pipeAccesses, __ATOMIC_RELAXED), __atomic_load_n(&pmEvents, __ATOMIC_RELAXED),
 				__atomic_load_n(&pciConfigWrites, __ATOMIC_RELAXED));
@@ -4106,11 +4112,11 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (breadcrumb)
 			writeBreadcrumb(t);
 		if (panicAt && t >= panicAt)
-			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
+			self->panicReport(t, now, "UnifiedRed: deliberate panic (crpanicat), the kernel was still running.");
 		uvdLiveTick();
 		vceLiveTick();
 		if (uvdPanicMs && uptimeMs() >= uvdPanicMs && !(uvdStartInfo.status & 2))
-			self->panicReport(t, now, "CarrizoRed: deliberate panic (-cruvdpanic), 20 s after the first UVD session.");
+			self->panicReport(t, now, "UnifiedRed: deliberate panic (-cruvdpanic), 20 s after the first UVD session.");
 		kickStalledFlip();
 		// GPU stopped: the GFX ring's read pointer (CP_RB0_RPTR) stuck behind its write pointer (CP_RB0_WPTR) for 10 s.
 		// The screen freezes with the kernel still running and nothing in NVRAM, so panic with the report instead.
@@ -4119,7 +4125,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 			uint32_t rptr = gpuMmio[0x21C0], wptr = gpuMmio[0x3045];
 			if (rptr != wptr && rptr == stallRptr) {
 				if (++stallTicks == 20)
-					self->panicReport(t, now, "CarrizoRed: the GPU stopped executing commands (GFX ring read pointer stuck "
+					self->panicReport(t, now, "UnifiedRed: the GPU stopped executing commands (GFX ring read pointer stuck "
 						"for 10 s with work queued).");
 			} else {
 				stallTicks = 0;
@@ -4188,14 +4194,14 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		// 120 s, panic with the report. -crnoautopanic disables it.
 		if (t >= 120 && accelKextLoads[2] && !smuLoadOk() && !autoPanicOff)
 			self->panicReport(t, now, gpuDeadMs ?
-				"CarrizoRed: the GPU stopped responding (registers read 0xFFFFFFFF), so the accelerator couldn't start. "
+				"UnifiedRed: the GPU stopped responding (registers read 0xFFFFFFFF), so the accelerator couldn't start. "
 				"Not a driver bug: power the machine off fully (hold power, wait 10 s) before the next boot." :
-				"CarrizoRed: the accelerator didn't start (no SMU microcode load by 120 s).");
+				"UnifiedRed: the accelerator didn't start (no SMU microcode load by 120 s).");
 		if (__atomic_load_n(&smuStoppedAt, __ATOMIC_RELAXED))
-			self->panicReport(t, now, "CarrizoRed: SMU load stopped by crsmustep.");
+			self->panicReport(t, now, "UnifiedRed: SMU load stopped by crsmustep.");
 		if (auto *stage = __atomic_load_n(&stoppedStage, __ATOMIC_RELAXED)) {
 			static char reason[160];
-			snprintf(reason, sizeof(reason), "CarrizoRed: stopped on entering %s (#%u, crstopat).", stage, stopAtCount);
+			snprintf(reason, sizeof(reason), "UnifiedRed: stopped on entering %s (#%u, crstopat).", stage, stopAtCount);
 			self->panicReport(t, now, reason);
 		}
 
@@ -4212,7 +4218,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 					(getKernelVersion() == KernelVersion::Catalina ? WatchdogMsCatalina : WatchdogMs);
 			if (stuck) {
 				static char reason[512];
-				size_t len = static_cast<size_t>(snprintf(reason, sizeof(reason), "%sCarrizoRed watchdog: open stages:",
+				size_t len = static_cast<size_t>(snprintf(reason, sizeof(reason), "%sUnifiedRed watchdog: open stages:",
 					gpuDeadMs ? "GPU NOT RESPONDING (power off fully). " : ""));
 				for (size_t i = 0; i < MaxTraceStages && len < sizeof(reason); i++)
 					if (__atomic_load_n(&stageOpen[i], __ATOMIC_RELAXED))
@@ -4268,7 +4274,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				self->iGPU->setProperty("LoadAMDSupport", true);
 				self->iGPU->setProperty("LoadController", true);
 				self->iGPU->registerService();
-				IOLog("CarrizoRed: t=%us set LoadController on the iGPU and re-registered it\n", t);
+				IOLog("UnifiedRed: t=%us set LoadController on the iGPU and re-registered it\n", t);
 				traceNote("LoadController@%us ", t);
 			}
 		}
@@ -4283,7 +4289,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 				self->iGPU->setProperty("LoadHWServices", true);
 				self->iGPU->setProperty("LoadAccelerator", true);
 				self->iGPU->registerService();
-				IOLog("CarrizoRed: t=%us set LoadHWServices + LoadAccelerator on the iGPU and re-registered it\n", t);
+				IOLog("UnifiedRed: t=%us set LoadHWServices + LoadAccelerator on the iGPU and re-registered it\n", t);
 			}
 			traceNote("LoadAccelerator@%us%s ", t, already ? "(already)" : "");
 		}
@@ -4291,25 +4297,25 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		// Every 15 s, or when the tree changes: launchd keeps scrolling the console once the GUI starts.
 		if (print && (strcmp(now, last) || t % 15 == 0)) {
 			strlcpy(last, now, sizeof(last));
-			self->iGPU->setProperty("CarrizoRed,tree", now);
-			IOLog("CarrizoRed: t=%us LoadController=%s, iGPU children:%s\n", t,
+			self->iGPU->setProperty("UnifiedRed,tree", now);
+			IOLog("UnifiedRed: t=%us LoadController=%s, iGPU children:%s\n", t,
 				self->iGPU->getProperty("LoadController") ? "set" : "not set", now[0] ? "" : " none");
 			// Wrap the summary at spaces so a long line can't be overwritten by the next console line.
 			if (!traceSummary[0])
-				IOLog("CarrizoRed: trace: (controller not probed yet)\n");
+				IOLog("UnifiedRed: trace: (controller not probed yet)\n");
 			for (size_t pos = 0, len = strlen(traceSummary); pos < len;) {
 				size_t chunk = len - pos > 100 ? 100 : len - pos;
 				if (pos + chunk < len)
 					while (chunk > 1 && traceSummary[pos + chunk - 1] != ' ')
 						chunk--;
-				IOLog("CarrizoRed: trace: %.*s\n", static_cast<int>(chunk), traceSummary + pos);
+				IOLog("UnifiedRed: trace: %.*s\n", static_cast<int>(chunk), traceSummary + pos);
 				pos += chunk;
 			}
 			for (char *line = now; *line;) {
 				char *end = strchr(line, '\n');
 				if (end)
 					*end = '\0';
-				IOLog("CarrizoRed:   %s\n", line);
+				IOLog("UnifiedRed:   %s\n", line);
 				if (!end)
 					break;
 				line = end + 1;
@@ -4353,17 +4359,17 @@ void CRDriver::patchSupport(KernelPatcher &patcher, size_t index, mach_vm_addres
 // its writes out as the cause of the freeze ~20 s after start-up.
 bool CRDriver::wrapTestVram(void *that, uint32_t region, bool flag) {
 	if (checkKernelArgument("-crnovramwrite")) {
-		IOLog("CarrizoRed: TestVRAM(region %u) skipped (-crnovramwrite), reporting success\n", region);
+		IOLog("UnifiedRed: TestVRAM(region %u) skipped (-crnovramwrite), reporting success\n", region);
 		traceNote("TestVRAM(%u)=skipped ", region);
 		return true;
 	}
 	bool ret = FunctionCast(wrapTestVram, callback->orgTestVram)(that, region, flag);
-	IOLog("CarrizoRed: TestVRAM(region %u) -> %s, reporting success\n", region, ret ? "passed" : "FAILED");
+	IOLog("UnifiedRed: TestVRAM(region %u) -> %s, reporting success\n", region, ret ? "passed" : "FAILED");
 	traceNote("TestVRAM(%u)=%s->ok ", region, ret ? "pass" : "FAIL");
 	return true;
 }
 
-// aty_config options CarrizoRed overrides (all booleans), each with a boot-arg that leaves Apple's value alone.
+// aty_config options UnifiedRed overrides (all booleans), each with a boot-arg that leaves Apple's value alone.
 //  CFG_NON_ZERO_MC_LOC: see patchSupport.
 //  CFG_NO_PP: no PowerPlay. Apple's PowerPlay drives the Polaris SMU7 power controller; Stoney has an SMU8, which
 //  also controls the CPU and memory clocks. Spoof boots 5-7 froze the whole machine instantly as the GUI (and AGPM's
@@ -4765,7 +4771,7 @@ namespace {
 				IOSleep(1000);
 		}
 		if (stages[N].sync) {
-			IOLog("CarrizoRed: => %s\n", stages[N].name);
+			IOLog("UnifiedRed: => %s\n", stages[N].name);
 			IOSleep(30);
 		}
 		if (!strcmp(stages[N].name, "hw.setupCAIL")) {
@@ -5113,7 +5119,7 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		}
 		for (size_t i = 0; checks && checks[i]; i++) {
 			if (!codeHas(fn, checkLen, checks[i])) {
-				IOLog("CarrizoRed: accel: %s left alone, its code differs from the 15.8.1 KDK (%s)\n", what, checks[i]);
+				IOLog("UnifiedRed: accel: %s left alone, its code differs from the 15.8.1 KDK (%s)\n", what, checks[i]);
 				traceNote("%s=nomatch ", what);
 				accelGuardMisses++;
 				accelGuardMissLast = what;
@@ -7201,10 +7207,10 @@ void CRDriver::traceFramebuffer(KernelPatcher &patcher, size_t index, mach_vm_ad
 IODeviceMemory *CRDriver::wrapGetApertureRange(void *that, int aperture) {
 	auto *mem = FunctionCast(wrapGetApertureRange, callback->orgGetApertureRange)(that, aperture);
 	if (mem)
-		IOLog("CarrizoRed: fb.getApertureRange(%d) -> phys 0x%llx length 0x%llx\n", aperture,
+		IOLog("UnifiedRed: fb.getApertureRange(%d) -> phys 0x%llx length 0x%llx\n", aperture,
 			static_cast<uint64_t>(mem->getPhysicalAddress()), static_cast<uint64_t>(mem->getLength()));
 	else
-		IOLog("CarrizoRed: fb.getApertureRange(%d) -> none\n", aperture);
+		IOLog("UnifiedRed: fb.getApertureRange(%d) -> none\n", aperture);
 	traceEvent("fb.getApertureRange", true, mem ? static_cast<uint32_t>(mem->getPhysicalAddress() >> 20) : 0);
 	IOSleep(30);
 	return mem;
@@ -7246,35 +7252,35 @@ void CRDriver::traceSupport(KernelPatcher &patcher, size_t index, mach_vm_addres
 // -crreglogall: register logging starts here (every access, with values), instead of 2 s after start.
 IOService *CRDriver::wrapAtiProbe(IOService *that, IOService *provider, SInt32 *score) {
 	if (checkKernelArgument("-crnoctl")) {
-		IOLog("CarrizoRed: %s::probe -> NO MATCH (-crnoctl)\n", that->getMetaClass()->getClassName());
+		IOLog("UnifiedRed: %s::probe -> NO MATCH (-crnoctl)\n", that->getMetaClass()->getClassName());
 		traceNote("%s.probe=blocked ", that->getMetaClass()->getClassName());
 		return nullptr;
 	}
 	if (regLogAll && !regLogFromMs) {
 		regLogFromMs = uptimeMs();
-		IOLog("CarrizoRed: logging every register access from probe (-crreglogall)\n");
+		IOLog("UnifiedRed: logging every register access from probe (-crreglogall)\n");
 	}
-	IOLog("CarrizoRed: %s::probe ...\n", that->getMetaClass()->getClassName());
+	IOLog("UnifiedRed: %s::probe ...\n", that->getMetaClass()->getClassName());
 	auto *ret = FunctionCast(wrapAtiProbe, callback->orgAtiProbe)(that, provider, score);
-	IOLog("CarrizoRed: %s::probe -> %s\n", that->getMetaClass()->getClassName(), ret ? "match" : "NO MATCH");
+	IOLog("UnifiedRed: %s::probe -> %s\n", that->getMetaClass()->getClassName(), ret ? "match" : "NO MATCH");
 	traceNote("%s.probe=%s ", that->getMetaClass()->getClassName(), ret ? "match" : "NO");
 	// ATIController::start can't be wrapped safely (see routeChecked), so the first-touch register log opens a fixed
 	// time after a successful probe instead of 2 s after start returns (start takes about 1 s).
 	if (ret && !regLogFromMs) {
 		regLogFromMs = uptimeMs() + 5000;
-		IOLog("CarrizoRed: logging registers first touched from probe + 5 s\n");
+		IOLog("UnifiedRed: logging registers first touched from probe + 5 s\n");
 	}
 	return ret;
 }
 
 bool CRDriver::wrapAtiStart(IOService *that, IOService *provider) {
-	IOLog("CarrizoRed: %s::start ...\n", that->getMetaClass()->getClassName());
+	IOLog("UnifiedRed: %s::start ...\n", that->getMetaClass()->getClassName());
 	bool ret = FunctionCast(wrapAtiStart, callback->orgAtiStart)(that, provider);
-	IOLog("CarrizoRed: %s::start -> %s\n", that->getMetaClass()->getClassName(), ret ? "OK" : "FAILED");
+	IOLog("UnifiedRed: %s::start -> %s\n", that->getMetaClass()->getClassName(), ret ? "OK" : "FAILED");
 	traceNote("%s.start=%s ", that->getMetaClass()->getClassName(), ret ? "OK" : "FAILED");
 	if (ret && !regLogFromMs) {
 		regLogFromMs = uptimeMs() + 2000;
-		IOLog("CarrizoRed: logging registers first touched from now + 2 s\n");
+		IOLog("UnifiedRed: logging registers first touched from now + 2 s\n");
 	}
 	return ret;
 }
@@ -7442,7 +7448,7 @@ static void printRegEvent(const RegEvent &event, const char *suffix) {
 	char pipe[48] = "";
 	if (event.pipe >= 0)
 		snprintf(pipe, sizeof(pipe), " [PIPE %d, APU has %u%s]", event.pipe, pipeLimit, pipeGuard ? ", blocked" : "");
-	IOLog("CarrizoRed: new reg %s 0x%x/0x%x%s%s%s\n", regOpNames[event.op], event.offset, event.extra, value, pipe,
+	IOLog("UnifiedRed: new reg %s 0x%x/0x%x%s%s%s\n", regOpNames[event.op], event.offset, event.extra, value, pipe,
 		suffix);
 }
 
@@ -7486,7 +7492,7 @@ static int regAccess(RegOp op, uint32_t offset, uint32_t extra, uint32_t value) 
 // Value of a read whose access line was printed (-crreglogall only).
 static uint32_t regReadDone(int flags, uint32_t value) {
 	if ((flags & RegPrinted) && regLogAll)
-		IOLog("CarrizoRed:     = 0x%x\n", value);
+		IOLog("UnifiedRed:     = 0x%x\n", value);
 	return value;
 }
 
@@ -7743,7 +7749,7 @@ void CRDriver::wrapIhHandler(void *that, void *owner, void *arg, void *nub, int 
 	int32_t before = preemptionLevelOff >= 0 ? preemptionLevel() : 0;
 	FunctionCast(wrapIhHandler, callback->orgIhHandler)(that, owner, arg, nub, source);
 	if (int32_t after = preemptionLevelOff >= 0 ? preemptionLevel() : 0; after != before)
-		panic("CarrizoRed: preemption level %d -> %d across BaffinInterruptManager::handler (IH rptr %x wptr %x)", before,
+		panic("UnifiedRed: preemption level %d -> %d across BaffinInterruptManager::handler (IH rptr %x wptr %x)", before,
 			after, gpuMmio ? gpuMmio[IhReg::RB_RPTR] : 0, gpuMmio ? gpuMmio[IhReg::RB_WPTR] : 0);
 }
 
@@ -7784,7 +7790,7 @@ static void pmLog(bool canSleep, const char *tag, uint32_t value, const char *fm
 	va_start(va, fmt);
 	vsnprintf(line, sizeof(line), fmt, va);
 	va_end(va);
-	IOLog("CarrizoRed: %s\n", line);
+	IOLog("UnifiedRed: %s\n", line);
 	if (canSleep)
 		IOSleep(30);
 	else
@@ -8014,19 +8020,19 @@ static void printMsiState(IOPCIDevice *device, const char *when) {
 			} else {
 				data = device->configRead16(cap + 8);
 			}
-			IOLog("CarrizoRed: %s: PCI command 0x%04x, MSI cap 0x%x control 0x%04x (%s) address 0x%08x%08x data 0x%04x\n",
+			IOLog("UnifiedRed: %s: PCI command 0x%04x, MSI cap 0x%x control 0x%04x (%s) address 0x%08x%08x data 0x%04x\n",
 				when, command, cap, control, (control & 1) ? "ENABLED" : "off", addressHi, addressLo, data);
 			return;
 		}
 		cap = device->configRead8(cap + 1) & 0xFC;
 	}
-	IOLog("CarrizoRed: %s: PCI command 0x%04x, no MSI capability\n", when, command);
+	IOLog("UnifiedRed: %s: PCI command 0x%04x, no MSI capability\n", when, command);
 }
 
 IOReturn CRDriver::wrapInstallInterrupts(void *that) {
 	auto *gpu = callback->iGPU;
 	if (checkKernelArgument("-crnoints")) {
-		IOLog("CarrizoRed: installInterruptsOnPciDevice skipped (-crnoints): no interrupt registered or enabled\n");
+		IOLog("UnifiedRed: installInterruptsOnPciDevice skipped (-crnoints): no interrupt registered or enabled\n");
 		traceNote("ints=skipped ");
 		if (gpu)
 			printMsiState(gpu, "-crnoints");
@@ -8038,7 +8044,7 @@ IOReturn CRDriver::wrapInstallInterrupts(void *that) {
 	auto ret = FunctionCast(wrapInstallInterrupts, callback->orgInstallInterrupts)(that);
 	// AtiFbInterruptManager: +0x31 installed, +0x34 interrupt index (see installInterruptsOnPciDevice).
 	auto *manager = static_cast<uint8_t *>(that);
-	IOLog("CarrizoRed: installInterruptsOnPciDevice = 0x%x, index %u%s\n", ret, *reinterpret_cast<uint32_t *>(manager + 0x34),
+	IOLog("UnifiedRed: installInterruptsOnPciDevice = 0x%x, index %u%s\n", ret, *reinterpret_cast<uint32_t *>(manager + 0x34),
 		manager[0x31] ? "" : " (not installed)");
 	traceNote("ints=%x/%u ", ret, *reinterpret_cast<uint32_t *>(manager + 0x34));
 	if (gpu)
@@ -8156,7 +8162,7 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 	}
 	// TMDS (DVI 2, HDMI 3) PHY clock source. The PHY takes its clock from the PLL in asConfig ucPhyClkSrcId (bits 3:2,
 	// ENCODER_REFCLK_SRC_P1PLL 0 / P2PLL 1 / DCPLL 2), which Linux sets to the same ATOM PLL id as SetPixelClock's
-	// ucPpll. Apple passes its own PLL index there, and CarrizoRed remaps index 1 to ATOM_PPLL0 (2) for SetPixelClock
+	// ucPpll. Apple passes its own PLL index there, and UnifiedRed remaps index 1 to ATOM_PPLL0 (2) for SetPixelClock
 	// and the CRTC's pixel rate source (see atomPllFor) but not here: the D509BA's HDMI mode set programmed 148.5 MHz in
 	// PPLL0 while the PHY was told P2PLL, which DCE 11.0 doesn't use, and the monitor got no signal (log 1746945787:
 	// SetPixelClock ucPpll 2, transmitter config 0x26). Apply the same remap. -crnopllremap leaves both alone.
@@ -8289,7 +8295,7 @@ uint8_t CRDriver::wrapExecuteBiosCommandTable(void *that, uint32_t table, void *
 			AtomTransmitterTable, power, flag);
 		AtomCall injected {};
 		injected.table = static_cast<uint16_t>(AtomTransmitterTable);
-		injected.ok = static_cast<uint8_t>((powered & 1) | 0x40);  // 0x40 = injected by CarrizoRed
+		injected.ok = static_cast<uint8_t>((powered & 1) | 0x40);  // 0x40 = injected by UnifiedRed
 		injected.repeat = 1;
 		memcpy(injected.in, power, sizeof(injected.in));
 		memcpy(injected.out, power, sizeof(injected.out));
@@ -8652,7 +8658,7 @@ static void assrProbe(void *that, uint8_t flags, IOReturn (*read)(void *, uint32
 		assrCap = value;
 	if (read(that, 0x10A, 1, &value, flags) == kIOReturnSuccess)
 		assrBoot = value;
-	IOLog("CarrizoRed: eDP DPCD 0x00D (eDP config cap) = 0x%02x, 0x10A (eDP config set) = 0x%02x before Apple's link "
+	IOLog("UnifiedRed: eDP DPCD 0x00D (eDP config cap) = 0x%02x, 0x10A (eDP config set) = 0x%02x before Apple's link "
 		  "setup\n", assrCap, assrBoot);
 }
 
@@ -8912,7 +8918,7 @@ static void restoreTick(uint32_t t) {
 	while (restoreDone < sizeof(restoreSteps) / sizeof(restoreSteps[0]) && t >= restoreSteps[restoreDone].at) {
 		uint32_t written = restoreStep(restoreDone++);
 		restoreWrites += written;
-		IOLog("CarrizoRed: t=%us restore step %u (%s): %u registers set to their boot values\n", t, restoreDone,
+		IOLog("UnifiedRed: t=%us restore step %u (%s): %u registers set to their boot values\n", t, restoreDone,
 			restoreSteps[restoreDone - 1].name, written);
 	}
 }
@@ -9028,8 +9034,8 @@ void CRDriver::logPCIInfo() {
 		SYSLOG("cr", "BAR5 (MMIO) 0x%llX size 0x%llX", static_cast<uint64_t>(bar5->getPhysicalAddress()),
 			static_cast<uint64_t>(bar5->getLength()));
 
-	iGPU->setProperty("CarrizoRed,family", familyName(family));
-	iGPU->setProperty("CarrizoRed,revision", revision, 8);
+	iGPU->setProperty("UnifiedRed,family", familyName(family));
+	iGPU->setProperty("UnifiedRed,revision", revision, 8);
 
 	// PowerPlay (HWLibs PHM_Initialize) has back ends for VI dGPUs, Vega, Navi and Raven/Renoir, but none for family
 	// 0x87 (Carrizo/Stoney), and the APU spoofed as Polaris 11 gets the VI path: the Tonga table parser and the Polaris
@@ -9044,7 +9050,7 @@ void CRDriver::logPCIInfo() {
 	}
 }
 
-// The GPU's registers (BAR5). IOKit's mapDeviceMemoryWithRegister can fail when CarrizoRed starts before the PCI
+// The GPU's registers (BAR5). IOKit's mapDeviceMemoryWithRegister can fail when UnifiedRed starts before the PCI
 // family has registered the device's memory ranges (nvram4-6: black screens, gpuMmio never set, so no SMU microcode
 // load, no FB move, nothing): then map BAR5 straight from config space (256 KB, uncached). Retried on demand
 // (ensureMmio) from the watcher, the SMU loader and the RLC halt hook.
@@ -9099,7 +9105,7 @@ void CRDriver::probeMMIO() {
 		gpuDeadAtStart = true;
 		checkGpuAlive(mmio);
 		SYSLOG("cr", "the GPU isn't responding at start-up (registers read 0xFFFFFFFF): power the machine off fully");
-		iGPU->setProperty("CarrizoRed,gpu-dead", true);
+		iGPU->setProperty("UnifiedRed,gpu-dead", true);
 	}
 	auto gbAddrConfig = mmio[Reg::GB_ADDR_CONFIG];
 	auto shaderArrayConfig = mmio[Reg::CC_GC_SHADER_ARRAY_CONFIG];
@@ -9118,9 +9124,9 @@ void CRDriver::probeMMIO() {
 	SYSLOG("cr", "GRBM_STATUS 0x%08X GB_ADDR_CONFIG 0x%08X CC_GC_SHADER_ARRAY_CONFIG 0x%08X CC_RB_BACKEND_DISABLE 0x%08X",
 		grbmStatus, gbAddrConfig, shaderArrayConfig, rbBackendDisable);
 
-	iGPU->setProperty("CarrizoRed,vram-mb", memSize, 32);
-	iGPU->setProperty("CarrizoRed,carveout-phys", carveoutPhys, 64);
-	iGPU->setProperty("CarrizoRed,gb-addr-config", gbAddrConfig, 32);
+	iGPU->setProperty("UnifiedRed,vram-mb", memSize, 32);
+	iGPU->setProperty("UnifiedRed,carveout-phys", carveoutPhys, 64);
+	iGPU->setProperty("UnifiedRed,gb-addr-config", gbAddrConfig, 32);
 
 	initDisplayRegs();
 	relocateFb();
@@ -9177,7 +9183,7 @@ void CRDriver::relocateFb() {
 	fbRelocReadback = mmio[Reg::MC_VM_FB_LOCATION];
 	SYSLOG("cr", "FB window moved from 0x%llX to 0: MC_VM_FB_LOCATION 0x%08X -> 0x%08X (reads 0x%08X), HDP base 0x%X",
 		base, location, moved, fbRelocReadback, hdp);
-	iGPU->setProperty("CarrizoRed,fb-relocated", fbRelocReadback == moved);
+	iGPU->setProperty("UnifiedRed,fb-relocated", fbRelocReadback == moved);
 }
 
 // Display and memory-controller registers watched from boot (firmware/GOP values) through Apple's bring-up: FB
@@ -12097,7 +12103,7 @@ static void captureUserIbs(char *out, size_t size) {
 void CRDriver::vmmPanic(void *vmm) {
 	// The state that decides this first (the panic log keeps the start): the fixes the sDMA channel depends on.
 	char reason[480];
-	snprintf(reason, sizeof(reason), "CarrizoRed: the GPU VM manager %p has no sDMA channel (+0x28 null) at a page-table "
+	snprintf(reason, sizeof(reason), "UnifiedRed: the GPU VM manager %p has no sDMA channel (+0x28 null) at a page-table "
 		"update; Apple's endVMPTUpdate would fault. hwsig %u found/%u missed, smu load %s (calls %u), sDMA1 dropped %u "
 		"aliased %u, sDMA0-only starts %u, accel guards failed %u (last %s), routes ok %u failed %u unverified %u (last %s), "
 		"kernel %d.%d.", vmm, hwsigResolved, hwsigMissed, smuLoad.result ? smuLoad.result : "not run", smuLoadCalls,
@@ -12907,7 +12913,7 @@ void CRDriver::checkDisplayRegs(uint32_t t) {
 		auto &reg = watchedRegs[i];
 		if (reg.pipe >= 0 && !powered[reg.pipe]) {
 			if (reg.valid && reg.changes++ < MaxPrintedChanges)
-				IOLog("CarrizoRed: t=%us p%d %s: pipe powered off\n", t, reg.pipe, reg.name);
+				IOLog("UnifiedRed: t=%us p%d %s: pipe powered off\n", t, reg.pipe, reg.name);
 			reg.valid = false;
 			continue;
 		}
@@ -12922,7 +12928,7 @@ void CRDriver::checkDisplayRegs(uint32_t t) {
 			char pipe[8] = "";
 			if (reg.pipe >= 0)
 				snprintf(pipe, sizeof(pipe), "p%d ", reg.pipe);
-			IOLog("CarrizoRed: t=%us %s%s 0x%X = 0x%08X%s%s\n", t, pipe, reg.name, reg.offset, value, was,
+			IOLog("UnifiedRed: t=%us %s%s 0x%X = 0x%08X%s%s\n", t, pipe, reg.name, reg.offset, value, was,
 				changes + 1 == MaxPrintedChanges ? ", further changes not shown" : "");
 		}
 		reg.value = value;

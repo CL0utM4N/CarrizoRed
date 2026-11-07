@@ -1,14 +1,22 @@
-# CarrizoRed
+# UnifiedRed
 
 A [Lilu](https://github.com/acidanthera/Lilu) plugin that brings macOS graphics to AMD's GCN 3 (GFX8) APUs by adapting
 Apple's own Polaris drivers (`AMD9500Controller` + `AMDSupport` for display, `AMDRadeonX4000` for acceleration). It's
 the same idea NootedRed applies to Vega iGPUs on top of `AMDRadeonX5000`. macOS has never supported these APUs (no Mac
 used them), so on a hackintosh they've only had the firmware framebuffer.
 
+**Formerly CarrizoRed.** The project was renamed UnifiedRed on 2026-11-07, when the GCN 2 work (Kabini, Mullins,
+Kaveri; previously the separate KaberiRed project) moved in: one kext for AMD's pre-Ryzen APUs, all on Apple's current
+Polaris drivers. GCN 2 support is planned, not working yet ([docs/OLDER_APUS.md](docs/OLDER_APUS.md)). Old links to
+`CL0utM4N/CarrizoRed` redirect here. **Updating from CarrizoRed 0.3.0 or earlier:** delete `CarrizoRed.kext` from
+`EFI/OC/Kexts`, add `UnifiedRed.kext`, and in `config.plist` → Kernel → Add change that entry's `BundlePath` to
+`UnifiedRed.kext` and `ExecutablePath` to `Contents/MacOS/UnifiedRed`. Never load both. Boot arguments keep their
+`-cr…` names, and the log is now `/private/var/log/UnifiedRed-<time>.log`.
+
 ## Status
 
 > **Experimental, in active development.** Pre-releases (latest **0.3.0**) are on the
-> [Releases](https://github.com/CL0utM4N/CarrizoRed/releases) page. Expect kernel panics and black screens, and
+> [Releases](https://github.com/CL0utM4N/UnifiedRed/releases) page. Expect kernel panics and black screens, and
 > don't run it on a machine you depend on. Everything below is from a handful of test machines.
 
 **What it does today:** on Stoney Ridge machines, macOS Catalina through Sequoia boots to the desktop and drives
@@ -21,13 +29,13 @@ scales with load (400 MHz idle, up to the chip's top level).
 |---|---|
 | Built-in eDP panel | **Works** through Apple's `AMD9500Controller` / `AMDFramebuffer`: Recovery, the installer and installed Catalina through Sequoia (the D509BA's 1366×768 panel on one eDP lane, the Inspiron 3475's on two) |
 | Display interrupts (vblank) | **Works** |
-| Acceleration / Metal (`AMDRadeonX4000`) | **Works.** The SMU loads the GPU microcode, the command processor and SDMA run, interrupts work, and WindowServer and apps render with Metal. Apple's shader compiler emits an interpolation pattern Stoney's 16-bank LDS gets wrong; CarrizoRed fixes the compiled pixel shaders before the GPU runs them, including when Metal re-uploads them (see *Metal needed*). Boot with `-crnoaccel` for an unaccelerated desktop |
-| GPU clock scaling (SCLK DPM) | **Works, on by default.** Apple's PowerPlay runs its Dummy back end here, so nothing would start the SMU's clock scaling and the GPU would stay at its lowest clock. CarrizoRed starts it 90 s after boot, from the SMU's own clock table: 400 MHz minimum, up to the top level (900 MHz on an A9-9425, 800 MHz on an A9-9420). `-crnosclkdpm` turns it off |
-| Sleep | **Works** on the D509BA (Catalina, Big Sur, Monterey) and the Dell Inspiron 3475 (Tahoe): real S3, no wakes of its own, and a USB keyboard on a USB 2 or USB 3 port wakes it (both machines). CarrizoRed flushes the CPU caches before S3 (Apple's ACPI code doesn't, and the wake died without it), lets only the USB controllers, the lid and the power button wake the machine, and works around the AMD FCH's USB wake quirks; FCHXHCIFix's `SSDT-FCHSLEEP` keeps the USB 2 controller powered through S3. It redoes what S3 resets in the display block the way Linux's DC driver does at resume (panel power, display clock and DP DTO, VBIOS scratch and backlight, AUX, ASSR). Sonoma untested since the cache flush. Lid close sleeps on AC too with `SSDT-PNLF` (see *Brightness*). Details: [docs/SLEEP.md](docs/SLEEP.md) |
+| Acceleration / Metal (`AMDRadeonX4000`) | **Works.** The SMU loads the GPU microcode, the command processor and SDMA run, interrupts work, and WindowServer and apps render with Metal. Apple's shader compiler emits an interpolation pattern Stoney's 16-bank LDS gets wrong; UnifiedRed fixes the compiled pixel shaders before the GPU runs them, including when Metal re-uploads them (see *Metal needed*). Boot with `-crnoaccel` for an unaccelerated desktop |
+| GPU clock scaling (SCLK DPM) | **Works, on by default.** Apple's PowerPlay runs its Dummy back end here, so nothing would start the SMU's clock scaling and the GPU would stay at its lowest clock. UnifiedRed starts it 90 s after boot, from the SMU's own clock table: 400 MHz minimum, up to the top level (900 MHz on an A9-9425, 800 MHz on an A9-9420). `-crnosclkdpm` turns it off |
+| Sleep | **Works** on the D509BA (Catalina, Big Sur, Monterey) and the Dell Inspiron 3475 (Tahoe): real S3, no wakes of its own, and a USB keyboard on a USB 2 or USB 3 port wakes it (both machines). UnifiedRed flushes the CPU caches before S3 (Apple's ACPI code doesn't, and the wake died without it), lets only the USB controllers, the lid and the power button wake the machine, and works around the AMD FCH's USB wake quirks; FCHXHCIFix's `SSDT-FCHSLEEP` keeps the USB 2 controller powered through S3. It redoes what S3 resets in the display block the way Linux's DC driver does at resume (panel power, display clock and DP DTO, VBIOS scratch and backlight, AUX, ASSR). Sonoma untested since the cache flush. Lid close sleeps on AC too with `SSDT-PNLF` (see *Brightness*). Details: [docs/SLEEP.md](docs/SLEEP.md) |
 | Brightness | **Works:** the Displays slider and the brightness keys (D509BA on Monterey, Dell Inspiron 3475 on Tahoe). Needs `SSDT-PNLF` and [BrightnessKeys](https://github.com/acidanthera/BrightnessKeys) (see *Installing*). With them the panel is macOS's built-in display, which also makes lid-close sleep work on AC |
 | External displays (HDMI) | **Works** on the D509BA and the Dell Inspiron 3475 (Tahoe): the monitor is detected and lit at boot and on hot-plug (1920×1080 at 60 Hz tested), and unplugging it hands the desktop back to the panel. See *HDMI* below. DisplayPort outputs untested |
 | HDMI audio | Not done |
-| Video decode/encode (UVD/VCE) | **On hold**: video plays and records in software. UVD powers up and Apple's firmware boots on it, but decoding hangs the GPU: Apple's driver gives UVD GPU virtual addresses, and Stoney's UVD has no VM support (Linux runs it in physical mode and rewrites every buffer address). Making it work means doing that translation in CarrizoRed. Findings and next steps in [docs/VIDEO.md](docs/VIDEO.md) |
+| Video decode/encode (UVD/VCE) | **On hold**: video plays and records in software. UVD powers up and Apple's firmware boots on it, but decoding hangs the GPU: Apple's driver gives UVD GPU virtual addresses, and Stoney's UVD has no VM support (Linux runs it in physical mode and rewrites every buffer address). Making it work means doing that translation in UnifiedRed. Findings and next steps in [docs/VIDEO.md](docs/VIDEO.md) |
 | Carrizo / Bristol Ridge | Same display engine and code paths; the SMU microcode loader, clock scaling and shader-engine fix include Carrizo's differences (second SDMA engine, second MEC), following Linux. **Untested** (no hardware): reports from owners are very welcome |
 
 **Tested on:**
@@ -45,11 +53,11 @@ scales with load (400 MHz idle, up to the chip's top level).
 | macOS | Support |
 |---|---|
 | Sequoia 15 | **Works.** Development target; every hook found by symbol |
-| Sonoma 14 | **Works.** Its AMD init library (HWLibs) ships stripped, so CarrizoRed finds the 46 functions it hooks by byte signatures checked against the 14.8.9 KDK ([`kern_sigs.hpp`](CarrizoRed/kern_sigs.hpp)); Metal patches at Sonoma's offsets |
+| Sonoma 14 | **Works.** Its AMD init library (HWLibs) ships stripped, so UnifiedRed finds the 46 functions it hooks by byte signatures checked against the 14.8.9 KDK ([`kern_sigs.hpp`](UnifiedRed/kern_sigs.hpp)); Metal patches at Sonoma's offsets |
 | Ventura 13 | **Works.** HWLibs is stripped and compiled differently: functions matched by the constants they use (45 of 46), safety checks accept Ventura's register allocation, Metal patches at Ventura's offsets |
 | Monterey 12 | **Works** (12.7.6). HWLibs functions matched by their constants (41 of 46) from the installed system's kexts (no Monterey KDK exists), the hardware capability fields at Monterey's offsets, safety checks accept its register allocation, Metal patches at its offsets. Needs the xHCI reset patch's `Limit` at 2048 for USB 3 (see FCHXHCIFix) |
 | Big Sur 11 | **Works** (11.7.11). Its HWLibs keeps its symbols, so every hook is found by name; the accelerator and command-buffer layouts differ (capability fields as Monterey, submission info, a vtable slot) and the Metal patches sit at Big Sur's offsets |
-| Catalina 10.15 | **Works** (10.15.7). HWLibs keeps its symbols (Polaris loads `AMDRadeonX4000HWLibs` unless the subsystem is Apple's); the accelerator's engine slots, capability fields and command-buffer layout, and CAIL's flags and SMU buffer fields, sit at Catalina's offsets. Its scheduler has one queue per engine and priority, so CarrizoRed creates three extra queues instead of four (the second SDMA engine is folded into the first). Metal: the shader compiler (`libSC.dylib` in AMDShared.bundle) and the Metal driver are separate files there, patched through `cs_validate_range`. The xHCI reset patch matches (`MinKernel` 19.0.0) |
+| Catalina 10.15 | **Works** (10.15.7). HWLibs keeps its symbols (Polaris loads `AMDRadeonX4000HWLibs` unless the subsystem is Apple's); the accelerator's engine slots, capability fields and command-buffer layout, and CAIL's flags and SMU buffer fields, sit at Catalina's offsets. Its scheduler has one queue per engine and priority, so UnifiedRed creates three extra queues instead of four (the second SDMA engine is folded into the first). Metal: the shader compiler (`libSC.dylib` in AMDShared.bundle) and the Metal driver are separate files there, patched through `cs_validate_range`. The xHCI reset patch matches (`MinKernel` 19.0.0) |
 | Tahoe 26 | **Works, with graphical glitches; not recommended yet** (26.7.2 on the Dell Inspiron 3475). The Metal patches match Tahoe's cache and the shader fix handles its shaders, but Tahoe needs more graphics memory than these APUs' usual 512 MB: Apple's driver logs `AMD ERROR! Failed to allocate size:… There is … free memory remaining` (up to 1,749 times in one session) when the carve-out is full or too fragmented, and desktop widgets draw broken while an app is open. Unless the firmware gives the GPU at least 1 GB, stay on Sequoia or earlier for now; if you run Tahoe anyway, expect more glitches. See *Graphics memory on Tahoe* |
 
 Each version's Metal shader-compiler patches are matched against that version's own dyld shared cache.
@@ -85,18 +93,18 @@ The accelerator so far needed:
 - the hardware description given to the Metal driver: the spoofed device ID instead of Stoney's real one;
 - graphics power gating kept off (nothing drives the SMU's save/restore jobs under the Dummy back end, and the GPU
   hung on its next command after powering down);
-- lost display-flip completions delivered by CarrizoRed (otherwise one lost completion freezes the screen);
+- lost display-flip completions delivered by UnifiedRed (otherwise one lost completion freezes the screen);
 - the video engines left off unless `-crvideo` powers them through the SMU.
 
 And Metal needed:
 - the compiled pixel shaders fixed for Stoney's 16-bank LDS: `v_interp_p1_f32` must not write the VGPR it reads, and
   Apple's shader compiler (even its own Stoney back end, after clearing the shader caches: about 47% of shaders) does
-  that for the last component of an attribute. CarrizoRed rewrites those shaders in GPU memory as each command buffer
+  that for the last component of an attribute. UnifiedRed rewrites those shaders in GPU memory as each command buffer
   is submitted, before the GPU runs them. When the broken result is part of a register block (an image coordinate),
   the whole block moves to fresh registers. Shaders up to 512 KB are handled (Sonoma's lock screen shader is 144 KB);
 - the fixes kept from being undone: Metal's driver re-uploads its shader heap with SDMA copies from a staging copy
   holding the original code, which could land after the fix and make some frames draw unfixed (the random flat-colour
-  images, like the old blue folder icons). CarrizoRed reads the SDMA command buffers at submission and applies the same
+  images, like the old blue folder icons). UnifiedRed reads the SDMA command buffers at submission and applies the same
   fix to each copy's source, so the GPU copies in fixed code;
 - the small-primitive filter off, the 2-pipe walk fence and no delta colour compression (Polaris settings Mesa doesn't
   use on Stoney), and the Metal compiler switched to its Stoney back end (patched in the dyld shared cache);
@@ -112,9 +120,9 @@ And Metal needed:
 | Random glitches (flat-colour images, login avatar, blue folder icons) | Fixed: Metal's SDMA shader re-uploads were undoing the shader fix. Folder icons drawn wrong by older builds stay in macOS's icon cache until it is cleared |
 | Lock screen (Sonoma) | Renders; the animated wallpaper is slow (10-bit 4K HEVC on the CPU; Stoney's UVD can't decode 10-bit). A still wallpaper avoids it |
 | GPU clock scaling | Works, on by default, up to the chip's top level. It stays at the top level more than it should; being looked at |
-| Freezes with clock scaling | Fixed: CarrizoRed's own interrupt-storm breaker was tripping on real interrupt bursts at higher clocks |
-| OpenGL | Expected to work, untested: Apple's AMD GL driver compiles through the same `libSC` CarrizoRed patches for Stoney (its `ATIRadeonX4000SCLib` wraps it), and the shader fix works on every submission whatever the API |
-| Video decode/encode | On hold: software decode and encode. UVD starts with Apple's firmware, but needs CarrizoRed to translate GPU virtual addresses to physical ones before it can decode ([docs/VIDEO.md](docs/VIDEO.md)) |
+| Freezes with clock scaling | Fixed: UnifiedRed's own interrupt-storm breaker was tripping on real interrupt bursts at higher clocks |
+| OpenGL | Expected to work, untested: Apple's AMD GL driver compiles through the same `libSC` UnifiedRed patches for Stoney (its `ATIRadeonX4000SCLib` wraps it), and the shader fix works on every submission whatever the API |
+| Video decode/encode | On hold: software decode and encode. UVD starts with Apple's firmware, but needs UnifiedRed to translate GPU virtual addresses to physical ones before it can decode ([docs/VIDEO.md](docs/VIDEO.md)) |
 | Sleep/wake | Done: works on the D509BA and the Dell (Tahoe), with USB 2 and USB 3 keyboard wake. Sonoma to retest; lid sleep on AC works with `SSDT-PNLF`; see [docs/SLEEP.md](docs/SLEEP.md) |
 | Carrizo / Bristol Ridge | Code paths written (SMU loader, clock scaling, caps), untested: no hardware |
 | Tahoe graphics memory | Open: Tahoe can fill the 512 MB carve-out (see *Graphics memory on Tahoe*) |
@@ -123,11 +131,11 @@ And Metal needed:
 | HDMI audio | Next |
 | GPU occasionally not responding after a warm restart | Open (power off fully) |
 
-**Testing:** every boot writes `/private/var/log/CarrizoRed-<time>.log`: GPU, SMU and clock state every second, all SMU
+**Testing:** every boot writes `/private/var/log/UnifiedRed-<time>.log`: GPU, SMU and clock state every second, all SMU
 messages, a census of draw set-ups and the black-box report, written straight to disk so it survives a freeze. Copy
 these files off after a few boots and attach them to an issue; no NVRAM dumps or forced panics needed.
 
-HWLibs patches not taking at boot turned out to be Lilu's trampoline buffer running out; CarrizoRed builds its own
+HWLibs patches not taking at boot turned out to be Lilu's trampoline buffer running out; UnifiedRed builds its own
 trampolines.
 
 Each fix is documented in the code, in [docs/TEST_MACHINES.md](docs/TEST_MACHINES.md) and in
@@ -161,17 +169,17 @@ Requires macOS with the Xcode command-line tools:
 
 ```sh
 bash scripts/bootstrap.sh   # fetches Lilu.kext (SDK) and MacKernelSDK
-make DEBUG=1                # build/Debug/CarrizoRed.kext
-make                        # build/Release/CarrizoRed.kext
+make DEBUG=1                # build/Debug/UnifiedRed.kext
+make                        # build/Release/UnifiedRed.kext
 ```
 
-No Mac? Push to GitHub: `.github/workflows/build.yml` builds CarrizoRed (Debug and Release) and the
+No Mac? Push to GitHub: `.github/workflows/build.yml` builds UnifiedRed (Debug and Release) and the
 XHCIProbe diagnostic on a macOS runner, and uploads them with a debug `Lilu.kext` as one workflow artifact.
 Development for this project is done entirely on Windows this way.
 
 ## Installing (test machine)
 
-Download `CarrizoRed-<version>-Release.zip` from [Releases](https://github.com/CL0utM4N/CarrizoRed/releases) (or a CI
+Download `UnifiedRed-<version>-Release.zip` from [Releases](https://github.com/CL0utM4N/UnifiedRed/releases) (or a CI
 build, see *Building*). It needs [Lilu](https://github.com/acidanthera/Lilu/releases) 1.7.2 or later (it is built against Lilu's current SDK).
 
 `scripts/build_efi_d509ba.py` builds the complete OpenCore EFI used for the D509BA. It's a good starting point for
@@ -181,19 +189,19 @@ similar machines. It includes:
 - the ACPI fixes (`SSDT-XOSI`, EC/USBX) and a USB map;
 - VoodooPS2 and VoodooI2C (touchpad);
 - [FCHXHCIFix](https://github.com/CL0utM4N/FCHXHCIFix) (USB, see below);
-- CarrizoRed and the iGPU spoof below, when the script is run with `--carrizored --spoof` (options of the script,
+- UnifiedRed and the iGPU spoof below, when the script is run with `--unifiedred --spoof` (options of the script,
   not boot-args).
 
-The pieces CarrizoRed needs:
-1. **Kexts:** add `Lilu.kext`, then `CarrizoRed.kext`, to `EFI/OC/Kexts` and to `config.plist` (Lilu first).
+The pieces UnifiedRed needs:
+1. **Kexts:** add `Lilu.kext`, then `UnifiedRed.kext`, to `EFI/OC/Kexts` and to `config.plist` (Lilu first).
 2. **Device ID spoof:** a `DeviceProperties` entry on the iGPU setting `device-id` to `EF670000` (Polaris 11 / Baffin,
    `0x67EF`). That's what makes Apple's Polaris kexts match. CAIL still reads the real ID from the hardware. The iGPU is
    always PCI device 1, function 0, but the `PciRoot` number differs between machines: `PciRoot(0x0)/Pci(0x1,0x0)` on
    the D509BA, `PciRoot(0x1)/Pci(0x1,0x0)` on a Dell Inspiron 3475. Check yours (see *Finding the iGPU's path* below).
-   With the wrong path OpenCore silently skips the entry, and nothing from CarrizoRed's acceleration ever loads.
+   With the wrong path OpenCore silently skips the entry, and nothing from UnifiedRed's acceleration ever loads.
 3. **Boot-args:** `-v keepsyms=1 debug=0x100` for testing, plus `-crnoaccel` to bring up the display without the
    accelerator.
-4. **When something goes wrong:** with `crpanicat=N`, CarrizoRed panics on purpose N seconds after the display driver
+4. **When something goes wrong:** with `crpanicat=N`, UnifiedRed panics on purpose N seconds after the display driver
    loads. The panic text carries a "black box" report: trace, registers, link, interrupts and accelerator state.
    `debug=0x100` makes the machine halt on the panic instead of rebooting. Read the report back from NVRAM
    (`AAPL,PanicInfo`) after the next boot, e.g. with OpenShell `dmpstore -all -s fs0:\nvram.bin`.
@@ -203,8 +211,8 @@ The pieces CarrizoRed needs:
    The SSDT is the `"backlight"` device macOS looks for before it treats a panel as built-in; without it the panel is an
    external-style display: no brightness control, and closing the lid doesn't sleep the machine on AC.
 6. **External displays (HDMI):** nothing to add; see *HDMI* under *Boot arguments*.
-7. **After boot:** `log show --last boot --predicate 'eventMessage CONTAINS "CarrizoRed"'` and
-   `ioreg -lw0 | grep CarrizoRed`.
+7. **After boot:** `log show --last boot --predicate 'eventMessage CONTAINS "UnifiedRed"'` and
+   `ioreg -lw0 | grep UnifiedRed`.
 
 ### Finding the iGPU's path
 
@@ -230,18 +238,18 @@ Before macOS is installed:
 
 To check that the spoof took effect, run `ioreg -lw0 -r -c IOPCIDevice | grep '"device-id" = <ef670000>'` in
 macOS. No output means OpenCore didn't apply the entry. Another sign is "Graphics 7 MB" in About This Mac with no
-`/private/var/log/CarrizoRed-*.log`.
+`/private/var/log/UnifiedRed-*.log`.
 
 ## USB on these machines
 
 The APUs' built-in USB 3 controller (FCH xHCI `1022:7914`) never delivers its interrupts to macOS, so USB crawls
 (a USB stick reads at ~130 KB/s, and installing macOS from one takes most of a day). The standalone
 [FCHXHCIFix](https://github.com/CL0utM4N/FCHXHCIFix) kext fixes it (its own repository, with releases). It doesn't
-depend on CarrizoRed or Lilu, so put it in the EFI **before** installing macOS. Its README has the cause, the diagnosis
+depend on UnifiedRed or Lilu, so put it in the EFI **before** installing macOS. Its README has the cause, the diagnosis
 and the list of affected machines.
 
 For sleep, also add FCHXHCIFix's `SSDT-FCHSLEEP` (with its `_PTS` rename): AMD's reference firmware powers the USB 2
-controller off in `_PTS`, which wakes the machine at once. CarrizoRed does the rest at S3 entry (see *Sleep* in
+controller off in `_PTS`, which wakes the machine at once. UnifiedRed does the rest at S3 entry (see *Sleep* in
 [docs/SLEEP.md](docs/SLEEP.md)).
 
 ## Boot arguments
@@ -259,26 +267,26 @@ controller off in `_PTS`, which wakes the machine at once. CarrizoRed does the r
 | `-crnovramtest` | Reporting `ATIController::TestVRAM` as passed (the real result is still logged) |
 | `-crnolbfix` | DCE 11.0's line-buffer size (0x6B0) in `LB_MEMORY_CTRL` instead of Apple's |
 | `-crnoedppoweron` | The eDP panel POWER_ON transmitter action before Apple enables the eDP transmitter, and before the first AUX transaction after a wake |
-| `-crnoassrsource` | When CarrizoRed enables ASSR in the eDP panel, don't also put the GPU's DP encoder in eDP panel mode (DP_DPHY_INTERNAL_CTRL = 1, as Linux DC does). The firmware sets it at boot; after a sleep it's 0 and the picture comes out as stripes |
+| `-crnoassrsource` | When UnifiedRed enables ASSR in the eDP panel, don't also put the GPU's DP encoder in eDP panel mode (DP_DPHY_INTERNAL_CTRL = 1, as Linux DC does). The firmware sets it at boot; after a sleep it's 0 and the picture comes out as stripes |
 | `-crnodispclk` | After a wake, don't set the display engine clock the way Linux's DC does on DCE 11.0 (VBIOS SetPixelClock with the DFS PLL and the VBIOS's default display clock; Apple's SetDCEClock path doesn't exist in these VBIOSes), so DPREFCLK and the DP DTO stay at their reset values |
 | `-crnodppclk` | Don't send Apple's DP/eDP SetPixelClock calls to the VBIOS the way Linux's DC does (ucPpll = ATOM_PPLL_INVALID, no dividers, so the VBIOS programs the DP DTO); Apple passes its Polaris "no PLL" index 6, and after a sleep nothing set the DTO up, so a trained link stayed black |
 | `-crnowakerestore` | Don't run Linux DC's resume steps after a wake: VBIOS EnableDispPowerGating INIT/DISABLE on both pipes, the VBIOS scratch and backlight PWM registers from before sleep, the eDP transmitter INIT with DC's parameters, the AUX engine reset |
 | `-crwakeregrestore` | Experimental: after a wake, also copy the firmware's boot-time display registers back (display clocks and time bases, PLL bandgap, AUX pad calibration and PHY set-up, panel power pads, UNIPHY0 macro). Not what Linux does |
 | `-crnoauxprobe` | Skip the diagnostic native AUX read of DPCD 0 (Linux DC's register sequence, bypassing the VBIOS AUX table) at boot and after a wake |
-| `-crnosleeppause` | Keep reading GPU registers from CarrizoRed's watcher (disk log status, clock sampling, display checks, SMU mailbox) while the GPU sleeps; by default they pause from "will sleep" until the GPU is powered again, since a register read once Apple has powered the GPU down can stall the CPU |
+| `-crnosleeppause` | Keep reading GPU registers from UnifiedRed's watcher (disk log status, clock sampling, display checks, SMU mailbox) while the GPU sleeps; by default they pause from "will sleep" until the GPU is powered again, since a register read once Apple has powered the GPU down can stall the CPU |
 | `-crnosleeppoweroff` | Don't power the eDP panel off before sleep (VBIOS POWER_OFF with the panel's parameters, right after Apple's DPCD 0x600 = 2), as Linux's DC does at suspend |
 | `-crnowakefilter` | Don't cut the armed wake sources down at S3 entry. By default only the USB controllers, the lid and an ACPI power button (each by its `_PRW` GPE) stay armed, and PCIe WAKE# is off: macOS arms every `_PRW` device, and a PCIe port signalling as the machine goes down brought it straight back |
 | `-crnowakeremap` | Leave the FCH's USB wake lines alone: by default the wake lines of FCH USB controllers that don't exist (SciMap sources 25 and 26 on Stoney) are moved off the shared USB GPE at S3 entry, since one of them fired as the machine went down |
 | `-crnoehcid2` | Let the FCH EHCI (`1022:7908`) sleep in D3: by default it sleeps in D2, since AMD's EHCI doesn't signal PME properly from D3 (Linux works around the same erratum) |
-| `-crnobacklight` | Brightness: don't complete AppleBacklight's panel set-up. On Monterey and later its `AppleIntelPanel::setDisplay` matches the panel to the `Default` entry, then fails storing the match and returns false, so the panel gets no `brightness` parameter (no slider, no keys); CarrizoRed stores it and reports success. Also stops it giving the panel driver a `Default` entry when it has none |
-| `-crnoblupdate` | Brightness: don't latch the backlight PWM after Apple's VBIOS brightness call. DCE 11 double-buffers `BL_PWM_CNTL` behind `BL_PWM_GRP1_REG_LOCK`; the VBIOS changes the duty but nothing applies it, so the screen kept its brightness. CarrizoRed locks, rewrites, unlocks and waits, as Linux DC's `driver_set_backlight` does |
+| `-crnobacklight` | Brightness: don't complete AppleBacklight's panel set-up. On Monterey and later its `AppleIntelPanel::setDisplay` matches the panel to the `Default` entry, then fails storing the match and returns false, so the panel gets no `brightness` parameter (no slider, no keys); UnifiedRed stores it and reports success. Also stops it giving the panel driver a `Default` entry when it has none |
+| `-crnoblupdate` | Brightness: don't latch the backlight PWM after Apple's VBIOS brightness call. DCE 11 double-buffers `BL_PWM_CNTL` behind `BL_PWM_GRP1_REG_LOCK`; the VBIOS changes the duty but nothing applies it, so the screen kept its brightness. UnifiedRed locks, rewrites, unlocks and waits, as Linux DC's `driver_set_backlight` does |
 | `-crnodevinfo` | Don't record the iGPU as the built-in GPU in Lilu's shared `DeviceInfo`. Lilu recognises an AMD iGPU by its `device-id` property, which the Polaris spoof changes, so plugins looking for the built-in panel through it (BrightnessKeys: the brightness keys' ACPI notifications) found nothing |
 | `-crnomacgpu` | HDMI: leave AGDP's board-id lookup and the iGPU's properties alone. By default AGDP's `board-id` is read as `board-ix`, so it uses its `Default` policy instead of the SMBIOS model's (which kept the external port's framebuffer from getting a display), and the iGPU gets `built-in` and `AAPL,slot-name` like a Mac's own GPU. The same idea as WhateverGreen's `agdpmod=pikera` |
 | `-crnoddcfix` | HDMI: don't add the hardware I2C engine bit to DDC connectors' sense ids. Apple's `AtiBiosParser1` (ATOM object table rev 1.x, as on these APUs) reports the DDC line as line + 1 without bit `0x10`, and `BaffinHwI2cProxy` only uses the hardware I2C engine for `0x10 \| line`, so the EDID read never ran |
 | `-crnoddcprep` | HDMI: don't set the DDC line up for the hardware I2C engine before Apple's EDID read (`DC_I2C_DDCn_SPEED`/`SETUP` and the `DC_GPIO_DDCn` mask, as Linux DC does); without it the read timed out |
-| `-crnotmdsfix` | HDMI: leave Apple's TMDS (HDMI/DVI) transmitter and pixel clock calls as they are. CarrizoRed builds them as Linux DC does: the PHY clocked from the PLL the pixel clock actually went to (CarrizoRed remaps Apple's P2PLL to PPLL0, which DCE 11.0 uses), the HDMI connector object, not coherent, and the stream's encoder mode in SetPixelClock. Calls for the eDP panel aren't touched |
+| `-crnotmdsfix` | HDMI: leave Apple's TMDS (HDMI/DVI) transmitter and pixel clock calls as they are. UnifiedRed builds them as Linux DC does: the PHY clocked from the PLL the pixel clock actually went to (UnifiedRed remaps Apple's P2PLL to PPLL0, which DCE 11.0 uses), the HDMI connector object, not coherent, and the stream's encoder mode in SetPixelClock. Calls for the eDP panel aren't touched |
 | `-crnobootdisp` | HDMI: don't run the display set-up Linux DC's `init_hw` does at boot and before each display enable: the VBIOS EnableDispPowerGating INIT/DISABLE on both pipes and the display engine clock (FirmwareInfo's default, 847 MHz on the A9-9425, through SetPixelClock's DFS). Apple sets that clock through SetDCEClock, which these VBIOSes don't have, so it stayed at the 100 MHz the firmware left: enough for the panel, not for 1080p, and the HDMI monitor stayed black |
-| `-crnohpdfix` | HDMI: don't correct a hot-plug pin left waiting for the wrong edge. Each HPD pin interrupts only on connect or only on disconnect (`DC_HPD_INT_POLARITY`), and the driver has to flip it after each event, as Linux does; Apple's sometimes didn't after an unplug, so the next plug-in went unnoticed (Dell 3475). CarrizoRed checks the pins every 0.5 s and flips one that has been waiting for the state it's already in for 1 s |
+| `-crnohpdfix` | HDMI: don't correct a hot-plug pin left waiting for the wrong edge. Each HPD pin interrupts only on connect or only on disconnect (`DC_HPD_INT_POLARITY`), and the driver has to flip it after each event, as Linux does; Apple's sometimes didn't after an unplug, so the next plug-in went unnoticed (Dell 3475). UnifiedRed checks the pins every 0.5 s and flips one that has been waiting for the state it's already in for 1 s |
 | `-crnoehciwakefix` | At S3 entry, don't clear the FCH USB 2 hub's wake on connect, disconnect and over-current (EHCI config 0x84 bits 23:21; wake on a device's remote wake stays) or a stale EHCI PME_Status. With them set, the machine woke ~1 s after every S3 entry |
 | `-crtps1restore` | Experimental: after a wake, copy LVTMA_PWRSEQ_CNTL, the UNIPHY link controls, TMDP_REG3/5 and DIG_FE_CNTL from the boot's link training (TPS1) back just before Apple's training. A boot-time copy, not what Linux does |
 | `-crtmdprestore` | Experimental: after a wake, copy the UNIPHY macro registers' boot values back right after Apple's eDP transmitter ENABLE. A boot-time copy, not what Linux does |
@@ -291,11 +299,11 @@ controller off in `_PTS`, which wakes the machine at once. CarrizoRed does the r
 | `-crnoassr` | Re-enabling eDP ASSR in the panel (DPCD 0x10A) when Apple sets up the link |
 | `-crnoihfix` | Mirroring Apple's IH interrupt enable (Tonga `IH_RB_CNTL.ENABLE_INTR`) into Carrizo/Stoney's `IH_CNTL` |
 | `-crnoloadctl` | Setting `LoadAMDSupport` / `LoadController` on the iGPU when the graphics policy hasn't (needed for the controller to match) |
-| `-crnoaccel` | The acceleration stack (AMDRadeonX4000, HWServices/CAIL); otherwise CarrizoRed requests it once the display is up |
+| `-crnoaccel` | The acceleration stack (AMDRadeonX4000, HWServices/CAIL); otherwise UnifiedRed requests it once the display is up |
 | `-crnosdmafix` | Stoney: releasing Apple's second sDMA engine and starting sDMA0 alone |
 | `-crnoppdummy` | Stoney/Carrizo: don't set `PP_PhmUseDummyBackEnd` (PowerPlay has no back end for these APUs; without the Dummy one, `initializePowerPlay` fails and the accelerator never powers up); also turns PowerPlay off |
 | `-crnosoftpptable` | Stoney/Carrizo: don't hand PowerPlay the VBIOS's PowerPlayInfo table as `PP_PhmSoftPowerPlayTable` (HWLibs' own VBIOS lookup appears to fail on the APU, and PowerPlay then fails to initialise) |
-| `-crnodirectucode` | Stoney/Carrizo: leave CAIL's `DisableCailLoadUcode` on (the default). CarrizoRed clears it so CAIL reserves its micro-engine VRAM block, which the SMU microcode loader extends and uses; with the flag on, nothing loads the microcode and the accelerator's power-up waits forever |
+| `-crnodirectucode` | Stoney/Carrizo: leave CAIL's `DisableCailLoadUcode` on (the default). UnifiedRed clears it so CAIL reserves its micro-engine VRAM block, which the SMU microcode loader extends and uses; with the flag on, nothing loads the microcode and the accelerator's power-up waits forever |
 | `-crvideo` | Video (on hold, for development): have the SMU power UVD and VCE up with CAIL's UVD power gating off, route AppleGVA to the AMD decoder, and refuse UVD and VCE sessions, so video stays in software |
 | `-cruvd` | With `-crvideo`: let UVD decode sessions through. **Hangs the GPU** until address translation exists (see docs/VIDEO.md) |
 | `-cruvdhevc` | With `-crvideo`: keep HEVC decode published to AppleGVA (withdrawn by default; Stoney can't decode the 10-bit aerial wallpapers) |
@@ -304,9 +312,9 @@ controller off in `_PTS`, which wakes the machine at once. CarrizoRed does the r
 | `-crnogva` | With `-crvideo`: leave AppleGVA's decoder choice alone (no `hwgva-id` board-id redirect) |
 | `-crnosrcfix` | Don't apply the shader fix to the source of Metal's SDMA re-uploads (fixed shaders can then revert for some frames) |
 | `-crnosdmawatch` | Don't read SDMA submissions at all (also turns the source fix off) |
-| `-crnovmmcheck` | Leave Apple's `AMDHWVMM::endVMPTUpdate` in place (CarrizoRed's copy panics with the black-box report when the GPU's page-table updater has no SDMA channel, instead of an Apple page fault without one) |
+| `-crnovmmcheck` | Leave Apple's `AMDHWVMM::endVMPTUpdate` in place (UnifiedRed's copy panics with the black-box report when the GPU's page-table updater has no SDMA channel, instead of an Apple page fault without one) |
 | `-crmm` | Also power up the accelerator's UVD, VCE and SAMU engines. On the APU those blocks stay power-gated without a real PowerPlay back end, and programming them can hang the bus, so by default their power-up is skipped (the engines themselves stay) |
-| `-crnosmuload` | Stoney: don't have the SMU load the RLC/CP/SDMA microcode (CarrizoRed builds the SMU's task table in VRAM from the images in HWLibs, as Linux `smu8_smumgr` does); direct register loading alone doesn't work on these APUs |
+| `-crnosmuload` | Stoney: don't have the SMU load the RLC/CP/SDMA microcode (UnifiedRed builds the SMU's task table in VRAM from the images in HWLibs, as Linux `smu8_smumgr` does); direct register loading alone doesn't work on these APUs |
 | `-crnoihmove` | With the accelerator: leave the interrupt ring in system memory, where the GPU can no longer reach it once VRAM is moved to GPU address 0 (an interrupt storm, and the accelerator's work never completes) |
 | `-crnohwinfofix` | Don't fill the zero clocks (no memory clock on an APU, none from the Dummy PowerPlay back end) in the hardware info the Metal driver asks for; without them every Metal device creation fails |
 | `-crnohwinfospoof` | Let the Metal driver's hardware info carry the real device ID (read from config space) instead of the spoofed Polaris one |
@@ -320,12 +328,12 @@ controller off in `_PTS`, which wakes the machine at once. CarrizoRed does the r
 | `-crnoscpatch` | Don't patch Apple's Metal shader compiler (`libSC.dylib`, in `MTLCompilerService`) to use its Stoney back end (`SCGfx81Info`, instruction set 0x1E) instead of the generic GFX 8.0 one it picks for every chip the Metal driver reports as VI |
 | `-crnosmallprim` | Let Apple's Metal driver enable the small-primitive filter (`PA_SU_SMALL_PRIM_FILTER_CNTL`), a Polaris feature Stoney doesn't get from Mesa |
 | `-crnowalkfence` | Keep the Metal driver's `PA_SC_MODE_CNTL_1` walk fence size 3 (Mesa uses 2 on 2-pipe chips such as Stoney) |
-| `-crdcc` | Let Apple's Metal driver give textures delta colour compression (DCC); by default CarrizoRed turns it off |
+| `-crdcc` | Let Apple's Metal driver give textures delta colour compression (DCC); by default UnifiedRed turns it off |
 | `-crnointerpfix` | Don't rewrite pixel shaders whose `v_interp_p1_f32` writes the VGPR it reads (wrong on Stoney's 16-bank LDS; Apple's compiler emits it) |
 | `-crnointerpsubmit` | Run the interpolation fix once a second from a thread instead of at every submission (content drawn before it gets to a shader stays wrong; no VGPR raises) |
 | `-crnointerpbump` | Don't give a shader more VGPRs when it has no free register for the fix (those hazards are left alone) |
 | `-crnostallpanic` | Don't panic with the black-box report when the GPU stops executing commands for 10 s |
-| `-crats` | Let CAIL turn on the iGPU's PCIe ATS, PRI and PASID capabilities (IOMMUv2 features; macOS has no AMD IOMMU driver to answer them), which CarrizoRed otherwise leaves off |
+| `-crats` | Let CAIL turn on the iGPU's PCIe ATS, PRI and PASID capabilities (IOMMUv2 features; macOS has no AMD IOMMU driver to answer them), which UnifiedRed otherwise leaves off |
 | `-crnoarbfix` | Leave Apple's Polaris memory-arbiter tweak (`MC_ARB_MISC2` `SEQ_RDY_POP_IDLE` / `POP_IDLE_REPLAY`) in `AMDBaffinHardware::powerUp`; on the APU the arbiter is shared with the CPU |
 | `-crnorlcreset`, `-crrlcreset` | With direct microcode loading: when CAIL halts the RLC to load its microcode, `-crnorlcreset` leaves coarse-grain clock gating and power gating alone (otherwise both are turned off); `-crrlcreset` also soft-resets the RLC again (CAIL already does, before its RLC set-up) |
 | `-crgating` | Keep CAIL's clock/power-gating settings: when the RLC starts (otherwise MGCG overrides forced, CP/RLC memory light sleep and CP power gating off) and after start-up (otherwise `Cail_Stoney_EnablePowerGating`, `Stoney_UpdateGfxPowerGating` and `Stoney_EnableCpPowerGating` do nothing). With CAIL's power gating the GPU hangs after idling |
@@ -341,18 +349,18 @@ and on hot-plug, and the desktop moving back to the panel on unplug. No boot arg
 missing, in the order they were found (each has its own off switch above):
 
 1. **Port policy:** AGDP, Apple's graphics policy, looks the SMBIOS model up and applies its port policy, which keeps
-   the external port off. CarrizoRed makes it use its `Default` policy (`-crnomacgpu`).
+   the external port off. UnifiedRed makes it use its `Default` policy (`-crnomacgpu`).
 2. **DDC (EDID):** Apple's ATOM parser for these VBIOSes reports the DDC line without the hardware I2C engine bit, so
    no EDID was read (`-crnoddcfix`), and the DDC pads need setting up for the engine first, as Linux DC does
    (`-crnoddcprep`).
 3. **TMDS transmitter:** Apple's calls clocked the PHY from a PLL DCE 11.0 doesn't use and set the wrong connector and
-   encoder mode; CarrizoRed builds them as Linux DC does (`-crnotmdsfix`).
+   encoder mode; UnifiedRed builds them as Linux DC does (`-crnotmdsfix`).
 4. **Display engine clock and power gating:** with all of that, the monitor woke but stayed black: the display engine
    clock was still the firmware's 100 MHz, too slow for 1080p, and Apple has no way to set it on these VBIOSes (no
-   SetDCEClock). HDMI first worked after a wake, whose restore sets the clock; CarrizoRed now does the same at boot and
+   SetDCEClock). HDMI first worked after a wake, whose restore sets the clock; UnifiedRed now does the same at boot and
    before every display enable (`-crnobootdisp`).
 5. **Replug:** on the Dell, after an unplug Apple's driver sometimes left the hot-plug pin waiting for another unplug,
-   so plugging back in did nothing; CarrizoRed points the pin at the next plug-in, as Linux does (`-crnohpdfix`).
+   so plugging back in did nothing; UnifiedRed points the pin at the next plug-in, as Linux does (`-crnohpdfix`).
 
 Still to do: HDMI audio, and DisplayPort outputs on machines that have them.
 
@@ -365,6 +373,7 @@ Still to do: HDMI audio, and DisplayPort outputs on machines that have them.
 | `-crbeta` | Allow loading on macOS versions newer than Tahoe |
 | `crpanicat=N` | Panic on purpose N s after the controller loads, with the black-box report (see Installing) |
 | `-crdisplaydiag` | Keep the display sections (VBIOS calls, DPCD, register diff, pixels) in the black box on accelerated boots |
+| `-crplatprobe` | Platform probe (from KaberiRed): every 250 ms prints the TSC/HPET/PM-timer drift, local APIC, ACPI and I/O APIC state, for early whole-machine freezes (the Kabini laptops). Read-only; the I/O ports are the HP test laptops' (docs/gcn2/TEST_MACHINES.md). `crprobepanic=N` panics from the probe at N s |
 | `crsmustep=N` | Stop the SMU microcode load after step N (1 region written … 7 RLC started) and panic with the report |
 | `crstopat=<stage>[#n]` | Stop on entering a traced stage (its n-th call) and panic with the report, e.g. `crstopat=pm4.start` |
 | `-crnohwlibsprobe` | Skip the test write into HWLibs' code at `setupCAIL` (used to check whether patches can land) |
@@ -387,7 +396,7 @@ Still to do: HDMI audio, and DisplayPort outputs on machines that have them.
 | `-crnosclkdpm` | Don't start the SMU's graphics clock scaling |
 | `crsclkmin=N`, `crsclkmax=N` | The lowest and highest clock level (defaults: level 2, 400 MHz, and the top level; on the A9-9425 levels 0–7 are 200–900 MHz) |
 | `-crnoclkread` | Don't read the SMU's clock table into the report |
-| `-crnodisklog` | Don't write the per-boot log `/private/var/log/CarrizoRed-<time>.log` (GPU, SMU and clock state every second, SMU messages, draw census, black-box reports; written straight to disk, so it survives a freeze) |
+| `-crnodisklog` | Don't write the per-boot log `/private/var/log/UnifiedRed-<time>.log` (GPU, SMU and clock state every second, SMU messages, draw census, black-box reports; written straight to disk, so it survives a freeze) |
 | `-crnocensus` | Don't record each distinct draw set-up in the disk log |
 | `-crnomodel` | Leave the iGPU's `model` alone (by default it is named from the CPU brand string, e.g. "AMD Radeon R5 Graphics", or a `model` from DeviceProperties is kept) |
 | `-crwakemark` | Keep the sleep and wake events in the NVRAM variable `CR-wake`, from "will sleep" until 30 s after the wake, with the CPU's sleep and resume (`IOCPUSleepKernel`) and the power manager's phases (`IOPMrootDomain::tracePoint`). For a wake that leaves nothing in the disk log; forced flash writes, at most 100 per sleep. See [docs/SLEEP.md](docs/SLEEP.md) |
@@ -402,25 +411,27 @@ Still to do: HDMI audio, and DisplayPort outputs on machines that have them.
 ## Layout
 
 ```
-CarrizoRed/
+UnifiedRed/
   kern_start.cpp   Lilu plugin configuration / entry point
   kern_cr.*        Driver logic: device detection, display and accelerator patches, tracing, black box
   kern_asic.hpp    Device IDs and register offsets (from Linux amdgpu headers)
   kern_vbios.*     VBIOS from the ACPI VFCT table → "ATY,bin_image" (read first by AMDSupport)
   kern_sigs.hpp    Byte signatures for the HWLibs functions on Sonoma and Ventura (stripped there)
+  kern_platprobe.* Platform probe for early boot freezes (-crplatprobe, from KaberiRed)
   kern_info.c      kmod_info declaration
   Info.plist.in    Bundle template (filled in by the Makefile)
 tools/XHCIProbe/   Diagnostic kext for that controller (state, interrupts, link states)
 docs/
   ROADMAP.md               Phase plan
   TEST_MACHINES.md         Test hardware and the boot-by-boot bring-up log
-  SLEEP.md                 Sleep and wake: what S3 resets, CarrizoRed's resume steps, open issues
+  SLEEP.md                 Sleep and wake: what S3 resets, UnifiedRed's resume steps, open issues
   APPLE_KEXTS.md           Getting Apple's AMD kexts from a KDK on Windows, and what's inside them
   CARRIZO_VS_POLARIS.md    Where Linux amdgpu treats Carrizo differently from Polaris
   DCE11_REGISTER_DIFF.md   DCE 11.0 vs 11.2 display register diff (full data in docs/data/)
   OLDER_APUS.md            GCN 2 APUs (Kaveri, Kabini, Mullins): the plan and the measurements behind it
   PHASE0.md                Hardware / environment / reverse-engineering checklist
   opencore/                SSDTs and the USB map for the D509BA
+  gcn2/                    From KaberiRed: Kabini vs Bonaire, Monterey's GCN 2 kexts, the Kabini test laptops
 scripts/
   bootstrap.sh             Fetch Lilu + MacKernelSDK (macOS / CI)
   build_efi_d509ba.py      Build the D509BA's OpenCore EFI (and test variants)
@@ -429,6 +440,11 @@ scripts/
   siggen.py                Signatures for HWLibs functions, checked against stripped builds (Sonoma)
   featmatch.py, addrsigs.py  Match functions across recompiled builds by their constants; signatures from those (Ventura)
   dce_regdiff.py           Diff two Linux DCE register header sets
+  fetch_macos.py           Files from Apple's macOS installer over HTTP range requests (no Mac, no KDK)
+  machotool.py, match_functions.py  Mach-O symbols/disassembly CLI; name functions in a stripped build
+  dmpstore.py              Decode an NVRAM dump: CR-progress and AAPL,PanicInfo
+  build_efi_hp.py          OpenCore EFI for the HP Kabini test laptops
+  collect_linux_info*.sh   Reference data from a Linux live session (the _gcn2 one for Kabini/Kaveri)
 ```
 
 ## Licensing notes
@@ -447,6 +463,6 @@ scripts/
 
 ## License
 
-BSD-3-Clause, see [LICENSE](LICENSE). CarrizoRed builds on [Lilu](https://github.com/acidanthera/Lilu) (BSD-3-Clause)
+BSD-3-Clause, see [LICENSE](LICENSE). UnifiedRed builds on [Lilu](https://github.com/acidanthera/Lilu) (BSD-3-Clause)
 and uses register definitions and behaviour documented in Linux `amdgpu` (MIT). No code from NootedRed, LegacyRed or
 other projects under restrictive licences is used, and no Apple binaries are included.

@@ -1,6 +1,6 @@
 //
 //  kern_asic.hpp
-//  CarrizoRed
+//  UnifiedRed
 //
 //  Hardware constants for Carrizo-family (GFX8 / VI) APUs.
 //  Register offsets are dword indices into the MMIO BAR (BAR5), as in Linux's

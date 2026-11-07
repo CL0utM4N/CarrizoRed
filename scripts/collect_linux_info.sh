@@ -1,11 +1,11 @@
 #!/bin/bash
 #
-#  Collect reference data for CarrizoRed from a Linux live session on the test machine.
+#  Collect reference data for UnifiedRed from a Linux live session on the test machine.
 #  Read-only: nothing on the machine is changed.
 #
 #    sudo bash collect_linux_info.sh
 #
-#  Produces carrizored-dump-<host>-<date>.tar.gz next to this script (or in $HOME if that
+#  Produces unifiedred-dump-<host>-<date>.tar.gz next to this script (or in $HOME if that
 #  location is read-only), containing:
 #    - hardware: lspci (incl. the GPU's full config space), dmidecode, CPU, memory, USB
 #    - ACPI tables (DSDT, SSDTs, VFCT, ...), also used to build the OpenCore EFI
@@ -36,7 +36,7 @@ base="$here"
 [ -w "$base" ] || base="${SUDO_USER:+/home/$SUDO_USER}"
 [ -n "$base" ] && [ -w "$base" ] || base="/root"
 
-name="carrizored-dump-$(hostname)-$(date +%Y%m%d-%H%M)"
+name="unifiedred-dump-$(hostname)-$(date +%Y%m%d-%H%M)"
 out="$base/$name"
 mkdir -p "$out"/{acpi,gpu}
 echo "Collecting into $out"

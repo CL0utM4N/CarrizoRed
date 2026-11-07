@@ -1,4 +1,4 @@
-# Generate kern_sigs.hpp: masked byte signatures for the HWLibs functions CarrizoRed uses, unique (or the same k-th
+# Generate kern_sigs.hpp: masked byte signatures for the HWLibs functions UnifiedRed uses, unique (or the same k-th
 # match) in the symbolised reference binary and in every stripped target, plus RIP-relative references to data symbols.
 # usage: siggen.py <kern_cr.cpp> <out.hpp> <ref HWLibs> <target HWLibs>...
 # e.g. ref = the 15.8.1 KDK's AMDRadeonX4000HWLibs, targets = the stripped ones of older KDKs (scripts/extract_kdk.py).

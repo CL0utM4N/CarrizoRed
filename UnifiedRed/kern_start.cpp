@@ -1,6 +1,6 @@
 //
 //  kern_start.cpp
-//  CarrizoRed
+//  UnifiedRed
 //
 
 #include <Headers/kern_api.hpp>

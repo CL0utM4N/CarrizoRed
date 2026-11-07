@@ -2,7 +2,7 @@
 """
 Build an OpenCore EFI for the ASUS VivoBook 15 D509BA (A9-9425, Stoney Ridge) test laptop.
 
-    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe] [--carrizored [--spoof [--accel] [--minimal]]] [--args="..."] [--oclog] [--nousbmap]
+    python scripts/build_efi_d509ba.py <work dir> [--gux] [--xhciprobe] [--unifiedred [--spoof [--accel] [--minimal]]] [--args="..."] [--oclog] [--nousbmap]
 
 <work dir> must contain:
     unpacked/OpenCore-<ver>-RELEASE/        OpenCorePkg release zip, extracted
@@ -68,8 +68,8 @@ KEXTS = [  # (bundle path inside its release folder, executable, comment)
 GUX_KEXT = ("GUX/GenericUSBXHCI.kext", "GenericUSBXHCI", "Experimental: AMD APU XHCI init workaround")
 # Optional (--xhciprobe): tools/XHCIProbe diagnostic kext from CI, unpacked to unpacked/XHCIProbe/.
 XHCIPROBE_KEXT = ("XHCIProbe/XHCIProbe.kext", "XHCIProbe", "Diagnostic: log/attempt xHCI start before AppleUSBXHCIPCI")
-# Optional (--carrizored): the CarrizoRed kext from CI (CarrizoRed-*-Release.zip), unpacked to unpacked/CarrizoRed/.
-CARRIZORED_KEXT = ("CarrizoRed/CarrizoRed.kext", "CarrizoRed", "CarrizoRed (Lilu plugin, iGPU)")
+# Optional (--unifiedred): the UnifiedRed kext from CI (UnifiedRed-*-Release.zip), unpacked to unpacked/UnifiedRed/.
+UNIFIEDRED_KEXT = ("UnifiedRed/UnifiedRed.kext", "UnifiedRed", "UnifiedRed (Lilu plugin, iGPU)")
 
 # HfsPlus.efi (Apple's HFS+ driver, from github.com/acidanthera/OcBinaryData Drivers/, in downloads/) instead of
 # OpenCore's OpenHfsPlus.efi, which is much slower: booting the full installer's HFS+ partition, the firmware took 112 s
@@ -137,11 +137,11 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     with_gux = "--gux" in sys.argv[1:]
     with_probe = "--xhciprobe" in sys.argv[1:]
-    with_cr = "--carrizored" in sys.argv[1:]
+    with_cr = "--unifiedred" in sys.argv[1:]
     with_spoof = "--spoof" in sys.argv[1:]
     with_oclog = "--oclog" in sys.argv[1:]
     if with_spoof and not with_cr:
-        die("--spoof needs --carrizored (it injects the VBIOS the Polaris drivers need)")
+        die("--spoof needs --unifiedred (it injects the VBIOS the Polaris drivers need)")
     if len(args) != 1:
         sys.exit(__doc__)
     work = Path(args[0]).resolve()
@@ -200,8 +200,8 @@ def main():
     # --- DeviceProperties ---------------------------------------------------------------------------
     # Precaution while installing: keep Apple's AMDSupport off the unsupported Stoney iGPU. AMDSupport matches any
     # display-class 1002:xxxx device (IOPCIMatch 0x00001002&0x0000FFFF). (The first install panics turned out to be
-    # AppleIntelMCEReporter, not AMDSupport; this stays until CarrizoRed handles the iGPU.) IOPCIMatch compares the vendor-id *property*, so overriding it stops the
-    # match; the class code is left alone so the boot framebuffer keeps working. Remove once CarrizoRed handles the iGPU.
+    # AppleIntelMCEReporter, not AMDSupport; this stays until UnifiedRed handles the iGPU.) IOPCIMatch compares the vendor-id *property*, so overriding it stops the
+    # match; the class code is left alone so the boot framebuffer keeps working. Remove once UnifiedRed handles the iGPU.
     cfg["DeviceProperties"]["Add"] = {
         "PciRoot(0x0)/Pci(0x1,0x0)": {"vendor-id": bytes.fromhex("FFFF0000")},
     }
@@ -214,7 +214,7 @@ def main():
 
     # --- Kernel -----------------------------------------------------------------------------------
     adds = []
-    extra = ([GUX_KEXT] if with_gux else []) + ([XHCIPROBE_KEXT] if with_probe else []) +         ([CARRIZORED_KEXT] if with_cr else [])
+    extra = ([GUX_KEXT] if with_gux else []) + ([XHCIPROBE_KEXT] if with_probe else []) +         ([UNIFIEDRED_KEXT] if with_cr else [])
     for pattern, exe, comment in KEXTS + extra:
         src = one(unpacked, pattern)
         if "/PlugIns/" not in pattern:

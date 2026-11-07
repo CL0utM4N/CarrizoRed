@@ -58,8 +58,8 @@ In Ghidra (or IDA), for each kext note the function addresses and what they do:
 
 ## First test boots
 
-1. Boot with `CarrizoRed.kext` (debug) + Lilu (debug), **no** device-id spoof. Collect the log lines and
-   `ioreg` properties (`CarrizoRed,vram-mb` etc.) and send them over.
+1. Boot with `UnifiedRed.kext` (debug) + Lilu (debug), **no** device-id spoof. Collect the log lines and
+   `ioreg` properties (`UnifiedRed,vram-mb` etc.) and send them over.
 2. Add DeviceProperties for `PciRoot(0x0)/Pci(0x1,0x0)`: `device-id` = `<EF 67 00 00>`. Expect a panic or
    hang in Apple's kexts — that failure point is the starting point for Phase 2. Keep a USB with the
    unspoofed config to recover.

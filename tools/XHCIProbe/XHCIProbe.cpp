@@ -1,6 +1,6 @@
 //
 //  XHCIProbe.cpp
-//  CarrizoRed tools
+//  UnifiedRed tools
 //
 //  Diagnostic kext for xHCI controllers that macOS fails to start ("reset failed").
 //

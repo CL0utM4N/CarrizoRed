@@ -1,6 +1,6 @@
 //
 //  kern_cr.hpp
-//  CarrizoRed
+//  UnifiedRed
 //
 
 #ifndef kern_cr_hpp

@@ -125,7 +125,7 @@ Carrizo caps are loaded. It then installs the Carrizo implementations into the a
 **Conclusion:** CAIL's whole chip identity follows from three inputs in `info` (adapter `+0x178`): device ID
 (`+0x04`), PCI revision (`+0x10`) and internal revision (`+0x1C`). With `0x9874` there, CAIL selects
 `CARRIZO_A1`, family `0x87`, and the Carrizo function table, whatever the rest of the driver believes the device is.
-`_get_asic_caps_set_from_table` is an exported symbol, so CarrizoRed can hook it (Lilu) and force the real device
+`_get_asic_caps_set_from_table` is an exported symbol, so UnifiedRed can hook it (Lilu) and force the real device
 ID and revision before it runs, if the input turns out to be the spoofed ID.
 
 **4. Where the inputs come from.** `_CAILInitialize(adapter, initInfo)` checks `*adapter == 0x1690`, then:
@@ -172,9 +172,9 @@ What still has to be checked in Ghidra:
    copies `min(length, 0x10000)` bytes. The result of `validateAtomBiosImage` is **ignored** on this path.
 2. Only if that returned 0: `readPciAtomBiosImage` (PCI expansion ROM), which must also pass `validateAtomBiosImage`.
 
-APUs have no expansion ROM, so CarrizoRed copies the VBIOS from the ACPI VFCT table into `ATY,bin_image`
-([`kern_vbios.cpp`](../CarrizoRed/kern_vbios.cpp)). It can also be injected by hand through OpenCore
-`DeviceProperties` (a Linux `amdgpu_vbios` dump), in which case CarrizoRed leaves it alone.
+APUs have no expansion ROM, so UnifiedRed copies the VBIOS from the ACPI VFCT table into `ATY,bin_image`
+([`kern_vbios.cpp`](../UnifiedRed/kern_vbios.cpp)). It can also be injected by hand through OpenCore
+`DeviceProperties` (a Linux `amdgpu_vbios` dump), in which case UnifiedRed leaves it alone.
 
 ### Parsers
 `AtiBiosParser1` handles the `atombios.h` format (`_ATOM_I2C_RECORD`, `_ATOM_HPD_INT_RECORD`): GCN 1–4, including
@@ -255,7 +255,7 @@ and the PLL index the Baffin assigner hands out (sent raw as `ucPpll`). Carrizo 
   generator per pipe, and over `getNumLineBuffers()` (`+0x918`) for the line buffers. Both are constant getters in
   `BaffinSharedController`: `getDisplayLimit` = 6, `getNumLineBuffers` = 6. Neighbours: `getFrameBufferLimit` (`+0x900`)
   returns the byte at `this+0x311f2` (framebuffer count, passed to the connector assigner), `getDigLimit` (`+0x908`) =
-  6, `getNumPixelClocks` (`+0x910`) = 7 (passed to the PLL assigner). **CarrizoRed routes `getDisplayLimit` and
+  6, `getNumPixelClocks` (`+0x910`) = 7 (passed to the PLL assigner). **UnifiedRed routes `getDisplayLimit` and
   `getNumLineBuffers` to 3 (Carrizo) / 2 (Stoney)** (`-crnopipes` disables it). The PLL count is still to check.
 - `BaffinSharedController::initializeResources()` has no per-pipe loop; it maps register sub-ranges of a PCI BAR
   (`[0, 0xC0000)`, `+0x40000`, `+0x100000`, `[0, 0x300000)`; check which BAR before the spoof test fails there).
@@ -284,7 +284,7 @@ out the lowest free index (`0xFE` = none). The index reaches the hardware twice:
 `hwProgramPpllUsingBios` → `AtomBiosProxy::setPixelClock` (`ActiveConnectorInfo +0x2E`, CRTC at `+0x2D`), and in
 `AMD9500Controller::hwSetCrtcToPixelClock(crtc, pll, params)`, which writes it into
 `CRTCn_PIXEL_RATE_CNTL[1:0]` (byte `0x500 + 0x10·crtc`) and sets bit 0 of a per-PLL Polaris resync register
-(bytes `0x400/0x404/0x408/0x40C/0x430/0x4F8` = dword `0x100–0x103`, `0x10C`, `0x13E`). CarrizoRed passes 2 to
+(bytes `0x400/0x404/0x408/0x40C/0x430/0x4F8` = dword `0x100–0x103`, `0x10C`, `0x13E`). UnifiedRed passes 2 to
 `createPllAssigner` (so `0x13E` is unreachable) and remaps Apple 1 → ATOM 2 in both places (`-crnoplllimit`,
 `-crnopllremap`). `getDigLimit()` (6, used by `doConnectionsProbe`) is routed to 3. Earlier notes:
 
@@ -323,12 +323,12 @@ on a Mac. Attribute 3 with flags: bit 0 sets `LoadAMDSupport` + `LoadController`
 `LoadHWServices` + `LoadAccelerator`; then `registerService()` (vtable `+0x5b0`; `+0x278` is `setProperty(char*, bool)`).
 Nothing requested it for the iGPU, so the controller never matched, and since the wrangler holds the iGPU's
 `IOFramebuffer` match category, the boot framebuffer driver couldn't attach either: the GUI ran with no display and the
-panel kept the boot console. CarrizoRed now sets `LoadAMDSupport` + `LoadController` and re-registers the iGPU once the
+panel kept the boot console. UnifiedRed now sets `LoadAMDSupport` + `LoadController` and re-registers the iGPU once the
 wrangler is attached (`-crnoloadctl` disables it).
 
 `AMD9500Controller` reads its `CFG_*` options with `ATIController::getConfigProperty` from the personality's
 `aty_config` (and per-framebuffer `ATY,<name>` overrides). `CFG_NON_ZERO_MC_LOC` is off for Polaris, so `ATY,vram_base`
-would be 0; CarrizoRed forces it on so the base comes from `AtiAsicInfo::getFbLocationBase()` (`-crnomcloc` disables).
+would be 0; UnifiedRed forces it on so the base comes from `AtiAsicInfo::getFbLocationBase()` (`-crnomcloc` disables).
 
 ### AMD9500Controller start-up on Stoney (spoof boots 3–4)
 `ATIController::start` → `AMD9500Controller::initializeResources` fails with `0xe00002c9`. Inside it,
@@ -337,13 +337,13 @@ already up (so no ASIC_Init), but `ATIController::TestVRAM(PCI_REG_INDEX 7, fals
 of `this+0x31332`). Region 7 is the 3 MB sub-range mapped at offset 0 in `BaffinSharedController::initializeResources`;
 the boot console ghosted while it ran, so it writes test patterns into the displayed memory. The other source of the
 same error, `createAsicInfo` (`AtiAsicInfo::initWithController` → `ASIC_INFO__BAFFIN::populate{DeviceInfo,FbLocation,
-MemoryConfig}`), wasn't reached. CarrizoRed now reports TestVRAM as passed (logging the real result; `-crnovramtest`
+MemoryConfig}`), wasn't reached. UnifiedRed now reports TestVRAM as passed (logging the real result; `-crnovramtest`
 disables) to see what fails next.
 
 ## Acceleration (`AMDRadeonX4000`) on Stoney (Sequoia 15.8.1 KDK, 2026-10-12)
 
 **Loading.** Both personalities need a property on the iGPU: HWServices `IOPropertyMatch {LoadHWServices}`, the
-accelerator `{LoadAccelerator}` (set by `AtiGpuWrangler::vendor_doDeviceAttribute` flag bit 1 on a Mac). CarrizoRed now
+accelerator `{LoadAccelerator}` (set by `AtiGpuWrangler::vendor_doDeviceAttribute` flag bit 1 on a Mac). UnifiedRed now
 sets both with `LoadController` unless `-crnoaccel`.
 
 **HWLibs / CAIL.** `AMDRadeonX4000_AMDRadeonHWServicesPolaris::getMatchProperty` picks the HWLibs plug-in from a table of
@@ -356,23 +356,23 @@ power gating and hang detection. Since CAIL reads the device ID from config spac
 
 **Accelerator.** `AMDBaffinGraphicsAccelerator` (← `AMDVIGraphicsAccelerator`) creates `AMDBaffinHardware`
 (← `AMDVIHardware` ← `AMDHardware`). Its `getDeviceType` compares the *config-space* device ID with Polaris IDs, so
-Stoney gets type 0. Polaris 11 assumptions that CarrizoRed patches on Stoney:
+Stoney gets type 0. Polaris 11 assumptions that UnifiedRed patches on Stoney:
 - `AMDBaffinHardware::allocateHWEngines` fills the engine array at `+0x3B0`: PM4 (`+0x3B0`), sDMA0 (`+0x3B8`), sDMA1
   (`+0x3C0`), UVD 6.3 (`+0x3D8`), VCE 3.4 (`+0x3E8`), SAMU (`+0x400`). Stoney has one sDMA. `initializeHWEngines` (11
   slots) and `getHWChannel` skip empty slots, but `AMDHardware::startHWEngines` starts `+0x3B8` and `+0x3C0` and fails if
-  either is missing. CarrizoRed releases sDMA1 and starts sDMA0 alone, setting the same status bit (bit 9 of the word
+  either is missing. UnifiedRed releases sDMA1 and starts sDMA0 alone, setting the same status bit (bit 9 of the word
   at `+8` of the block returned by `(this+0x18)->vtable[0x178]`).
 - `AMDBaffinHardware::setupAndInitializeHWCapabilities` sets `+0x64` = 2 shader engines, `+0x6C` = 1 SH per SE,
   `+0xA0` = 8 CUs per SH (Ellesmere 4/1/9), then `AMDVIHardware`'s version reads `GB_ADDR_CONFIG` (0x263E),
   `PA_SC_RASTER_CONFIG(_1)` (0xA0D4/5) and the active-CU bitmaps from CAIL (query 3) into `+0x70…`, and the minimum
-  active CUs into `+0xA4`. CarrizoRed sets 1 SE and `+0xA0` = `+0xA4` afterwards.
+  active CUs into `+0xA4`. UnifiedRed sets 1 SE and `+0xA0` = `+0xA4` afterwards.
 - Tiling: `AMDHWAlignManager::init` takes its configuration from the hardware interface at run time (AddrLib), i.e.
   from what CAIL programmed for Stoney, so the kernel side should follow the real 2-pipe layout. User space is unchecked.
 - GPU VM: `AMDVIVMM::getPTEValue(level, addr, flags, fragment)` = `addr & 0xFFFFFFF000 | flags` (bit 0 valid, bit 1
   system); `getPDEValue` = `addr & 0xFFFFFFFFC0 | 1`. Bulk updates go through sDMA:
   `AMDHWVMContext::updateContiguousPTEsWithDMAUsingAddr(dst, count, addr, flagsTemplate, increment)`, with the
   template from `getPTE/PDEValue(…, 0, …)`. On an APU local entries need the carve-out's physical address
-  (`MC_VM_FB_OFFSET << 22`, Linux `gmc_v8_0_get_vm_pde` / `vram_base_offset`), so CarrizoRed converts MC addresses
+  (`MC_VM_FB_OFFSET << 22`, Linux `gmc_v8_0_get_vm_pde` / `vram_base_offset`), so UnifiedRed converts MC addresses
   (inside `MC_VM_FB_LOCATION`) and FB offsets in all three. The black box records which form Apple actually uses.
 - Not handled yet: BAR0 (256 MB) is smaller than the 512 MB carve-out (CPU mappings of VRAM above 256 MB); UVD/VCE/SAMU
   on Stoney (UVD 6.2, VCE 3.4, no GPUVM for UVD/VCE on APUs); power management (SMU8 vs SMU7 messages); user space.
@@ -382,10 +382,10 @@ Stoney gets type 0. Polaris 11 assumptions that CarrizoRed patches on Stoney:
 What stood between `accel.start` and a running command processor, in the order it was found. Each item has a
 boot-arg to undo it (see the README).
 
-| Step | Polaris assumption / gap | CarrizoRed |
+| Step | Polaris assumption / gap | UnifiedRed |
 |---|---|---|
 | `createAccelChannels` | spreads sDMA channels over sDMA0 and sDMA1, uses `getHWChannel` unchecked | sDMA1 lookups return sDMA0's channel |
-| `BaffinPowerPlayManager::initialize` | `CFG_NO_PP` was forced by CarrizoRed itself (display-era workaround) | PowerPlay on with acceleration |
+| `BaffinPowerPlayManager::initialize` | `CFG_NO_PP` was forced by UnifiedRed itself (display-era workaround) | PowerPlay on with acceleration |
 | `PHM_Initialize` | no back end for family 0x87; the VI path (Tonga table parser, Polaris SMU7 back end) fails | `PP_PhmUseDummyBackEnd` answered as 1 in `PECI_ReadRegistry` (the iGPU property reads back as 0); VBIOS PowerPlayInfo (rev 6.1) as `PP_PhmSoftPowerPlayTable` |
 | `Stoney_LoadRlcUcode` | `DisableCailLoadUcode` (CAIL flags `+0x6F0` bit 21, default 1) leaves the RLC/CP/SDMA microcode to the SMU, which the Dummy back end never asks | flag cleared: CAIL loads the microcode itself (as Linux `fw_load_type=0`); the embedded Stoney RLC/CE/PFP/ME/MEC images are byte-identical to linux-firmware's |
 | GPU addresses | `AMDRadeonX4000` assumes VRAM at MC 0 (system aperture `[0, GART)`, GART at 0x20000000) and never reads `MC_VM_FB_LOCATION`; the firmware maps the carve-out at 0xF4_0000_0000, so "VRAM" accesses hit physical RAM | FB window moved to 0 (as Linux `radeon` did on APUs), with HDP and live scanout |
@@ -412,7 +412,7 @@ error).
 
 From a stalled command processor to an accelerated desktop. Same format: each fix has a boot-arg (README).
 
-| Step | Problem | CarrizoRed |
+| Step | Problem | UnifiedRed |
 |---|---|---|
 | Microcode | The GPU's microcode RAMs ignore direct writes (the RLC and PFP word 0 read back random values after a write), and the SMU had loaded nothing (`UcodeLoadStatus` 0). On Carrizo/Stoney only the SMU can load the RLC, CP and SDMA microcode; Windows does it in PowerPlay's SMU8 manager, which Apple's HWLibs lacks (`SMUM_RequestSMULoadFW` covers Tonga/Fiji/Iceland/Polaris only) | A port of Linux `smu8_smumgr.c` (MIT): the TOC of SMU tasks, the RLC save areas and copies of CAIL's own images (`Stoney_UcodeInfo`, what `Stoney_GetFirmwareInfoTable` hands PowerPlay on Windows) in VRAM, then `DriverDramAddrHi/Lo`, `InitJobs`, `ExecuteJob` × 3 and the MEC's `CP_CPC_IC_BASE`. VRAM: an extension of CAIL's micro-engine block (`Stoney_FormatSmuDramDataBuffer`'s size), run from `Stoney_LoadRlcUcode`. Result: `UcodeLoadStatus` 0 → 0x53D in ~27 ms, real code in the RAMs |
 | Interrupts | `AMD9500Controller`'s IH ring is system RAM given to the IH by *physical* address, reached through the system aperture. With VRAM moved to MC 0 that range is FB or GART: the IH's writes never reached the CPU's ring (WPTR advanced, ring and write-back empty), every handler call wrote RPTR 0, and the storm breaker turned interrupts off, so nothing ever completed | The ring moved into our VRAM region with Apple's own `BaffinInterruptManager::setRingBufferLocation({cpu, gpu, size})` before the IH is enabled |
@@ -422,7 +422,7 @@ From a stalled command processor to an accelerated desktop. Same format: each fi
 | Hang recovery | Apple's recovery (`AMDVIPM4Engine::reset`, `pm4.initializeMicroEngine` again) soft-resets the CP, wiping the SMU-loaded CE/PFP microcode, and CAIL's direct reload does nothing on Stoney | A CP-only job (CE, PFP, ME, MEC jump table) added to the SMU's TOC and run whenever the engine is re-initialised |
 | Frozen screen | Occasionally a display-pipe transaction (flip) never gets its completion (`'txni'`, `AMDAccelDisplayPipe::processTransactionInterrupt`) while vblank interrupts keep arriving; WindowServer then never presents again | The watcher delivers it after 250 ms (`processTransactionInterrupt` only acts if a transaction is pending). One such rescue in a 5-minute desktop session |
 
-**Start-up reliability.** On some boots none of CarrizoRed's HWLibs hooks run (no PowerPlay keys, no SMU load, black
+**Start-up reliability.** On some boots none of UnifiedRed's HWLibs hooks run (no PowerPlay keys, no SMU load, black
 screen). The cause, worked out over boots 109–137: CAIL's `AmdCailServices::earlyInitialize` is called normally, at
 the patched address, but its first bytes are Apple's original code again (`55 48 89 e5`, read at
 `AMDHardware::setupCAIL`), and a re-applied route didn't land either. The rate went from occasional to almost every
@@ -432,7 +432,7 @@ patches checked and re-applied at `setupCAIL`, and the physical page plus a test
 failed start panics with the report after 120 s. Theories ruled out on the way: a second HWLibs copy (the vtable
 calls the patched address), start order (the controller was always ready first), `ATY,bin_image` missing at
 `setupCAIL` (it was present). Also seen: after a warm restart the GPU can stop responding entirely (every register
-reads 0xFFFFFFFF); only a full power-off fixes it, and CarrizoRed now says so in the report.
+reads 0xFFFFFFFF); only a full power-off fixes it, and UnifiedRed now says so in the report.
 
 **Rendering.** Large surfaces the GPU both writes and reads (wallpaper, windows, text) are right. The Dock shows its
 background but no icons, and some icons are flat colour blocks; Reduce Transparency changes nothing. Leading theory:
@@ -443,7 +443,7 @@ it's told it runs on. Next: extract the Metal driver from the dyld shared cache 
 its layout code uses. Stoney is also the only GFX8 chip with RB+ (Mesa programs `SX_PS_DOWNCONVERT` /
 `SX_BLEND_OPT_*` only for it), a second candidate for blending errors.
 
-**Lessons from crashes CarrizoRed caused itself.** A Lilu route writes a 14-byte jump: hooking a function shorter
+**Lessons from crashes UnifiedRed caused itself.** A Lilu route writes a 14-byte jump: hooking a function shorter
 than that overwrote the next one (the 6-byte `AMDSWScheduler::signalTimeout` broke `AMDSWScheduler::advance`);
 `routeChecked` now refuses functions that end inside the patch. Marking X4000/HWServices reloadable made Lilu hand
 over an already-patched image again (now skipped by load address). Re-registering the iGPU to re-match the
@@ -453,13 +453,13 @@ accelerator (a start-order experiment, now opt-in) is the suspect for a WindowSe
 ### Bring-up, part 3: rendering (2026-10-15/16, boots nvram138–169)
 
 **Start-up reliability, solved.** Lilu builds every plugin's trampolines in one shared 4 KB buffer. With ~150 traced
-stages CarrizoRed alone needed more; once it was full, `createTrampoline` failed, `routeFunctionInternal` returned
+stages UnifiedRed alone needed more; once it was full, `createTrampoline` failed, `routeFunctionInternal` returned
 `EINVAL` and `routeMultiple` took that for a trampoline address and reported success. Whichever kext loaded last
 (usually HWLibs) silently lost its hooks: the "reverted" `earlyInitialize` bytes were never patched. `routeChecked`
-now builds trampolines in a pool of CarrizoRed's own and reads every jump back.
+now builds trampolines in a pool of UnifiedRed's own and reads every jump back.
 
 **User-space patches.** Lilu's user patcher is switched off on Big Sur and later, and finds patch sites by reading the
-library from disk (cache-only dylibs aren't on disk). CarrizoRed wraps `cs_validate_page` and patches pages of the
+library from disk (cache-only dylibs aren't on disk). UnifiedRed wraps `cs_validate_page` and patches pages of the
 dyld shared cache (`dyld_shared_cache_x86_64h.03`, 15.8.1) as they are validated:
 - `libSC` `SCGetInstructionSet`: the VI branch returns 0x1E, Stoney's own back end (`SCGfx81Info`);
 - `AMDMTLBronzeDriver`: small-primitive filter off (`PA_SU_SMALL_PRIM_FILTER_CNTL` 0; Mesa never enables it on

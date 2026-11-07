@@ -37,7 +37,7 @@
 		</dict>
 	</dict>
 	<key>NSHumanReadableCopyright</key>
-	<string>Copyright © 2026 CarrizoRed contributors.</string>
+	<string>Copyright © 2026 UnifiedRed contributors.</string>
 	<key>OSBundleLibraries</key>
 	<dict>
 		<key>com.apple.iokit.IOACPIFamily</key>

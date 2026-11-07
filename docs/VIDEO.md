@@ -34,7 +34,7 @@ Linux drives UVD 6.0/6.2/6.3 with one file (`uvd_v6_0.c`); the only 6.2/6.3 diff
   `stoney_power_down_uvd_block_for_dpg_mode`, `stoney_vce_pgfsm`, plus the generic `CailUvdInit`, `CailUvdPowerOnOff`,
   `CailVceInit`, `CailVcePowerOnOff`. Power on/off goes through PowerPlay (`PHM_PowerGateUVD`/`VCE`), which under the
   Dummy back end does nothing (`PhwDummy_PowerGateUVD`): the engines stay power-gated, and touching their registers
-  then can hang the bus, which is why CarrizoRed skips their power-up today.
+  then can hang the bus, which is why UnifiedRed skips their power-up today.
 
 ## What has to be done
 
@@ -78,7 +78,7 @@ answers, firmware loaded, ring tests) before any playback test.
 - **Stage 1 result:** the SMU powers both engines (`UVDPowerON 1`, `VCEPowerON 1`), but Apple's `loadUVDFW`, UVD
   `start` and the VCE stages never ran: the engines start when a decode session opens, and none did.
 - **Stage 2, implemented (`-crvideo`, in testing):** AppleGVA chooses the hardware decoder from the platform's
-  board-id and expects the Intel iGPU's for iMac19,1. As WhateverGreen's `unfairgva=4` does, CarrizoRed renames the
+  board-id and expects the Intel iGPU's for iMac19,1. As WhateverGreen's `unfairgva=4` does, UnifiedRed renames the
   property AppleGVA reads (`board-id`, next to `hw.model` in the dyld shared cache) to `hwgva-id` and sets that on the
   device tree root to iMacPro1,1's board-id, an AMD-only Mac. The rest of the system keeps its SMBIOS. `-crnogva` leaves
   AppleGVA alone.
@@ -101,7 +101,7 @@ answers, firmware loaded, ring tests) before any playback test.
 - **Stage 4, user space reaches the kernel (Sonoma).** AMD's user-space driver failed `AVD_api.Create` (err 5) for every
   codec: `AMDAccelVideoContext::getHWInfo` handed it the real device ID (0x98E4). The getHWInfo hook substitutes the
   spoofed one (its prologue has a `jcc` in the first 14 bytes, so `routeChecked` relocates it, opted in per route with
-  `routeAllowJcc`). Then `AMDAccelUVDContext::init` failed on null UVD/VCE engine slots: CarrizoRed's own
+  `routeAllowJcc`). Then `AMDAccelUVDContext::init` failed on null UVD/VCE engine slots: UnifiedRed's own
   `wrapPowerUpHWEngines` restored all three multimedia slots after saving only SAMU (fixed).
 - **Stage 5, UVD was dead.** The first real session hung (UVD event timeout, GPU restart, black screen). UVD's registers
   read 0 and dropped writes. Ruled out one by one: the UVD/VCE clocks (GNB_CLK1-3 DFS dividers were already set and
@@ -115,7 +115,7 @@ answers, firmware loaded, ring tests) before any playback test.
   `UVD_STATUS` bit 1). The flags follow the CAIL registry key `DisableUVDPowerGating`, which CAIL reads from the PCI
   device after `AMDHardware::setupCAIL` copies the accelerator's `cail_properties` there
   (`addPlistPropertiesToPCIDevice`); `AMDVIUVDRing::init` reads the same key to choose its plain ring registers over
-  the DPG ones. CarrizoRed adds `CAIL_DisableUVDPowerGating = 1` before the copy. **Result: UVD starts and Apple's
+  the DPG ones. UnifiedRed adds `CAIL_DisableUVDPowerGating = 1` before the copy. **Result: UVD starts and Apple's
   Polaris firmware boots on Stoney** (`UVD_STATUS` 2, `VCPU_CNTL` 0xFF20200). No Linux firmware is needed.
 - **Stage 7, decode hangs: VM mode.** With the firmware running, the first session (the 10-bit aerial, then an H.264
   screen recording with HEVC withdrawn) left UVD busy, and Apple's GPU restart never finished. A snapshot of UVD before
@@ -142,7 +142,7 @@ reported, and the report's `uvd start` / `uvd live` lines hold the registers, ri
    memory-controller address (the IB itself has to be contiguous or copied).
 3. In each IB, rewrite every `UVD_GPCOM_VCPU_DATA0`/`DATA1` address pair before a `UVD_GPCOM_VCPU_CMD` (message, feedback,
    DPB, decode target, bitstream, context, ...) from the client's VMID to a memory-controller address, as
-   `amdgpu_uvd_cs_parse` does. CarrizoRed already walks client page tables for the shader fix (`ibVaToPhys`).
+   `amdgpu_uvd_cs_parse` does. UnifiedRed already walks client page tables for the shader fix (`ibVaToPhys`).
 4. The hard part: in physical mode every buffer has to be contiguous in the memory controller's view. Buffers in the
    carve-out probably are; the bitstream comes from user space in scattered system memory and may need a bounce buffer,
    or a mapping in VMID 0's page table (GART).
