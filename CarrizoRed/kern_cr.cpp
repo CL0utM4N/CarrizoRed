@@ -12176,8 +12176,7 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 			for (size_t i = 0; v.ringRead[r] && i < arrsize(v.ring[r]); i++)
 				add(" %x", v.ring[r][i]);
 		}
-		add("
-");
+		add("\n");
 	}
 	if (smuDpm.done)
 		add("sclk dpm: resp %x %x %x %x %x, L%u-L%u, features %x -> %x (SclkDpmOn %u), level changes %u, max seen L%u (before DPM), now %x; deep sleep %x watermark %x; mailbox msg %x resp %x arg %x, foreign %u:",
