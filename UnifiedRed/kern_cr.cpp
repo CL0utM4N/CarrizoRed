@@ -6495,7 +6495,7 @@ static const uint16_t vceRegs[] {0x8001, 0x8005, 0x8009, 0x800A, 0x800B, 0x800C,
 	0x8618};
 static struct {
 	uint64_t ms;
-	uint32_t tails, heads, logged, regs[arrsize(vceRegs)], ring[2][8];
+	uint32_t tails, heads, logged, regs[arrsize(vceRegs)], ring[2][24];
 	bool ringRead[2];
 } vceLive;
 
@@ -6550,21 +6550,67 @@ static void vceSnapshot(const char *why) {
 // they change.
 static void vceLiveTick() {
 	auto &s = vceLive;
-	if (!s.tails || !gpuMmio || !videoPowered())
+	auto *m = gpuMmio;
+	if (!s.tails || !m || !videoPowered())
 		return;
 	static const size_t bases[2][2] {{14, 15}, {9, 10}};
-	static uint32_t ringLogs;
+	static uint32_t ringLogs, ibLogs, fenceLogs, fenceLast[2];
+	static uint64_t fenceAddr;
+	if (fenceAddr && fenceLogs < 8) {
+		uint32_t v[2] {};
+		if (gartRead(fenceAddr, v, sizeof(v)) && (v[0] != fenceLast[0] || v[1] != fenceLast[1])) {
+			fenceLast[0] = v[0];
+			fenceLast[1] = v[1];
+			fenceLogs++;
+			diskLogEvent("vce fence %llx now %x %x; VCE_STATUS %x LLQ rptr %x wptr %x", fenceAddr, v[0], v[1], m[0x8001],
+				s.regs[12], s.regs[13]);
+		}
+	}
 	for (size_t r = 0; r < 2; r++) {
-		uint32_t ring[8] {};
+		uint32_t ring[24] {};
 		if (!gartRead(static_cast<uint64_t>(s.regs[bases[r][1]]) << 32 | s.regs[bases[r][0]], ring, sizeof(ring)))
 			continue;
 		if (s.ringRead[r] && !memcmp(ring, s.ring[r], sizeof(ring)))
 			continue;
 		memcpy(s.ring[r], ring, sizeof(ring));
 		s.ringRead[r] = true;
-		if (ringLogs++ < 16)
-			diskLogEvent("vce ring %s: %x %x %x %x %x %x %x %x", r ? "llq" : "1", ring[0], ring[1], ring[2], ring[3],
-				ring[4], ring[5], ring[6], ring[7]);
+		if (ringLogs++ < 16) {
+			char buf[260];
+			size_t len = 0;
+			for (size_t i = 0; i < arrsize(ring) && len + 12 < sizeof(buf); i++)
+				len += snprintf(buf + len, sizeof(buf) - len, " %x", ring[i]);
+			diskLogEvent("vce ring %s:%s", r ? "llq" : "1", buf);
+		}
+		// The first block's IB (IB_VM at dword 0, or 6 after our UPDATE_PTB/FLUSH_TLB/END) and fence: what the firmware
+		// was given, read through Apple's own page tables, and whether the fence was written. With the VM layout the
+		// firmware has to walk (VM_CONTEXT1_CNTL depth/block size, VM_CONTEXT1 start/end, the VMID's directory).
+		size_t at = ring[0] == 0x102 ? 0 : ring[6] == 0x102 ? 6 : 24;
+		if (at + 9 > arrsize(ring) || ibLogs >= 6)
+			continue;
+		ibLogs++;
+		uint32_t vmid = ring[at + 1] & 0xF;
+		uint64_t va = static_cast<uint64_t>(ring[at + 3]) << 32 | ring[at + 2];
+		uint64_t fence = static_cast<uint64_t>(ring[at + 7]) << 32 | ring[at + 6];
+		uint64_t phys = ibVaToPhys(vmid, va);
+		uint32_t ib[32] {}, fenceVal[2] {0xFFFFFFFF, 0xFFFFFFFF};
+		bool ibOk = phys && ibReadPhys(phys, sizeof(ib), ib);
+		bool fenceOk = gartRead(fence, fenceVal, sizeof(fenceVal));
+		if (fenceOk && !fenceAddr) {
+			fenceAddr = fence;
+			fenceLast[0] = fenceVal[0];
+			fenceLast[1] = fenceVal[1];
+		}
+		diskLogEvent("vce vm: cntl %x start %x end %x pdb%u %x; ib va %llx -> phys %llx%s; fence %llx = %x %x%s; "
+			"VM_CONTEXT1 fault status %x addr %x", m[0x505], m[0x558], m[0x560], vmid,
+			vmid < 8 ? m[0x54F + vmid] : m[0x50E + vmid - 8], va, phys, ibOk ? "" : " (unread)", fence, fenceVal[0],
+			fenceVal[1], fenceOk ? "" : " (unread)", m[0x536], m[0x53E]);
+		if (ibOk) {
+			char buf[400];
+			size_t len = 0;
+			for (size_t i = 0; i < arrsize(ib) && len + 12 < sizeof(buf); i++)
+				len += snprintf(buf + len, sizeof(buf) - len, " %x", ib[i]);
+			diskLogEvent("vce ib:%s", buf);
+		}
 	}
 }
 
