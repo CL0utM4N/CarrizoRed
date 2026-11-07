@@ -6606,10 +6606,67 @@ static void wrapRingDisable(void *that) {
 		vceRingLog("disable", that, kind, 0);
 }
 
+// VCE's page tables (log 1747070946, 40ce1f5): the firmware boots, Apple's LLQ submit reaches the hardware (WPTR2 0x20)
+// and the read pointer never moves. The block Apple writes (AMDVCE3v4Channel::commitIndirectCommandBuffer: a 0x20-dword
+// template with fields filled in) is VCE_CMD_IB_VM (0x102), vmid, IB address lo/hi, length, then VCE_CMD_FENCE (3),
+// fence lo/hi, sequence, and the template's tail. Nothing sends the firmware the VMID's page directory. Linux's
+// vce_v3_0 VM mode (Stoney and Polaris alike) emits, before every IB, VCE_CMD_UPDATE_PTB (0x107), vmid, page directory
+// >> 12, then VCE_CMD_FLUSH_TLB (0x108), vmid, VCE_CMD_END (1) (vce_v3_0_emit_vm_flush). So before the submit
+// (before writeTail), rewrite each new IB_VM block in place to start with those six dwords, the page directory being
+// that VMID's VM_CONTEXTn_PAGE_TABLE_BASE_ADDR (already in 4 KB units). Monterey's AMDCommandRing layout: +0x40 CPU
+// base, +0x30 size in dwords, +0x54 tail, +0x74 last submitted tail (dwords). -crnovceptb leaves the blocks alone.
+static uint32_t vcePtbRewrites, vcePtbSkips;
+
+static void vcePrependPtb(void *that) {
+	static int off = -1;
+	if (off < 0)
+		off = checkKernelArgument("-crnovceptb") ? 1 : 0;
+	auto *m = gpuMmio;
+	if (off || !m)
+		return;
+	auto *b = static_cast<uint8_t *>(that);
+	auto *ring = *reinterpret_cast<uint32_t **>(b + 0x40);
+	uint32_t size = *reinterpret_cast<uint32_t *>(b + 0x30), tail = *reinterpret_cast<uint32_t *>(b + 0x54),
+			 pos = *reinterpret_cast<uint32_t *>(b + 0x74);
+	if (!ring || !size || size > 0x100000 || tail >= size || pos >= size)
+		return;
+	for (uint32_t n = 0; pos != tail && n < 64; n++) {
+		if (pos + 0x20 > size)
+			break;
+		uint32_t *blk = ring + pos;
+		if (blk[0] == 0x102 && blk[5] == 3 && blk[1] < 16) {
+			uint32_t used = 0x20;
+			while (used && !blk[used - 1])
+				used--;
+			uint32_t vmid = blk[1];
+			uint32_t pd = vmid < 8 ? m[0x54F + vmid] : m[0x50E + vmid - 8];
+			if (used + 6 <= 0x20 && pd) {
+				uint32_t copy[0x20];
+				memcpy(copy, blk, used * 4);
+				uint32_t head[6] {0x107, vmid, pd, 0x108, vmid, 1};
+				memcpy(blk, head, sizeof(head));
+				memcpy(blk + 6, copy, used * 4);
+				for (uint32_t i = used + 6; i < 0x20; i++)
+					blk[i] = 0;
+				if (vcePtbRewrites++ < 8)
+					diskLogEvent("vce ptb: block at %x: vmid %u page directory %x (%u dwords before, VM_CONTEXT cntl %x)",
+						pos, vmid, pd, used, m[0x504 + (vmid ? 1 : 0)]);
+			} else if (vcePtbSkips++ < 8) {
+				diskLogEvent("vce ptb: block at %x skipped: vmid %u pd %x used %u", pos, vmid, pd, used);
+			}
+		}
+		pos += 0x20;
+		if (pos >= size)
+			pos = 0;
+	}
+}
+
 static void wrapRingSubmit(void *that) {
 	auto kind = vceRingKind(that);
-	if (kind)
+	if (kind) {
+		vcePrependPtb(that);
 		vceRingLog("submit (before)", that, kind, 0);
+	}
 	FunctionCast(wrapRingSubmit, orgRingSubmit)(that);
 }
 
