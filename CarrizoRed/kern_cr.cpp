@@ -1586,9 +1586,16 @@ static struct {
 static bool uvdReadyForSession();
 static mach_vm_address_t orgVceContextInit;
 static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
-static mach_vm_address_t orgVceWriteTail, orgVceGetHead;
+static mach_vm_address_t orgVceWriteTail, orgVceGetHead, orgRingEnable, orgRingDisable, orgRingSubmit, orgRingFlush,
+	orgVceRegLoc, orgVceLlqRegLoc, vceRingVtable, vceLlqRingVtable;
 static void wrapVceWriteTail(void *that);
 static uint32_t wrapVceGetHead(void *that);
+static bool wrapRingEnable(void *that);
+static void wrapRingDisable(void *that);
+static void wrapRingSubmit(void *that);
+static void wrapRingFlush(void *that);
+static bool wrapVceRegLoc(void *that);
+static bool wrapVceLlqRegLoc(void *that);
 
 void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	for (size_t i = 0; i < arrsize(kexts); i++) {
@@ -5221,6 +5228,29 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 				orgVceWriteTail, nullptr, 0, "VCE writeTail");
 			route("__ZN27AMDRadeonX4000_AMDVIVCERing7getHeadEv", reinterpret_cast<mach_vm_address_t>(wrapVceGetHead),
 				orgVceGetHead, nullptr, 0, "VCE getHead");
+			// The ring life cycle, logged for the two VCE ring classes only (by vtable).
+			auto vt = patcher.solveSymbol(index, "__ZTV27AMDRadeonX4000_AMDVIVCERing", slide, size);
+			auto vtLlq = patcher.solveSymbol(index, "__ZTV30AMDRadeonX4000_AMDVIVCELLQRing", slide, size);
+			patcher.clearError();
+			if (vt && vtLlq) {
+				vceRingVtable = vt + 16;
+				vceLlqRingVtable = vtLlq + 16;
+				route("__ZN27AMDRadeonX4000_AMDVIVCERing16registerLocationEv",
+					reinterpret_cast<mach_vm_address_t>(wrapVceRegLoc), orgVceRegLoc, nullptr, 0, "VCE registerLocation");
+				route("__ZN30AMDRadeonX4000_AMDVIVCELLQRing16registerLocationEv",
+					reinterpret_cast<mach_vm_address_t>(wrapVceLlqRegLoc), orgVceLlqRegLoc, nullptr, 0,
+					"VCE LLQ registerLocation");
+				routeAllowJcc = true;
+				route("__ZN24AMDRadeonX4000_AMDHWRing6enableEv", reinterpret_cast<mach_vm_address_t>(wrapRingEnable),
+					orgRingEnable, nullptr, 0, "ring enable");
+				route("__ZN24AMDRadeonX4000_AMDHWRing7disableEv", reinterpret_cast<mach_vm_address_t>(wrapRingDisable),
+					orgRingDisable, nullptr, 0, "ring disable");
+				route("__ZN24AMDRadeonX4000_AMDHWRing6submitEv", reinterpret_cast<mach_vm_address_t>(wrapRingSubmit),
+					orgRingSubmit, nullptr, 0, "ring submit");
+				route("__ZN24AMDRadeonX4000_AMDHWRing18flushWithoutSubmitEv",
+					reinterpret_cast<mach_vm_address_t>(wrapRingFlush), orgRingFlush, nullptr, 0, "ring flush");
+				routeAllowJcc = false;
+			}
 		}
 		route("__ZN29AMDRadeonX4000_AMDUVDHWEngine5startEv", reinterpret_cast<mach_vm_address_t>(wrapUvdStart),
 			orgUvdStart, nullptr, 0, "UVD start");
@@ -6534,6 +6564,66 @@ static void wrapVceWriteTail(void *that) {
 	FunctionCast(wrapVceWriteTail, orgVceWriteTail)(that);
 	vceLive.tails++;
 	vceSnapshot("tail");
+}
+
+// Which VCE ring an AMDHWRing is (0 none, 1 ring 1, 2 LLQ), and its state: enabled (+0x70), head (+0x50), tail
+// (+0x54), last submitted tail (+0x74) on Monterey's layout.
+static uint32_t vceRingKind(void *that) {
+	auto vptr = that ? *reinterpret_cast<mach_vm_address_t *>(that) : 0;
+	return vptr && vptr == vceRingVtable ? 1 : vptr && vptr == vceLlqRingVtable ? 2 : 0;
+}
+
+static void vceRingLog(const char *what, void *that, uint32_t kind, uint64_t ret) {
+	static uint32_t logs;
+	if (logs++ >= 48)
+		return;
+	auto *b = static_cast<uint8_t *>(that);
+	diskLogEvent("vce %s %s: ret %llx enabled %u head %x tail %x submitted %x", kind == 2 ? "llq" : "ring1", what, ret,
+		b[0x70], *reinterpret_cast<uint32_t *>(b + 0x50), *reinterpret_cast<uint32_t *>(b + 0x54),
+		*reinterpret_cast<uint32_t *>(b + 0x74));
+}
+
+static bool wrapRingEnable(void *that) {
+	auto kind = vceRingKind(that);
+	bool ret = FunctionCast(wrapRingEnable, orgRingEnable)(that);
+	if (kind)
+		vceRingLog("enable", that, kind, ret);
+	return ret;
+}
+
+static void wrapRingDisable(void *that) {
+	auto kind = vceRingKind(that);
+	FunctionCast(wrapRingDisable, orgRingDisable)(that);
+	if (kind)
+		vceRingLog("disable", that, kind, 0);
+}
+
+static void wrapRingSubmit(void *that) {
+	auto kind = vceRingKind(that);
+	if (kind)
+		vceRingLog("submit (before)", that, kind, 0);
+	FunctionCast(wrapRingSubmit, orgRingSubmit)(that);
+}
+
+static void wrapRingFlush(void *that) {
+	auto kind = vceRingKind(that);
+	if (kind)
+		vceRingLog("flushWithoutSubmit (before)", that, kind, 0);
+	FunctionCast(wrapRingFlush, orgRingFlush)(that);
+}
+
+static bool wrapVceRegLoc(void *that) {
+	bool ret = FunctionCast(wrapVceRegLoc, orgVceRegLoc)(that);
+	vceRingLog("registerLocation", that, 1, ret);
+	vceSnapshot("ring1 registered");
+	return ret;
+}
+
+static bool wrapVceLlqRegLoc(void *that) {
+	bool ret = FunctionCast(wrapVceLlqRegLoc, orgVceLlqRegLoc)(that);
+	vceRingLog("registerLocation", that, 2, ret);
+	vceSnapshot("llq registered");
+	return ret;
 }
 
 static uint32_t wrapVceGetHead(void *that) {
