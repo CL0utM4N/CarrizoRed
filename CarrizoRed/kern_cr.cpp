@@ -5224,20 +5224,22 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 			  "AMDAccelVideoContextP23sVideoContextCreateInfo",
 			reinterpret_cast<mach_vm_address_t>(wrapVceContextInit), orgVceContextInit, nullptr, 0, "VCE context init");
 		if (checkKernelArgument("-crvce")) {
-			route("__ZN27AMDRadeonX4000_AMDVIVCERing9writeTailEv", reinterpret_cast<mach_vm_address_t>(wrapVceWriteTail),
+			route("__ZN28AMDRadeonX4000_AMDVCE3v4Ring9writeTailEv", reinterpret_cast<mach_vm_address_t>(wrapVceWriteTail),
 				orgVceWriteTail, nullptr, 0, "VCE writeTail");
-			route("__ZN27AMDRadeonX4000_AMDVIVCERing7getHeadEv", reinterpret_cast<mach_vm_address_t>(wrapVceGetHead),
+			route("__ZN28AMDRadeonX4000_AMDVCE3v4Ring7getHeadEv", reinterpret_cast<mach_vm_address_t>(wrapVceGetHead),
 				orgVceGetHead, nullptr, 0, "VCE getHead");
-			// The ring life cycle, logged for the two VCE ring classes only (by vtable).
-			auto vt = patcher.solveSymbol(index, "__ZTV27AMDRadeonX4000_AMDVIVCERing", slide, size);
-			auto vtLlq = patcher.solveSymbol(index, "__ZTV30AMDRadeonX4000_AMDVIVCELLQRing", slide, size);
+			// The ring life cycle, logged for the two VCE ring classes only (by vtable). Polaris hardware (AMDBaffinHardware,
+			// AMDEllesmereHardware::allocateHWEngines) makes an AMDVCE3v4HWEngine with AMDVCE3v4Ring/LLQRing, not the
+			// AMDVIVCE* classes 754d92a watched (none of its hooks ran).
+			auto vt = patcher.solveSymbol(index, "__ZTV28AMDRadeonX4000_AMDVCE3v4Ring", slide, size);
+			auto vtLlq = patcher.solveSymbol(index, "__ZTV31AMDRadeonX4000_AMDVCE3v4LLQRing", slide, size);
 			patcher.clearError();
 			if (vt && vtLlq) {
 				vceRingVtable = vt + 16;
 				vceLlqRingVtable = vtLlq + 16;
-				route("__ZN27AMDRadeonX4000_AMDVIVCERing16registerLocationEv",
+				route("__ZN28AMDRadeonX4000_AMDVCE3v4Ring16registerLocationEv",
 					reinterpret_cast<mach_vm_address_t>(wrapVceRegLoc), orgVceRegLoc, nullptr, 0, "VCE registerLocation");
-				route("__ZN30AMDRadeonX4000_AMDVIVCELLQRing16registerLocationEv",
+				route("__ZN31AMDRadeonX4000_AMDVCE3v4LLQRing16registerLocationEv",
 					reinterpret_cast<mach_vm_address_t>(wrapVceLlqRegLoc), orgVceLlqRegLoc, nullptr, 0,
 					"VCE LLQ registerLocation");
 				routeAllowJcc = true;
@@ -6476,10 +6478,10 @@ static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint
 
 // VCE with -crvce on Monterey (2026-11-07, log 1747067949): CAIL's Stoney table already uses Cail_Ellesmere_VceInit
 // (the VCE 3.4 one), the firmware boots (VCE_STATUS 22, VCPU_CNTL 100001, soft reset clear), Apple writes 0x20 bytes to
-// the LLQ ring, and its read pointer never moves: "channel 10 event timeout on stamp 1". Apple's AMDVIVCERing programs
+// the LLQ ring, and its read pointer never moves: "channel 10 event timeout on stamp 1". Apple's AMDVCE3v4Ring (same code as AMDVIVCERing) programs
 // ring 1 at VCE_RB_BASE_LO/HI/SIZE/RPTR/WPTR 0x8060-0x8064 and the LLQ ring at 0x805B-0x805F, each under
 // GRBM_GFX_INDEX 7 (VCE instance 0, all pipes) as Linux's vce_v3_0 does. What the hardware holds then isn't known (the
-// sample reads ring 1 only, without the instance select), so after Apple's writeTail and getHead (which it polls while
+// sample reads ring 1 only, without the instance select), so after AMDVCE3v4Ring's writeTail and getHead (which it polls while
 // waiting), select the instance the same way, read both rings, the VCPU cache set-up and the LMI, and the first dwords
 // of each ring through the GART.
 static const uint16_t vceRegs[] {0x8001, 0x8005, 0x8009, 0x800A, 0x800B, 0x800C, 0x800D, 0x800E, 0x8048, 0x805B,
