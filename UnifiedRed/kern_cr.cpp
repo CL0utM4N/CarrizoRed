@@ -1578,6 +1578,8 @@ static bool wrapUvdStart(void *that);
 static void uvdLiveTick();
 static void vceLiveTick();
 static uint64_t ibMcToPhys(uint64_t addr, bool system);
+static uint64_t ibVaToPhys(uint32_t vmid, uint64_t va);
+static bool ibReadPhys(uint64_t phys, uint32_t bytes, void *out, bool coherent);
 static bool physRangeOk(uint64_t phys, uint32_t bytes);
 static mach_vm_address_t orgAddPlistPropertiesToPCIDevice;
 static uint64_t wrapAddPlistPropertiesToPCIDevice(IOService *that, const char *name);
@@ -6593,7 +6595,7 @@ static void vceLiveTick() {
 		uint64_t fence = static_cast<uint64_t>(ring[at + 7]) << 32 | ring[at + 6];
 		uint64_t phys = ibVaToPhys(vmid, va);
 		uint32_t ib[32] {}, fenceVal[2] {0xFFFFFFFF, 0xFFFFFFFF};
-		bool ibOk = phys && ibReadPhys(phys, sizeof(ib), ib);
+		bool ibOk = phys && ibReadPhys(phys, sizeof(ib), ib, false);
 		bool fenceOk = gartRead(fence, fenceVal, sizeof(fenceVal));
 		if (fenceOk && !fenceAddr) {
 			fenceAddr = fence;
