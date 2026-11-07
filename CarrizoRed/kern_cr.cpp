@@ -1570,6 +1570,7 @@ static bool wrapUvdContextInit(void *that, void *accel, void *videoContext, uint
 static mach_vm_address_t orgUvdStart;
 static bool wrapUvdStart(void *that);
 static void uvdLiveTick();
+static void vceLiveTick();
 static uint64_t ibMcToPhys(uint64_t addr, bool system);
 static bool physRangeOk(uint64_t phys, uint32_t bytes);
 static mach_vm_address_t orgAddPlistPropertiesToPCIDevice;
@@ -1585,6 +1586,9 @@ static struct {
 static bool uvdReadyForSession();
 static mach_vm_address_t orgVceContextInit;
 static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint32_t *createInfo);
+static mach_vm_address_t orgVceWriteTail, orgVceGetHead;
+static void wrapVceWriteTail(void *that);
+static uint32_t wrapVceGetHead(void *that);
 
 void CRDriver::processKext(KernelPatcher &patcher, size_t index, mach_vm_address_t slide, size_t size) {
 	for (size_t i = 0; i < arrsize(kexts); i++) {
@@ -4097,6 +4101,7 @@ void CRDriver::watcherThread(void *arg, wait_result_t) {
 		if (panicAt && t >= panicAt)
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (crpanicat), the kernel was still running.");
 		uvdLiveTick();
+		vceLiveTick();
 		if (uvdPanicMs && uptimeMs() >= uvdPanicMs && !(uvdStartInfo.status & 2))
 			self->panicReport(t, now, "CarrizoRed: deliberate panic (-cruvdpanic), 20 s after the first UVD session.");
 		kickStalledFlip();
@@ -5211,6 +5216,12 @@ void CRDriver::patchAccelerator(KernelPatcher &patcher, size_t index, mach_vm_ad
 		route("__ZN33AMDRadeonX4000_AMDAccelVCEContext4initEP37AMDRadeonX4000_AMDGraphicsAcceleratorP35AMDRadeonX4000_"
 			  "AMDAccelVideoContextP23sVideoContextCreateInfo",
 			reinterpret_cast<mach_vm_address_t>(wrapVceContextInit), orgVceContextInit, nullptr, 0, "VCE context init");
+		if (checkKernelArgument("-crvce")) {
+			route("__ZN27AMDRadeonX4000_AMDVIVCERing9writeTailEv", reinterpret_cast<mach_vm_address_t>(wrapVceWriteTail),
+				orgVceWriteTail, nullptr, 0, "VCE writeTail");
+			route("__ZN27AMDRadeonX4000_AMDVIVCERing7getHeadEv", reinterpret_cast<mach_vm_address_t>(wrapVceGetHead),
+				orgVceGetHead, nullptr, 0, "VCE getHead");
+		}
 		route("__ZN29AMDRadeonX4000_AMDUVDHWEngine5startEv", reinterpret_cast<mach_vm_address_t>(wrapUvdStart),
 			orgUvdStart, nullptr, 0, "UVD start");
 		route("__ZN37AMDRadeonX4000_AMDGraphicsAccelerator29addPlistPropertiesToPCIDeviceEPKc",
@@ -5670,28 +5681,6 @@ static uint64_t wrapCailEnableAts(void *) {
 	atsSkipped++;
 	traceNote("ats=skipped ");
 	return 0;
-}
-
-// VCE start. Stoney's VCE is 3.4, the Polaris one, but CAIL's Stoney tables use the Tonga (VCE 3.0/3.1) init,
-// Cail_Tonga_VceInit, which points the VCPU at its firmware through the single VCE_LMI_VCPU_CACHE_40BIT_BAR (0x8597)
-// and only sets VCE_VCPU_CNTL.CLK_EN. VCE 3.4 has three cache BARs (0x8616-0x8618, one per cache region, with the
-// region number in bits 31:24 of each VCE_VCPU_CACHE_OFFSETn) and needs VCPU_CNTL bit 21 cleared: Linux does both
-// for asic_type >= CHIP_STONEY (vce_v3_0_mc_resume, vce_v3_0_start), and so does Apple's Cail_Ellesmere_VceInit,
-// otherwise the same function with the same arguments. With the Tonga one the screen recording's session hung, the
-// VCPU still in soft reset ("VCELLQ event timeout"). On Stoney, run the Ellesmere one. -crnovceinit leaves CAIL's.
-static mach_vm_address_t orgCailTongaVceInit, cailEllesmereVceInit;
-static uint32_t vceInits;
-
-static uint64_t wrapCailTongaVceInit(void *cail, void *info) {
-	using Fn = uint64_t (*)(void *, void *);
-	bool swap = cailEllesmereVceInit != 0;
-	auto ret = swap ? reinterpret_cast<Fn>(cailEllesmereVceInit)(cail, info) :
-		FunctionCast(wrapCailTongaVceInit, orgCailTongaVceInit)(cail, info);
-	if (vceInits++ < 8)
-		diskLogEvent("vce: %s VceInit = %llx; VCE_STATUS %x VCPU_CNTL %x SOFT_RESET %x", swap ? "Ellesmere (VCE 3.4)" :
-			"Tonga", ret, gpuMmio ? gpuMmio[0x8001] : 0, gpuMmio ? gpuMmio[0x8005] : 0, gpuMmio ? gpuMmio[0x8048] : 0);
-	traceNote("vceinit=%s:%llx ", swap ? "ell" : "tonga", ret);
-	return ret;
 }
 
 // SMU microcode loading (port of Linux smu8_smumgr.c, MIT). nvram71/72: the GPU's microcode RAMs ignore direct writes
@@ -6455,6 +6444,105 @@ static bool wrapVceContextInit(void *that, void *accel, void *videoContext, uint
 	return ret;
 }
 
+// VCE with -crvce on Monterey (2026-11-07, log 1747067949): CAIL's Stoney table already uses Cail_Ellesmere_VceInit
+// (the VCE 3.4 one), the firmware boots (VCE_STATUS 22, VCPU_CNTL 100001, soft reset clear), Apple writes 0x20 bytes to
+// the LLQ ring, and its read pointer never moves: "channel 10 event timeout on stamp 1". Apple's AMDVIVCERing programs
+// ring 1 at VCE_RB_BASE_LO/HI/SIZE/RPTR/WPTR 0x8060-0x8064 and the LLQ ring at 0x805B-0x805F, each under
+// GRBM_GFX_INDEX 7 (VCE instance 0, all pipes) as Linux's vce_v3_0 does. What the hardware holds then isn't known (the
+// sample reads ring 1 only, without the instance select), so after Apple's writeTail and getHead (which it polls while
+// waiting), select the instance the same way, read both rings, the VCPU cache set-up and the LMI, and the first dwords
+// of each ring through the GART.
+static const uint16_t vceRegs[] {0x8001, 0x8005, 0x8009, 0x800A, 0x800B, 0x800C, 0x800D, 0x800E, 0x8048, 0x805B,
+	0x805C, 0x805D, 0x805E, 0x805F, 0x8060, 0x8061, 0x8062, 0x8063, 0x8064, 0x85A6, 0x85A7, 0x85A8, 0x8616, 0x8617,
+	0x8618};
+static struct {
+	uint64_t ms;
+	uint32_t tails, heads, logged, regs[arrsize(vceRegs)], ring[2][8];
+	bool ringRead[2];
+} vceLive;
+
+static bool gartRead(uint64_t addr, uint32_t *out, uint32_t bytes) {
+	auto *m = gpuMmio;
+	uint64_t table = static_cast<uint64_t>(m[0x54F]) << 12, start = static_cast<uint64_t>(m[0x557]) << 12;
+	uint64_t carveout = static_cast<uint64_t>(m[Reg::MC_VM_FB_OFFSET] & 0x3FFFF) << 22;
+	if (!table || !start || addr < start || (addr & 0xFFF) + bytes > 0x1000)
+		return false;
+	auto readPhys = [](uint64_t phys, uint32_t len, void *dst) {
+		if (!physRangeOk(phys, len))
+			return false;
+		auto *desc = IOMemoryDescriptor::withPhysicalAddress(phys, len, kIODirectionIn);
+		auto *map = desc ? desc->map(kIOMapInhibitCache) : nullptr;
+		if (map)
+			memcpy(dst, reinterpret_cast<const void *>(map->getVirtualAddress()), len);
+		bool ok = map != nullptr;
+		OSSafeReleaseNULL(map);
+		OSSafeReleaseNULL(desc);
+		return ok;
+	};
+	uint64_t pte = 0;
+	if (!readPhys(carveout + table + ((addr - start) >> 12) * 8, sizeof(pte), &pte) || !(pte & 1))
+		return false;
+	return readPhys((pte & 0xFFFFFFFFF000ULL) | (addr & 0xFFF), bytes, out);
+}
+
+static void vceSnapshot(const char *why) {
+	auto *m = gpuMmio;
+	if (!m || !videoPowered())
+		return;
+	auto &s = vceLive;
+	uint32_t old[arrsize(vceRegs)];
+	memcpy(old, s.regs, sizeof(old));
+	m[0xC200] = 7;
+	for (size_t i = 0; i < arrsize(vceRegs); i++)
+		s.regs[i] = m[vceRegs[i]];
+	m[0xC200] = 0xE0000000;
+	s.ms = uptimeMs();
+	if (s.logged >= 24 || !memcmp(old, s.regs, sizeof(old)))
+		return;
+	s.logged++;
+	char buf[400];
+	size_t len = 0;
+	for (size_t i = 0; i < arrsize(vceRegs) && len + 16 < sizeof(buf); i++)
+		len += snprintf(buf + len, sizeof(buf) - len, " %x=%x", vceRegs[i], s.regs[i]);
+	diskLogEvent("vce %s (tails %u heads %u):%s", why, s.tails, s.heads, buf);
+}
+
+// From the watcher (the hooks may run under Apple's locks): the first dwords of each ring, read through the GART at
+// the base the last snapshot saw (ring 1 BASE 0x8060/0x8061 = regs 14/15, LLQ 0x805B/0x805C = regs 9/10), logged when
+// they change.
+static void vceLiveTick() {
+	auto &s = vceLive;
+	if (!s.tails || !gpuMmio || !videoPowered())
+		return;
+	static const size_t bases[2][2] {{14, 15}, {9, 10}};
+	static uint32_t ringLogs;
+	for (size_t r = 0; r < 2; r++) {
+		uint32_t ring[8] {};
+		if (!gartRead(static_cast<uint64_t>(s.regs[bases[r][1]]) << 32 | s.regs[bases[r][0]], ring, sizeof(ring)))
+			continue;
+		if (s.ringRead[r] && !memcmp(ring, s.ring[r], sizeof(ring)))
+			continue;
+		memcpy(s.ring[r], ring, sizeof(ring));
+		s.ringRead[r] = true;
+		if (ringLogs++ < 16)
+			diskLogEvent("vce ring %s: %x %x %x %x %x %x %x %x", r ? "llq" : "1", ring[0], ring[1], ring[2], ring[3],
+				ring[4], ring[5], ring[6], ring[7]);
+	}
+}
+
+static void wrapVceWriteTail(void *that) {
+	FunctionCast(wrapVceWriteTail, orgVceWriteTail)(that);
+	vceLive.tails++;
+	vceSnapshot("tail");
+}
+
+static uint32_t wrapVceGetHead(void *that) {
+	auto ret = FunctionCast(wrapVceGetHead, orgVceGetHead)(that);
+	vceLive.heads++;
+	vceSnapshot("head");
+	return ret;
+}
+
 // The SMU's graphics clock table, read once (nvram180: the current/target DPM level never left 0 and Apple's
 // PowerPlay runs its dummy back end, so nobody started SCLK DPM). What Linux's smu8_download_pptable_settings does:
 // SetClkTableAddrHi/Lo, ExecuteJob(the clock table job), ClkTableXferToDram; then the SclkBreakdownTable
@@ -6671,7 +6759,7 @@ static uint64_t wrapStoneyEnableCpPg(void *, uint64_t) {
 // none of them taking effect (no PowerPlay key notes, flags untouched, ATS not skipped) with no "noroute" note.
 enum HwlibsHook {
 	HookPeciRead, HookPeciSize, HookWaitFor, HookAts, HookHaltRlc, HookFlags, HookSmuFormat, HookSmuLoad, HookEarlyInit,
-	HookPgEnable, HookPgGfx, HookPgCp, HookVceInit
+	HookPgEnable, HookPgGfx, HookPgCp
 };
 static uint32_t hwlibsHooks, hwlibsHookFails;
 
@@ -6925,15 +7013,6 @@ void CRDriver::traceKext(KernelPatcher &patcher, size_t index, mach_vm_address_t
 			static const HwlibsHook pgHooks[] {HookPgEnable, HookPgGfx, HookPgCp};
 			for (size_t i = 0; i < arrsize(pg); i++)
 				routeHwlibs(patcher, index, pg[i], slide, size, pgHooks[i]);
-		}
-		if (family == ChipFamily::Stoney && !checkKernelArgument("-crnovceinit")) {
-			cailEllesmereVceInit = solveOrSignature(patcher, index, "_Cail_Ellesmere_VceInit", slide, size);
-			patcher.clearError();
-			KernelPatcher::RouteRequest vce {"_Cail_Tonga_VceInit", wrapCailTongaVceInit, orgCailTongaVceInit};
-			if (!cailEllesmereVceInit)
-				traceNote("vceinit=noellesmere ");
-			else
-				routeHwlibs(patcher, index, vce, slide, size, HookVceInit);
 		}
 		if ((family == ChipFamily::Stoney || family == ChipFamily::Carrizo) && !checkKernelArgument("-crats")) {
 			KernelPatcher::RouteRequest ats {"_Cail_Spectre_EnableAts", wrapCailEnableAts, orgCailEnableAts};
@@ -12086,6 +12165,19 @@ const char *CRDriver::composeReport(uint32_t t, const char *tree) {
 		for (size_t i = 0; s.ringRead && i < arrsize(s.ring); i++)
 			add(" %x", s.ring[i]);
 		add("\n");
+	}
+	if (vceLive.tails) {
+		auto &v = vceLive;
+		add("vce live (writeTail %u, getHead %u, last at %llu ms):", v.tails, v.heads, v.ms);
+		for (size_t i = 0; i < arrsize(vceRegs); i++)
+			add(" %x=%x", vceRegs[i], v.regs[i]);
+		for (size_t r = 0; r < 2; r++) {
+			add("; ring %s%s:", r ? "llq" : "1", v.ringRead[r] ? "" : " (not read)");
+			for (size_t i = 0; v.ringRead[r] && i < arrsize(v.ring[r]); i++)
+				add(" %x", v.ring[r][i]);
+		}
+		add("
+");
 	}
 	if (smuDpm.done)
 		add("sclk dpm: resp %x %x %x %x %x, L%u-L%u, features %x -> %x (SclkDpmOn %u), level changes %u, max seen L%u (before DPM), now %x; deep sleep %x watermark %x; mailbox msg %x resp %x arg %x, foreign %u:",
